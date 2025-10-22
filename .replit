@@ -1,4 +1,4 @@
-modules = ["python-3.11"]
+modules = ["python-3.11", "postgresql-16"]
 
 [nix]
 channel = "stable-25_05"
@@ -36,6 +36,5 @@ outputType = "webview"
 localPort = 5000
 externalPort = 80
 
-[[ports]]
-localPort = 39839
-externalPort = 3000
+[agent]
+integrations = ["streamlit_database:1.0.0"]
