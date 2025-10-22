@@ -36,5 +36,9 @@ outputType = "webview"
 localPort = 5000
 externalPort = 80
 
+[[ports]]
+localPort = 36263
+externalPort = 3000
+
 [agent]
 integrations = ["streamlit_database:1.0.0"]

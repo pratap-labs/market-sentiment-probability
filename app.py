@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import os
 from io import StringIO
 
-from utils.data_processor import DataProcessor
+from utils.db_data_processor import DatabaseDataProcessor
 from utils.model_trainer import ModelTrainer
 
 # Configure page
@@ -21,13 +21,15 @@ st.set_page_config(
 
 @st.cache_data
 def load_and_process_data():
-    """Load and process FII and OI data"""
+    """Load and process data from database"""
     try:
-        processor = DataProcessor()
-        processed_data = processor.load_and_merge_data()
+        processor = DatabaseDataProcessor()
+        processed_data = processor.load_and_process_data()
+        processor.close()
         return processed_data
     except Exception as e:
-        st.error(f"Error loading data: {str(e)}")
+        st.error(f"Error loading data from database: {str(e)}")
+        st.info("Make sure to run: python scripts/fetch_nse_data.py")
         return None
 
 @st.cache_resource
@@ -119,7 +121,16 @@ def create_feature_importance_chart(feature_importance, feature_names):
 
 def main():
     st.title("📊 Market Sentiment Probability Dashboard")
-    st.markdown("Predict market sentiment using FII and Options Open Interest data")
+    st.markdown("Predict market sentiment using NSE Futures and Options Open Interest data")
+    
+    with st.sidebar:
+        st.markdown("### 🔄 Data Source")
+        st.info("📊 Data loaded from PostgreSQL database")
+        
+        if st.button("🔄 Refresh Data"):
+            st.cache_data.clear()
+            st.cache_resource.clear()
+            st.rerun()
     
     # Load data
     with st.spinner("Loading and processing market data..."):
@@ -138,7 +149,7 @@ def main():
         return
     
     # Generate predictions for all dates
-    processor = DataProcessor()
+    processor = DatabaseDataProcessor()
     trainer = ModelTrainer()
     
     # Prepare features for prediction
