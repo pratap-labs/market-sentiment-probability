@@ -341,7 +341,7 @@ def main():
             
             # Highlight selected date
             trend_fig.add_vline(
-                x=selected_date, 
+                x=selected_date.to_pydatetime(), 
                 line_dash="dash", 
                 line_color="red",
                 annotation_text="Selected Date"
