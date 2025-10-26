@@ -7,8 +7,6 @@ from datetime import timedelta
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# bring in supabase client to fetch futures data
-from database.models import supabase
 
 # Ensure the project root is on sys.path so `from views import ...` works
 # This allows running the module as a script (python views/data_hub.py)
@@ -19,6 +17,7 @@ if ROOT not in sys.path:
 # Single place to set page config for combined view
 st.set_page_config(layout="wide")
 
+from database.models import supabase
 # Import the two view modules lazily
 from views import futures_data_loader as futures_view
 from views import options_data_loader as options_view
@@ -105,8 +104,8 @@ def render():
                         subf['change_in_oi'] = pd.to_numeric(subf['change_in_oi'], errors='coerce').fillna(0)
 
                         fig_f = make_subplots(specs=[[{'secondary_y': True}]])
-                        fig_f.add_trace(go.Scatter(x=subf['date'], y=subf['underlying_value'], name='Underlying', line=dict(color='#9333EA', width=2)), secondary_y=False)
-                        fig_f.add_trace(go.Bar(x=subf['date'], y=subf['change_in_oi'], name='Change in OI', marker_color='#3B82F6'), secondary_y=True)
+                        fig_f.add_trace(go.Scatter(x=subf['date'], y=subf['underlying_value'], name='Underlying', line=dict(color="#F9F6FB", width=2)), secondary_y=False)
+                        fig_f.add_trace(go.Bar(x=subf['date'], y=subf['change_in_oi'], name='Change in OI', marker_color="#3B82F6"), secondary_y=True)
                         # tighten layout and remove left/right padding
                         min_dt = subf['date'].min()
                         max_dt = subf['date'].max()
@@ -167,6 +166,65 @@ def render():
                         fig_o.update_yaxes(title_text='Open Interest', secondary_y=False)
                         fig_o.update_yaxes(title_text='Underlying Price', secondary_y=True)
                         st.plotly_chart(fig_o, use_container_width=True)
+
+                        # ----- Per-strike OI chart for a selected day -----
+                        # Prepare data: ensure strike_price numeric and date present
+                        if 'strike_price' in opt_sub.columns and 'open_int' in opt_sub.columns:
+                            opt_sub['strike_price'] = pd.to_numeric(opt_sub['strike_price'], errors='coerce')
+                            # Convert available dates to native python datetimes for Streamlit slider
+                            available_dates = sorted([pd.to_datetime(d).to_pydatetime() for d in opt_sub['date'].dropna().unique()])
+                            if available_dates:
+                                # slider for selecting a date (use string representation keys to avoid Streamlit state collisions)
+                                slider_key = f"strike_slider_{choice}"
+                                # Replace slider with previous/next buttons and weekday display
+                                idx_key = f"strike_idx_{choice}"
+                                # initialize index to last available date
+                                if idx_key not in st.session_state:
+                                    st.session_state[idx_key] = len(available_dates) - 1
+
+                                col_prev, col_date, col_next = st.columns([1, 6, 1])
+                                if col_prev.button("◀", key=f"prev_{idx_key}"):
+                                    st.session_state[idx_key] = max(0, st.session_state[idx_key] - 1)
+                                if col_next.button("▶", key=f"next_{idx_key}"):
+                                    st.session_state[idx_key] = min(len(available_dates) - 1, st.session_state[idx_key] + 1)
+
+                                sel_date = available_dates[st.session_state[idx_key]]
+                                # show YYYY-MM-DD and day of week (e.g., Fri)
+                                col_date.markdown(f"**{sel_date.strftime('%Y-%m-%d (%a)')}**")
+
+                                # convert back to pandas Timestamp for filtering
+                                sel_pd = pd.to_datetime(sel_date)
+                                day_df = opt_sub[opt_sub['date'] == sel_pd]
+                                if day_df.empty:
+                                    st.info("No option rows for the selected date at this expiry")
+                                else:
+                                    # pivot by strike and option_type
+                                    day_df['option_type'] = day_df['option_type'].astype(str).str.upper().str.strip()
+                                    pivot = day_df.pivot_table(index='strike_price', columns='option_type', values='open_int', aggfunc='sum').fillna(0)
+                                    # ensure CE/PE columns
+                                    for colname in ['CE', 'PE']:
+                                        if colname not in pivot.columns:
+                                            pivot[colname] = 0
+                                    pivot = pivot.sort_index()
+                                    # limit strikes to requested window (23k - 27k)
+                                    try:
+                                        pivot = pivot[(pivot.index >= 23000) & (pivot.index <= 27000)]
+                                    except Exception:
+                                        # if index is not numeric, attempt to coerce
+                                        pivot.index = pd.to_numeric(pivot.index, errors='coerce')
+                                        pivot = pivot.dropna().sort_index()
+                                        pivot = pivot[(pivot.index >= 23000) & (pivot.index <= 27000)]
+
+                                    # small bar chart: x=strike, grouped CE/PE
+                                    fig_s = make_subplots()
+                                    fig_s.add_trace(go.Bar(x=pivot.index, y=pivot['CE'], name='CE OI', marker_color='#E96767'))
+                                    fig_s.add_trace(go.Bar(x=pivot.index, y=pivot['PE'], name='PE OI', marker_color='#75F37B'))
+                                    fig_s.update_layout(title_text=f"Per-strike OI on {pd.to_datetime(sel_date).strftime('%Y-%m-%d')}", barmode='group', height=420, margin=dict(l=40, r=20, t=40, b=60), bargroupgap=0.02)
+                                    fig_s.update_xaxes(title_text='Strike Price')
+                                    fig_s.update_yaxes(title_text='Open Interest')
+                                    st.plotly_chart(fig_s, use_container_width=True)
+                            else:
+                                st.info("No dated option rows to build per-strike chart")
 
 
 if __name__ == "__main__":
