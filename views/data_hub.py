@@ -15,7 +15,9 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 # Single place to set page config for combined view
-st.set_page_config(layout="wide")
+# Only set page config when running as standalone script, not when imported
+if __name__ == "__main__":
+    st.set_page_config(layout="wide")
 
 from database.models import supabase
 # Import the two view modules lazily
@@ -24,8 +26,6 @@ from views import options_data_loader as options_view
 
 
 def render():
-    st.title("📊 Data Management Hub")
-    st.markdown("Use the tabs below to switch between Futures and Options data loaders and visualisers.")
 
     tab1, tab2, tab3 = st.tabs(["Futures Data", "Options Data", "Analysis"])
 

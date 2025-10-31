@@ -204,47 +204,59 @@ def plot_fii_futures_chart(symbol='NIFTY'):
 
 
 def render():
-    st.title("📥 Data Loader")
-    st.markdown("View existing data and load new futures data from NSE")
-    st.set_page_config(layout="wide")
+    # Debug flag - set to True to show all tabs (Futures Data, FII Chart, Load New Data)
+    # Set to False to show only FII Futures Chart (no tabs)
+    DEBUG = 0  # Force reload
+    
+    # st.title("📥 Data Loader")
+    # st.markdown("View existing data and load new futures data from NSE")
+    # st.set_page_config(layout="wide")
     # increase width of each tab
 
-    
-    tab1, tab2, tab3 = st.tabs(["Futures Data", "FII Futures Chart", "Load New Data"])
-    
-    with tab1:
-        display_table_data("Futures Data")
-    
-    with tab2:
-        st.subheader("📊 FII Futures Analysis")
+    if DEBUG:
+        # Debug mode: Create all 3 tabs
+        tab1, tab2, tab3 = st.tabs(["Futures Data", "FII Futures Chart", "Load New Data"])
+        
+        with tab1:
+            display_table_data("Futures Data")
+        
+        with tab2:
+            st.subheader("📊 FII Futures Analysis")
+            col1, col2 = st.columns([1, 3])
+            with col1:
+                symbol = st.selectbox("Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], key="chart_symbol")
+            plot_fii_futures_chart(symbol)
+        
+        with tab3:
+            st.subheader("🔄 Load New Data")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                symbol = st.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0)
+            
+            with col2:
+                expiry_dates = get_monthly_expiry_dates(months_back=3)
+                expiry_options = [date.strftime('%d-%b-%Y') for date in expiry_dates]
+                selected_expiry_str = st.selectbox("Select Expiry Date", expiry_options, index=0)
+            
+            selected_expiry = datetime.strptime(selected_expiry_str, '%d-%b-%Y')
+            st.info(f"📅 Data will be fetched from {(selected_expiry - timedelta(days=90)).strftime('%d-%b-%Y')} to {selected_expiry_str}")
+            
+            if st.button("🚀 Fetch & Load Data", type="primary", use_container_width=True):
+                with st.spinner(f"Fetching {symbol} data for {selected_expiry_str}..."):
+                    success, message = fetch_and_store_futures_data(symbol, selected_expiry)
+                    if success:
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
+    else:
+        # Production mode: Show only FII Futures Chart (no tabs)
+        # st.subheader("📊 FII Futures Analysis")
         col1, col2 = st.columns([1, 3])
         with col1:
             symbol = st.selectbox("Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], key="chart_symbol")
         plot_fii_futures_chart(symbol)
-    
-    with tab3:
-        st.subheader("🔄 Load New Data")
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            symbol = st.selectbox("Select Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0)
-        
-        with col2:
-            expiry_dates = get_monthly_expiry_dates(months_back=3)
-            expiry_options = [date.strftime('%d-%b-%Y') for date in expiry_dates]
-            selected_expiry_str = st.selectbox("Select Expiry Date", expiry_options, index=0)
-        
-        selected_expiry = datetime.strptime(selected_expiry_str, '%d-%b-%Y')
-        st.info(f"📅 Data will be fetched from {(selected_expiry - timedelta(days=90)).strftime('%d-%b-%Y')} to {selected_expiry_str}")
-        
-        if st.button("🚀 Fetch & Load Data", type="primary", use_container_width=True):
-            with st.spinner(f"Fetching {symbol} data for {selected_expiry_str}..."):
-                success, message = fetch_and_store_futures_data(symbol, selected_expiry)
-                if success:
-                    st.success(message)
-                    st.rerun()
-                else:
-                    st.error(message)
 
 
 if __name__ == "__main__":

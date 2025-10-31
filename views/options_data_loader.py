@@ -169,8 +169,10 @@ def load_all_data(dirs=None):
 
 
 def render():
-    st.title("📥 Options Data Loader")
-    st.markdown("Load options data from spreadsheet files located in `database/data/` or `database/options_data/`.")
+    # Debug flag - set to True to show all tabs (Expiry Table, More Visuals)
+    # Set to False to show only More Visuals tab
+    DEBUG = 0
+    
 
     df, errors = load_all_data()
 
@@ -183,27 +185,103 @@ def render():
         st.info("No files found in `database/data/` or `database/options_data/`. Place your Excel/CSV files there and reload.")
         return
 
-    tab1, tab2 = st.tabs(["Expiry Table", "More Visuals (TBD)"])
+    if DEBUG:
+        # Debug mode: Show both tabs
+        tab1, tab2 = st.tabs(["Expiry Table", "More Visuals (TBD)"])
+        
+        with tab1:
+            st.subheader("Select Expiry and View Table")
+            if "expiry" not in df.columns:
+                st.error("No `Expiry` column detected after parsing. Make sure your files have the expected headers.")
+            else:
+                # list unique expiries
+                expiries = sorted([x for x in df["expiry"].dropna().unique()])
+                expiries_str = [pd.to_datetime(x).strftime("%Y-%m-%d") for x in expiries]
+                choice = st.selectbox("Select Expiry", expiries_str)
+                chosen_dt = pd.to_datetime(choice)
+                filtered = df[df["expiry"] == chosen_dt].copy()
 
-    with tab1:
-        st.subheader("Select Expiry and View Table")
-        if "expiry" not in df.columns:
-            st.error("No `Expiry` column detected after parsing. Make sure your files have the expected headers.")
-        else:
-            # list unique expiries
-            expiries = sorted([x for x in df["expiry"].dropna().unique()])
-            expiries_str = [pd.to_datetime(x).strftime("%Y-%m-%d") for x in expiries]
-            choice = st.selectbox("Select Expiry", expiries_str)
-            chosen_dt = pd.to_datetime(choice)
-            filtered = df[df["expiry"] == chosen_dt].copy()
+                # Show a simple preview table and basic metrics
+                st.write(f"Rows for expiry {choice}: {len(filtered)}")
+                st.dataframe(filtered, use_container_width=True)
 
-            # Show a simple preview table and basic metrics
-            st.write(f"Rows for expiry {choice}: {len(filtered)}")
-            st.dataframe(filtered, use_container_width=True)
+        with tab2:
+            # st.subheader("More Visuals")
+            # st.markdown("Per-expiry: last 60 days CE vs PE open interest (bars) with underlying price (line) — one figure per expiry.")
 
-    with tab2:
-        st.subheader("More Visuals")
-        st.markdown("Per-expiry: last 60 days CE vs PE open interest (bars) with underlying price (line) — one figure per expiry.")
+            if not all(x in df.columns for x in ["date", "expiry", "option_type", "open_int"]):
+                st.error("Required columns for plots not found. Need: date, expiry, option_type, open_int")
+            else:
+                expiries = sorted([x for x in df["expiry"].dropna().unique()])
+                # allow user to select which expiries to plot (multi-select)
+                sel = st.multiselect("Select expiries to plot (one or more)",
+                                     [pd.to_datetime(x).strftime("%Y-%m-%d") for x in expiries],
+                                     default=[pd.to_datetime(expiries[-1]).strftime("%Y-%m-%d")] if expiries else [])
+
+                for choice in sel:
+                    expiry_dt = pd.to_datetime(choice)
+                    # filter last 60 days up to expiry
+                    start_dt = expiry_dt - timedelta(days=60)
+                    mask = (df["expiry"] == expiry_dt) & (df["date"] >= start_dt) & (df["date"] <= expiry_dt)
+                    sub = df.loc[mask].copy()
+                    if sub.empty:
+                        st.info(f"No rows for expiry {choice} in the last 60 days")
+                        continue
+
+                    # Aggregate CE and PE open interest per date
+                    sub["option_type"] = sub["option_type"].astype(str).str.upper().str.strip()
+                    oi_pivot = sub.pivot_table(index="date", columns="option_type", values="open_int", aggfunc="sum").fillna(0)
+
+                    # Ensure CE and PE columns exist
+                    for col in ["CE", "PE"]:
+                        if col not in oi_pivot.columns:
+                            oi_pivot[col] = 0
+
+                    # make sure index is datetime and sorted
+                    oi_pivot.index = pd.to_datetime(oi_pivot.index)
+                    oi_pivot = oi_pivot.sort_index()
+
+                    # Underlying price per date (use last observed for that date)
+                    if "underlying_value" in sub.columns:
+                        underlying = sub.groupby("date")["underlying_value"].last().reindex(oi_pivot.index).ffill()
+                    else:
+                        underlying = pd.Series([pd.NA] * len(oi_pivot), index=oi_pivot.index)
+
+                    # ensure numeric
+                    for col in ["CE", "PE"]:
+                        oi_pivot[col] = pd.to_numeric(oi_pivot[col], errors="coerce").fillna(0)
+                    underlying = pd.to_numeric(underlying, errors="coerce")
+
+                    # Build plotly figure: grouped bars for CE/PE and line for underlying
+                    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+                    fig.add_trace(
+                        go.Bar(x=oi_pivot.index, y=oi_pivot["CE"], name="CE OI", marker_color="#75F37B"),
+                        secondary_y=False,
+                    )
+                    fig.add_trace(
+                        go.Bar(x=oi_pivot.index, y=oi_pivot["PE"], name="PE OI", marker_color="#E96767"),
+                        secondary_y=False,
+                    )
+
+                    fig.add_trace(
+                        go.Scatter(x=underlying.index, y=underlying.values, name="Underlying", mode="lines+markers", line=dict(color="#f1f1f1", width=2)),
+                        secondary_y=True,
+                    )
+
+                    fig.update_layout(barmode="group", height=420, title_text=f"Expiry {choice} — CE vs PE OI (last 60 days)")
+                    fig.update_xaxes(title_text="Date", tickangle=45, nticks=15)
+                    fig.update_yaxes(title_text="Open Interest (contracts)", secondary_y=False)
+                    fig.update_yaxes(title_text="Underlying Price", secondary_y=True)
+
+                    # improve hover formatting
+                    fig.update_traces(hovertemplate=None)
+
+                    st.plotly_chart(fig, use_container_width=True)
+    else:
+        # Production mode: Show only More Visuals (no tabs)
+        # st.subheader("More Visuals")
+        # st.markdown("Per-expiry: last 60 days CE vs PE open interest (bars) with underlying price (line) — one figure per expiry.")
 
         if not all(x in df.columns for x in ["date", "expiry", "option_type", "open_int"]):
             st.error("Required columns for plots not found. Need: date, expiry, option_type, open_int")
