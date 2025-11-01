@@ -369,7 +369,333 @@ This dashboard provides comprehensive options trading analytics, position manage
 
 ---
 
-## Data Hub Tab (📂 Data Hub)
+### 7. 📊 Trade History Tab
+**Purpose**: Comprehensive analysis of past trades from Kite Console tradebook export, analyzed at strategy/expiry level for iron condors and short strangles.
+
+**Data Source**: `database/tradebook.csv` (exported from Kite Console)
+
+**Required CSV Columns**:
+- Symbol, ISIN, Trade Date, Exchange, Segment, Series
+- Trade Type (BUY/SELL), Auction, Quantity, Price
+- Trade ID, Order ID, Order Execution Time
+
+**Analysis Methodology**:
+- **FIFO Trade Matching**: Pairs buy/sell trades for each symbol chronologically
+- **Expiry-Level Grouping**: Groups all matched legs by expiry cycle (not individual trades)
+- **Strategy-Level KPIs**: Calculates metrics per complete expiry cycle (iron condor/short strangle)
+
+**Features**:
+- Date range filtering
+- Expiry extraction from option symbols
+- Debug view showing symbol → expiry mapping
+- Six comprehensive analysis tabs
+
+---
+
+#### Trade History Sub-Tabs
+
+##### 7.1. 📊 Profitability Tab
+**Purpose**: Analyze profitability at strategy/expiry cycle level.
+
+**Key Metrics (13 metrics)**:
+
+1. **Gross P&L**: Total profit/loss across all expiry cycles in ₹
+   - 🟢 Positive: Profitable overall
+   - 🔴 Negative: Overall loss
+
+2. **Net P&L (Est.)**: Gross P&L minus estimated charges
+   - Charges estimated at 1% of total trade value
+   - Shows impact of transaction costs
+
+3. **Profit Factor**: Gross Profit / Gross Loss ratio
+   - 🟢 >1.5: Excellent
+   - 🟡 1.0-1.5: Profitable
+   - 🔴 <1.0: Losing system
+
+4. **Total Expiry Cycles**: Number of different expiry cycles traded
+   - Each cycle represents one complete strategy (iron condor/strangle)
+
+5. **Win Rate**: Percentage of profitable expiry cycles
+   - Shows number of winning cycles
+   - Formula: (Winning Cycles / Total Cycles) × 100
+
+6. **Loss Rate**: Percentage of losing expiry cycles
+   - Shows number of losing cycles
+
+7. **Avg Win**: Average profit per winning expiry cycle in ₹
+
+8. **Avg Loss**: Average loss per losing expiry cycle in ₹
+
+9. **Avg Win / Avg Loss Ratio**: Quality of wins vs losses
+   - 🟢 >2: Excellent - Big wins, small losses
+   - 🟡 1-2: Good
+   - 🔴 <1: Poor - Losses bigger than wins
+
+10. **Expectancy per Expiry**: Expected value per trade in ₹
+    - Formula: (Avg Win × Win Rate) - (Avg Loss × Loss Rate)
+    - 🟢 Positive: Statistically profitable system
+    - 🔴 Negative: Statistically losing system
+
+11. **Max Drawdown**: Largest peak-to-trough loss in ₹
+    - Calculated from cumulative P&L of expiry cycles
+
+12. **Recovery Factor**: Net P&L / Max Drawdown ratio
+    - 🟢 >3: Excellent recovery efficiency
+    - 🟡 1-3: Good
+    - 🔴 <1: Poor - losses not recovered efficiently
+
+13. **Gross Profit**: Total profit from all winning cycles
+    - Shows source of overall profitability
+
+**Data Tables**:
+- **Expiry Cycle Performance Table**: All expiry cycles with:
+  - Expiry identifier
+  - Entry Date, Exit Date
+  - Num Legs (2 = vertical spread, 4 = iron condor, etc.)
+  - P&L in ₹
+  - ROI % (P&L / Trade Value)
+  - Duration in days
+  - Sorted by Entry Date (most recent first)
+
+**Visualizations**:
+- **P&L Distribution Histogram**: Per expiry cycle P&L
+  - Break-even line (₹0)
+  - Expectancy line (expected value per cycle)
+  - Shows profit/loss frequency
+
+##### 7.2. ⚡ Efficiency Tab
+**Purpose**: Analyze strategy quality and consistency metrics.
+
+**Key Metrics (9 metrics)**:
+
+1. **Expiry Cycles**: Total number of cycles traded
+   - Shows average legs per cycle
+
+2. **Avg Cycle Duration**: Average holding period
+   - Displayed in hours (if <24) or days
+   - Indicates typical strategy duration
+
+3. **Total ROI**: Overall return on investment
+   - Formula: Gross P&L / Total Capital Deployed × 100
+
+4. **Risk-Adjusted P&L**: Sharpe-like ratio
+   - Formula: P&L / Std Dev of expiry cycles
+   - Higher = better risk-adjusted returns
+
+5. **Max Winning Streak**: Longest consecutive winning expiry cycles
+   - 🟢 >5: Strong consistency
+
+6. **Max Losing Streak**: Longest consecutive losing cycles
+   - 🔴 >5: Review strategy robustness
+
+7. **Mean P&L per Expiry**: Average P&L per cycle in ₹
+
+8. **Sharpe-like Ratio**: Mean P&L / Std Dev P&L
+   - 🟢 >1: Excellent risk-adjusted returns
+   - 🟡 0.5-1: Good
+   - 🔴 <0.5: Poor - high volatility relative to returns
+
+9. **Consistency Score**: Combined metric (0-100 scale)
+   - Components:
+     - Win Rate (30% weight)
+     - Profit Factor (30% weight)
+     - Streak Control (20% weight)
+     - Expectancy (20% weight)
+   - 🟢 >70: Highly consistent strategy
+   - 🟡 50-70: Moderately consistent
+   - 🔴 <50: Inconsistent - needs improvement
+
+**Breakdown Section**:
+- Shows individual component scores contributing to Consistency Score
+
+##### 7.3. 📈 Performance Trends Tab
+**Purpose**: Visualize performance evolution over time.
+
+**Key Metrics (4 metrics)**:
+
+1. **Best Expiry**: Highest P&L expiry cycle in ₹
+   - Shows expiry identifier
+
+2. **Worst Expiry**: Lowest P&L expiry cycle in ₹
+   - Shows expiry identifier
+
+3. **Positive Expiries**: Count and percentage of winning cycles
+   - Format: X/Y (Z%)
+
+4. **Avg Expiry P&L**: Mean P&L per cycle in ₹
+
+**Visualizations**:
+- **Dual-Chart Layout**:
+  1. **Cumulative P&L by Expiry Cycle** (top 60% of chart)
+     - Line chart with markers
+     - Fill-to-zero shading
+     - Shows equity curve progression
+     - Hover shows expiry and entry date
+  
+  2. **P&L per Expiry Cycle** (bottom 40% of chart)
+     - Bar chart
+     - Green bars for profits, red for losses
+     - Shows individual cycle performance
+     - Hover shows expiry and entry date
+
+- **Interactive Features**:
+  - Unified hover mode (both charts sync)
+  - X-axis: Expiry identifiers
+  - Entry dates displayed on hover
+
+##### 7.4. 🎯 Trade Analysis Tab
+**Purpose**: Detailed breakdown by expiry and symbol-level analysis.
+
+**Sections**:
+
+A. **Performance by Expiry Cycle Table**:
+   - All cycles with full details:
+     - Expiry, Entry Date, Exit Date
+     - Num Legs
+     - P&L, Trade Value, ROI %
+     - Duration (days)
+   - Styled with color gradient on P&L (red-yellow-green)
+   - Sorted by Entry Date (most recent first)
+
+B. **Strategy Leg Composition**:
+   - **Bar Chart**: Distribution of leg counts
+     - X-axis: Number of legs (2, 4, 6, etc.)
+     - Y-axis: Frequency
+     - Caption: "2 legs = Vertical Spread, 4 legs = Iron Condor, etc."
+   
+   - **ROI Distribution Histogram**:
+     - Shows ROI % distribution across all expiry cycles
+     - Identifies consistency of returns
+
+C. **Performance by Individual Legs (Symbols)**:
+   - Symbol-level breakdown (top 20 symbols):
+     - Symbol name
+     - Total P&L in ₹
+     - Leg Count (how many times traded)
+     - Avg P&L per leg
+     - Total Quantity
+   - Styled with color gradient on Total P&L
+   - Shows which strikes/symbols performed best
+
+D. **Top 5 Best/Worst Expiry Cycles**:
+   - **Top 5 Best**: Highest profit cycles with details
+   - **Top 5 Worst**: Highest loss cycles with details
+   - Both show: Expiry, Entry Date, P&L, Num Legs, Duration (days)
+
+E. **Holding Period Analysis**:
+   - **Duration Distribution Histogram**:
+     - X-axis: Duration in days
+     - Y-axis: Frequency
+     - Shows typical strategy holding periods
+
+##### 7.5. 📉 Drawdown Tab
+**Purpose**: Analyze loss periods and recovery patterns.
+
+**Key Metrics (3 metrics)**:
+
+1. **Current Drawdown**: Latest drawdown value in ₹
+   - Shows % drawdown
+   - Delta color = inverse (red for drawdown)
+
+2. **Max Drawdown**: Largest historical drawdown in ₹
+   - Shows % drawdown
+   - Peak-to-trough measurement
+
+3. **Recovery Factor**: Net P&L / Max Drawdown
+   - Same as in Profitability tab
+   - Efficiency of loss recovery
+
+**Recovery Analysis Metrics (3 metrics)**:
+
+4. **Avg Drawdown Duration**: Average length of drawdown periods
+   - Measured in expiry cycles
+   - Shows typical recovery time
+
+5. **Max Drawdown Duration**: Longest drawdown period in days
+   - Calendar days from drawdown start to recovery
+
+6. **Number of Drawdown Periods**: Count of distinct drawdown episodes
+   - Shows frequency of loss periods
+
+**Visualizations**:
+
+A. **Drawdown Over Time Chart**:
+   - Line chart with area fill (red)
+   - X-axis: Expiry cycles
+   - Y-axis: Drawdown in ₹ (always negative or zero)
+   - Markers on line
+   - Hover shows expiry and entry date
+
+B. **Drawdown Periods Table**:
+   - Lists all historical drawdown periods:
+     - Start Expiry
+     - End Expiry
+     - Depth (₹)
+     - Duration (expiry cycles)
+     - Duration (days)
+   - Formatted with currency and integer displays
+
+##### 7.6. 📋 Raw Data Tab
+**Purpose**: Access to underlying trade data for verification and export.
+
+**Two Sub-Tabs**:
+
+A. **Matched Trades Tab**:
+   - Shows all FIFO-matched buy/sell pairs
+   - Columns:
+     - Symbol
+     - Expiry
+     - Quantity
+     - Buy Price, Sell Price
+     - P&L in ₹
+     - Entry Date, Exit Date
+     - Duration (hrs)
+     - Trade Value
+   - Formatted currency and decimals
+   - Download button: Export as CSV with date range in filename
+
+B. **All Trades Tab**:
+   - Raw tradebook data (filtered by date range)
+   - All original columns from CSV
+   - Download button: Export filtered data as CSV
+
+**Export Features**:
+- CSV downloads include date range in filename
+- Format: `matched_trades_YYYY-MM-DD_to_YYYY-MM-DD.csv`
+- Format: `tradebook_all_YYYY-MM-DD_to_YYYY-MM-DD.csv`
+
+---
+
+#### Trade History Additional Features
+
+**Date Range Filter** (at top of tab):
+- Start Date selector (default: earliest trade)
+- End Date selector (default: latest trade)
+- Shows "X trades in period (Y% of total)"
+
+**Debug Expander**:
+- "🔍 Debug: Expiry Extraction" section
+- Shows sample of Symbol → Expiry mapping
+- Displays count of unique expiry cycles found
+- Helps verify correct expiry parsing
+
+**Expiry Extraction Logic**:
+- Removes last 7 characters from symbol (strike + CE/PE)
+- Example: `NIFTY25JUN24000CE` → `NIFTY25JUN`
+- Example: `NIFTY25N0426400CE` → `NIFTY25N04` (weekly)
+- Groups all legs with same expiry identifier
+
+**Error Handling**:
+- File not found: Shows error with expected path
+- Missing columns: Lists required vs actual columns
+- Empty date range: Warning message
+- No matched trades: Shows fallback with raw trade data
+
+**Total Trade History Metrics: 32 unique metrics across all sub-tabs**
+
+---
+
+## 8. 📂 Data Hub Tab
 
 ### Purpose
 Centralized data management for futures and options historical data with visualization tools.

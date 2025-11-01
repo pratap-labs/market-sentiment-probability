@@ -9,7 +9,7 @@ from plotly.subplots import make_subplots
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database.models import supabase
-from utils.nse_fetcher import NSEDataFetcher
+from views.utils.nse_fetcher import NSEDataFetcher
 
 def get_monthly_expiry_dates(start_date=None, months_back=3):
     if start_date is None:

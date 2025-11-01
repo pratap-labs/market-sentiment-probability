@@ -3,7 +3,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database.models import create_tables, get_session, FuturesData
-from utils.nse_fetcher import NSEDataFetcher
+from views.utils.nse_fetcher import NSEDataFetcher
 from datetime import datetime
 
 def main():

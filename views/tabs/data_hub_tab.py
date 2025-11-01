@@ -21,11 +21,11 @@ if __name__ == "__main__":
 
 from database.models import supabase
 # Import the two view modules lazily
-from views import futures_data_loader as futures_view
-from views import options_data_loader as options_view
+from views.utils import futures_data_loader as futures_view
+from views.utils import options_data_loader as options_view
 
 
-def render():
+def render_data_hub_tab():
 
     tab1, tab2, tab3 = st.tabs(["Futures Data", "Options Data", "Analysis"])
 
@@ -225,7 +225,3 @@ def render():
                                     st.plotly_chart(fig_s, use_container_width=True)
                             else:
                                 st.info("No dated option rows to build per-strike chart")
-
-
-if __name__ == "__main__":
-    render()
