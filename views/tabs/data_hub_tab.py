@@ -20,33 +20,54 @@ if __name__ == "__main__":
     st.set_page_config(layout="wide")
 
 from database.models import supabase
-# Import the two view modules lazily
-from views.utils import futures_data_loader as futures_view
-from views.utils import options_data_loader as options_view
+# Import derivatives data tab for data loading
+from views.tabs.derivatives_data_tab import load_from_cache
 
 
 def render_data_hub_tab():
+    """
+    Data Hub Tab - Legacy view replaced by Derivatives Data tab.
+    This tab now focuses on combined analysis.
+    """
+    
+    st.info("💡 For data fetching and management, please use the **Derivatives Data** tab.")
 
     tab1, tab2, tab3 = st.tabs(["Futures Data", "Options Data", "Analysis"])
 
     with tab1:
-        # Call the futures view renderer
-        try:
-            futures_view.render()
-        except Exception as e:
-            st.error(f"Failed to render futures view: {e}")
+        st.markdown("### Futures Data")
+        st.info("Use the **Derivatives Data** tab to fetch and manage futures data.")
+        # Show cached data if available
+        futures_df = load_from_cache("nifty_futures")
+        if not futures_df.empty:
+            st.dataframe(futures_df, use_container_width=True, height=400)
 
     with tab2:
-        try:
-            options_view.render()
-        except Exception as e:
-            st.error(f"Failed to render options view: {e}")
+        st.markdown("### Options Data")
+        st.info("Use the **Derivatives Data** tab to fetch and manage options data.")
+        # Show cached data if available
+        ce_df = load_from_cache("nifty_options_ce")
+        pe_df = load_from_cache("nifty_options_pe")
+        if not ce_df.empty and not pe_df.empty:
+            options_df = pd.concat([ce_df, pe_df], ignore_index=True)
+            st.dataframe(options_df, use_container_width=True, height=400)
+        elif not ce_df.empty:
+            st.dataframe(ce_df, use_container_width=True, height=400)
+        elif not pe_df.empty:
+            st.dataframe(pe_df, use_container_width=True, height=400)
 
     with tab3:
         st.subheader("Combined Analysis: Futures & Options per-expiry")
 
-        # Load options data (from files)
-        options_df, _ = options_view.load_all_data()
+        # Load options data from cache
+        ce_df = load_from_cache("nifty_options_ce")
+        pe_df = load_from_cache("nifty_options_pe")
+        
+        if ce_df.empty and pe_df.empty:
+            st.warning("⚠️ No options data in cache. Please fetch data from the Derivatives Data tab first.")
+            return
+        
+        options_df = pd.concat([ce_df, pe_df], ignore_index=True) if not ce_df.empty and not pe_df.empty else (ce_df if not ce_df.empty else pe_df)
 
         # Fetch futures data for the selected symbol
         symbol = st.selectbox("Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0, key="analysis_symbol")

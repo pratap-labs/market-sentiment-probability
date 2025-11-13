@@ -7,11 +7,18 @@ import os
 import sys
 import streamlit as st
 import pandas as pd
+import json
+from pathlib import Path
 
 # Add project root to path
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+
+# Cache directory for credentials
+CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+KITE_CREDS_FILE = CACHE_DIR / "kite_credentials.json"
 
 try:
     from kiteconnect import KiteConnect
@@ -25,11 +32,7 @@ try:
 except Exception:
     bs = iv = greeks = None
 
-# Import utility functions
-from views.utils import (
-    load_all_data,
-    load_nifty_daily
-)
+
 
 # Import tab render functions
 from views.tabs import (
@@ -42,14 +45,52 @@ from views.tabs import (
     render_alerts_tab,
     render_advanced_analytics_tab,
     render_trade_history_tab,
-    render_data_hub_tab
+    render_data_hub_tab,
+    render_kite_instruments_tab,
+    render_nifty_overview_tab
 )
+
+from views.tabs.derivatives_data_tab import render_derivatives_data_tab
 
 try:
     from views.tabs import data_hub_tab
 except Exception as e:
     data_hub_tab = None
     print(f"Failed to import data_hub: {e}")
+
+
+def save_kite_credentials(access_token: str, api_key: str):
+    """Save Kite credentials to persistent file."""
+    try:
+        creds = {
+            "access_token": access_token,
+            "api_key": api_key
+        }
+        with open(KITE_CREDS_FILE, 'w') as f:
+            json.dump(creds, f)
+    except Exception as e:
+        st.error(f"Failed to save credentials: {e}")
+
+
+def load_kite_credentials():
+    """Load Kite credentials from persistent file."""
+    try:
+        if KITE_CREDS_FILE.exists():
+            with open(KITE_CREDS_FILE, 'r') as f:
+                creds = json.load(f)
+                return creds.get("access_token"), creds.get("api_key")
+    except Exception as e:
+        st.error(f"Failed to load credentials: {e}")
+    return None, None
+
+
+def clear_kite_credentials():
+    """Clear saved Kite credentials file."""
+    try:
+        if KITE_CREDS_FILE.exists():
+            KITE_CREDS_FILE.unlink()
+    except Exception as e:
+        st.error(f"Failed to clear credentials: {e}")
 
 
 def render():
@@ -129,6 +170,14 @@ def render():
         st.session_state.kite_login_initiated = False
     if "kite_processing_token" not in st.session_state:
         st.session_state.kite_processing_token = False
+    
+    # Load credentials from file if not in session
+    if "kite_access_token" not in st.session_state or "kite_api_key" not in st.session_state:
+        saved_token, saved_key = load_kite_credentials()
+        if saved_token and saved_key:
+            st.session_state["kite_access_token"] = saved_token
+            st.session_state["kite_api_key"] = saved_key
+            st.success("✅ Loaded saved Kite credentials from file")
 
     # Check for request_token in URL
     query_params = st.query_params
@@ -151,7 +200,11 @@ def render():
                     if access_token:
                         st.session_state["kite_access_token"] = access_token
                         st.session_state["kite_api_key"] = api_key
-                        st.success("✅ Successfully logged in!")
+                        
+                        # Save credentials to persistent file
+                        save_kite_credentials(access_token, api_key)
+                        
+                        st.success("✅ Successfully logged in and saved credentials!")
                         
                         st.query_params.clear()
                         st.session_state.kite_login_initiated = False
@@ -170,66 +223,18 @@ def render():
             st.session_state.kite_processing_token = False
             st.query_params.clear()
 
-    # Load data
-    with st.spinner("Loading options data..."):
-        options_df, errors = load_all_data()
-        
-        # Setup Kite client if logged in
-        kite_client = None
-        kite_token = st.session_state.get("kite_access_token")
-        kite_key = st.session_state.get("kite_api_key")
-        if kite_token and kite_key:
-            try:
-                kite_client = KiteConnect(api_key=kite_key)
-                kite_client.set_access_token(kite_token)
-            except Exception:
-                kite_client = None
-
-        # Load NIFTY daily data from Kite if available
-        if kite_client is not None:
-            try:
-                nifty_df = load_nifty_daily(_kite_client=kite_client)
-            except RuntimeError as e:
-                st.error(f"Failed to load NIFTY daily: {e}")
-                nifty_df = pd.DataFrame()
-                st.session_state["nifty_loaded_from"] = None
-        else:
-            nifty_df = pd.DataFrame()
-            st.session_state["nifty_loaded_from"] = None
-            st.info("Log in via the Login tab to load NIFTY daily price data from Kite.")
-
-        # Store NIFTY data in session state for VaR calculations
-        if not nifty_df.empty:
-            st.session_state["nifty_loaded_from"] = "Kite API"
-            st.session_state["nifty_df"] = nifty_df
-
-            # Validate required columns
-            required_cols = {"date", "close", "open", "high", "low"}
-            present = set(nifty_df.columns.str.lower())
-            missing = required_cols - present
-            if missing:
-                msg = f"NIFTY daily data missing required columns: {sorted(list(missing))}"
-                st.error(msg)
-                raise RuntimeError(msg)
+    # Initialize empty dataframes - data will be loaded from Derivatives Data tab
+    # Each tab will load data from cache using their own reload buttons
     
-    # Show data loading warnings if any
-    if errors:
-        with st.expander("⚠️ Data loading warnings", expanded=False):
-            for file, err in errors:
-                st.warning(f"{file}: {err}")
-
-    # Create tabs
+    # Create tabs - Only show essential tabs
     tabs = st.tabs([
         "🔐 Login",
         "🧭 Overview",
         "📊 Positions", 
         "📈 Portfolio Overview",
-        "🔍 Position Diagnostics", 
+        "🔍 Position Diagnostics",
         "🌡️ Market Regime",
-        "🚨 Risk Alerts",
-        "🎯 Advanced Analytics",
-        "📜 Trade History",
-        "📂 Data Hub"
+        "💾 Derivatives Data"
     ])
 
     # Render each tab
@@ -237,10 +242,10 @@ def render():
         render_login_tab()
 
     with tabs[1]:
-        render_overview_tab(options_df, nifty_df)
+        render_overview_tab()
 
     with tabs[2]:
-        render_positions_tab(options_df, nifty_df)
+        render_positions_tab()
     
     with tabs[3]:
         render_portfolio_tab()
@@ -249,19 +254,10 @@ def render():
         render_diagnostics_tab()
     
     with tabs[5]:
-        render_market_regime_tab(options_df, nifty_df)
+        render_market_regime_tab()
     
     with tabs[6]:
-        render_alerts_tab()
-    
-    with tabs[7]:
-        render_advanced_analytics_tab()
-    
-    with tabs[8]:
-        render_trade_history_tab()
-    
-    with tabs[9]:
-        render_data_hub_tab()
+        render_derivatives_data_tab()
 
 
 if __name__ == "__main__":

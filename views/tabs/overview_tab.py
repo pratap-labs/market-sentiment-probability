@@ -16,9 +16,26 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from views.utils.portfolio_metrics import calculate_portfolio_greeks, calculate_market_regime
-from views.utils.risk_calculations import calculate_var
-from views.utils.formatters import format_inr
+from scripts.utils.portfolio_metrics import calculate_portfolio_greeks, calculate_market_regime
+from scripts.utils.risk_calculations import calculate_var
+from scripts.utils.formatters import format_inr
+from pathlib import Path
+from datetime import datetime
+
+
+# Cache directory
+CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
+
+
+def load_from_cache(data_type: str) -> pd.DataFrame:
+    """Load data from most recent cache file."""
+    cache_file = CACHE_DIR / f"{data_type}_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    if cache_file.exists():
+        df = pd.read_csv(cache_file)
+        return df
+    else:
+        return pd.DataFrame()
+
 
 
 def get_market_signal(regime_data: Dict) -> tuple[str, str, str]:
@@ -245,16 +262,57 @@ def get_alignment_status(market_iv_rank: float, portfolio_vega: float,
     return alignments
 
 
-def render_overview_tab(options_df: pd.DataFrame, nifty_df: pd.DataFrame):
+def render_overview_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame = None):
     """Render the Ultimate Overview Tab with key decision metrics."""
     
-    # Add refresh button at the top
-    col1, col2 = st.columns([3, 1])
+    # Add refresh and reload data buttons at the top
+    col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         st.header("🧭 Portfolio Overview — Decision View")
     with col2:
+        if st.button("🔄 Reload Data", key="overview_reload_data", help="Load latest derivatives data from cache"):
+            with st.spinner("Loading data from cache..."):
+                # Load options data (combine CE and PE)
+                df_ce = load_from_cache("nifty_options_ce")
+                df_pe = load_from_cache("nifty_options_pe")
+                
+                if not df_ce.empty and not df_pe.empty:
+                    options_df = pd.concat([df_ce, df_pe], ignore_index=True)
+                    st.session_state["options_df_cache"] = options_df
+                    st.success(f"✅ Loaded {len(options_df)} options records")
+                elif not df_ce.empty:
+                    options_df = df_ce
+                    st.session_state["options_df_cache"] = options_df
+                    st.success(f"✅ Loaded {len(options_df)} CE records")
+                elif not df_pe.empty:
+                    options_df = df_pe
+                    st.session_state["options_df_cache"] = options_df
+                    st.success(f"✅ Loaded {len(options_df)} PE records")
+                else:
+                    st.warning("⚠️ No options data in cache")
+                
+                # Load NIFTY OHLCV data
+                nifty_df = load_from_cache("nifty_ohlcv")
+                if not nifty_df.empty:
+                    st.session_state["nifty_df_cache"] = nifty_df
+                    st.success(f"✅ Loaded {len(nifty_df)} NIFTY records")
+                else:
+                    st.warning("⚠️ No NIFTY data in cache")
+    with col3:
         if st.button("🔄 Refresh", key="overview_refresh", help="Refresh overview with latest data"):
             st.rerun()
+    
+    # Use cached data if available
+    if "options_df_cache" in st.session_state:
+        options_df = st.session_state["options_df_cache"]
+    if "nifty_df_cache" in st.session_state:
+        nifty_df = st.session_state["nifty_df_cache"]
+    
+    # Initialize empty dataframes if None
+    if options_df is None:
+        options_df = pd.DataFrame()
+    if nifty_df is None:
+        nifty_df = pd.DataFrame()
     
     # Check if positions exist
     positions = st.session_state.get("enriched_positions", [])

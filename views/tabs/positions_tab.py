@@ -14,12 +14,79 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from views.utils import enrich_position_with_greeks, calculate_market_regime
+from scripts.utils import enrich_position_with_greeks, calculate_market_regime
+from pathlib import Path
+from datetime import datetime
 
 
-def render_positions_tab(options_df: pd.DataFrame, nifty_df: pd.DataFrame):
+# Cache directory
+CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
+
+
+def load_from_cache(data_type: str) -> pd.DataFrame:
+    """Load data from most recent cache file."""
+    cache_file = CACHE_DIR / f"{data_type}_{datetime.now().strftime('%Y-%m-%d')}.csv"
+    if cache_file.exists():
+        df = pd.read_csv(cache_file)
+        return df
+    else:
+        return pd.DataFrame()
+
+
+def render_positions_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame = None):
     """Render the positions tab with enriched data."""
     st.subheader("Positions")
+    
+    # Add button to reload derivatives data from cache
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        if st.button("🔄 Reload Data", help="Load latest derivatives data from cache"):
+            with st.spinner("Loading data from cache..."):
+                # Load options data (combine CE and PE)
+                df_ce = load_from_cache("nifty_options_ce")
+                df_pe = load_from_cache("nifty_options_pe")
+                
+                if not df_ce.empty and not df_pe.empty:
+                    options_df = pd.concat([df_ce, df_pe], ignore_index=True)
+                    st.session_state["options_df_cache"] = options_df
+                    st.success(f"✅ Loaded {len(options_df)} options records")
+                elif not df_ce.empty:
+                    options_df = df_ce
+                    st.session_state["options_df_cache"] = options_df
+                    st.success(f"✅ Loaded {len(options_df)} CE records")
+                elif not df_pe.empty:
+                    options_df = df_pe
+                    st.session_state["options_df_cache"] = options_df
+                    st.success(f"✅ Loaded {len(options_df)} PE records")
+                else:
+                    st.warning("⚠️ No options data in cache")
+                
+                # Load NIFTY OHLCV data
+                nifty_df = load_from_cache("nifty_ohlcv")
+                if not nifty_df.empty:
+                    st.session_state["nifty_df_cache"] = nifty_df
+                    st.success(f"✅ Loaded {len(nifty_df)} NIFTY records")
+                else:
+                    st.warning("⚠️ No NIFTY data in cache")
+    
+    # Use cached data if available
+    if "options_df_cache" in st.session_state:
+        options_df = st.session_state["options_df_cache"]
+    if "nifty_df_cache" in st.session_state:
+        nifty_df = st.session_state["nifty_df_cache"]
+    
+    # Initialize empty dataframes if None
+    if options_df is None:
+        options_df = pd.DataFrame()
+    if nifty_df is None:
+        nifty_df = pd.DataFrame()
+    
+    # Check if data is loaded
+    if options_df.empty:
+        st.warning("⚠️ No options data loaded. Please go to the 'Derivatives Data' tab and load options data first.")
+        st.info("💡 You need options data to calculate Greeks and enrich position information.")
+        return
+    
     access_token = st.session_state.get("kite_access_token")
     
     if not access_token:

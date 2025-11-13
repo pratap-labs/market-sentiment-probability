@@ -13,8 +13,6 @@ import tempfile
 import os
 
 
-
-
 class NSEDataFetcher:
     """
     Fetch data from NSE India API for futures and options
@@ -181,15 +179,38 @@ class NSEDataFetcher:
         for item in raw_data['data']:
             try:
                 record = {
+                    # Date and identification
                     'date': datetime.strptime(item.get('FH_TIMESTAMP', ''), '%d-%b-%Y').date() if item.get('FH_TIMESTAMP') else None,
-                    'instrument_type': item.get('FH_INSTRUMENT_TYPE'),
+                    'timestamp_order': item.get('FH_TIMESTAMP_ORDER'),
+                    'instrument_type': item.get('FH_INSTRUMENT') or 'FUTIDX',
                     'symbol': item.get('FH_SYMBOL'),
+                    'market_type': item.get('FH_MARKET_TYPE'),
+                    
+                    # Expiry
                     'expiry_date': datetime.strptime(item.get('FH_EXPIRY_DT', ''), '%d-%b-%Y').date() if item.get('FH_EXPIRY_DT') else None,
-                    'strike_price': 0,
-                    'option_type': item.get('FH_OPTION_TYPE'),
+                    'expiry': datetime.strptime(item.get('FH_EXPIRY_DT', ''), '%d-%b-%Y').date() if item.get('FH_EXPIRY_DT') else None,  # Alias
+                    'strike_price': 0,  # Futures don't have strikes
+                    'option_type': None,
+                    
+                    # Price data
+                    'open': float(item.get('FH_OPENING_PRICE', 0)),
+                    'high': float(item.get('FH_TRADE_HIGH_PRICE', 0)),
+                    'low': float(item.get('FH_TRADE_LOW_PRICE', 0)),
+                    'close': float(item.get('FH_CLOSING_PRICE', 0)),
+                    'ltp': float(item.get('FH_LAST_TRADED_PRICE', 0)),
+                    'prev_close': float(item.get('FH_PREV_CLS', 0)),
+                    'settle_price': float(item.get('FH_SETTLE_PRICE', 0)),
+                    
+                    # Volume and OI
                     'open_interest': int(item.get('FH_OPEN_INT', 0)),
+                    'open_int': int(item.get('FH_OPEN_INT', 0)),  # Alias
                     'change_in_oi': int(item.get('FH_CHANGE_IN_OI', 0)),
                     'volume': int(item.get('FH_TOT_TRADED_QTY', 0)),
+                    'no_of_contracts': int(item.get('FH_TOT_TRADED_QTY', 0)),  # Alias
+                    'traded_value': float(item.get('FH_TOT_TRADED_VAL', 0)),
+                    
+                    # Other
+                    'market_lot': int(item.get('FH_MARKET_LOT', 0)),
                     'underlying_value': float(item.get('FH_UNDERLYING_VALUE', 0)),
                     'timestamp': datetime.now()
                 }
@@ -288,5 +309,148 @@ class NSEDataFetcher:
         print(f"\n{'='*60}")
         print(f"✗ No data fetched")
         print(f"{'='*60}\n")
+        
+        return pd.DataFrame()
+
+
+    def fetch_options_data(self, from_date, to_date, symbol, expiry_str, option_type, year=2025):
+        """
+        Fetch options data using curl with cookies
+        
+        Args:
+            from_date: Start date in format 'DD-MM-YYYY'
+            to_date: End date in format 'DD-MM-YYYY'
+            symbol: Symbol name (e.g., 'NIFTY')
+            expiry_str: Expiry date as datetime object
+            option_type: 'CE' for Call or 'PE' for Put
+            year: Year of expiry (default: 2025)
+            
+        Returns:
+            Raw JSON response from NSE API or None if error
+        """
+        cookie_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt')
+        cookie_path = cookie_file.name
+        cookie_file.close()
+        
+        try:
+            # Get cookies from homepage
+            subprocess.run([
+                'curl', 'https://www.nseindia.com',
+                '-c', cookie_path, '-s', '-o', '/dev/null',
+                '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            ], timeout=10)
+            
+            # API call with cookies
+            expiry_date = expiry_str.strftime('%d-%b-%Y').upper()  # '28-AUG-2025'
+            
+            url = f"https://www.nseindia.com/api/historicalOR/foCPV?from={from_date}&to={to_date}&instrumentType=OPTIDX&symbol={symbol}&year={year}&expiryDate={expiry_date}&optionType={option_type}&csv=true"
+            print(f"URL ({option_type}): {url}")
+            
+            result = subprocess.run([
+                'curl', url, '-b', cookie_path,
+                '-H', 'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                '-H', 'Accept: application/json',
+                '-H', 'Referer: https://www.nseindia.com/get-quotes/derivatives',
+                '--compressed', '-s'
+            ], capture_output=True, text=True, timeout=30)
+
+            data = json.loads(result.stdout)
+            print(f"  ✓ {len(data.get('data', []))} records")
+            return data
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
+            return None
+        finally:
+            if os.path.exists(cookie_path):
+                os.remove(cookie_path)
+
+
+    def parse_options_data(self, raw_data):
+        """
+        Parse raw options data into structured DataFrame
+        
+        Args:
+            raw_data: Raw JSON response from NSE API
+            
+        Returns:
+            DataFrame with parsed options data
+        """
+        if not raw_data or 'data' not in raw_data:
+            return pd.DataFrame()
+        
+        records = []
+        
+        for item in raw_data['data']:
+            try:
+                record = {
+                    # Date and identification
+                    'date': datetime.strptime(item.get('FH_TIMESTAMP', ''), '%d-%b-%Y').date() if item.get('FH_TIMESTAMP') else None,
+                    'timestamp_order': item.get('FH_TIMESTAMP_ORDER'),
+                    'instrument_type': item.get('FH_INSTRUMENT') or 'OPTIDX',
+                    'symbol': item.get('FH_SYMBOL'),
+                    'market_type': item.get('FH_MARKET_TYPE'),
+                    
+                    # Expiry and strike
+                    'expiry_date': datetime.strptime(item.get('FH_EXPIRY_DT', ''), '%d-%b-%Y').date() if item.get('FH_EXPIRY_DT') else None,
+                    'expiry': datetime.strptime(item.get('FH_EXPIRY_DT', ''), '%d-%b-%Y').date() if item.get('FH_EXPIRY_DT') else None,  # Alias for compatibility
+                    'strike_price': float(item.get('FH_STRIKE_PRICE', 0)),
+                    'option_type': item.get('FH_OPTION_TYPE'),
+                    
+                    # Price data
+                    'open': float(item.get('FH_OPENING_PRICE', 0)),
+                    'high': float(item.get('FH_TRADE_HIGH_PRICE', 0)),
+                    'low': float(item.get('FH_TRADE_LOW_PRICE', 0)),
+                    'close': float(item.get('FH_CLOSING_PRICE', 0)),
+                    'ltp': float(item.get('FH_LAST_TRADED_PRICE', 0)),
+                    'prev_close': float(item.get('FH_PREV_CLS', 0)),
+                    'settle_price': float(item.get('FH_SETTLE_PRICE', 0)),
+                    'calculated_premium': float(item.get('CALCULATED_PREMIUM_VAL', 0)),
+                    
+                    # Volume and OI
+                    'open_interest': int(item.get('FH_OPEN_INT', 0)),
+                    'open_int': int(item.get('FH_OPEN_INT', 0)),  # Alias for compatibility
+                    'change_in_oi': int(item.get('FH_CHANGE_IN_OI', 0)),
+                    'volume': int(item.get('FH_TOT_TRADED_QTY', 0)),
+                    'no_of_contracts': int(item.get('FH_TOT_TRADED_QTY', 0)),  # Alias for compatibility
+                    'traded_value': float(item.get('FH_TOT_TRADED_VAL', 0)),
+                    
+                    # Other
+                    'market_lot': int(item.get('FH_MARKET_LOT', 0)),
+                    'underlying_value': float(item.get('FH_UNDERLYING_VALUE', 0)),
+                    'timestamp': datetime.now()
+                }
+                records.append(record)
+            except Exception as e:
+                print(f"  ⚠ Error parsing record: {str(e)}")
+                continue
+        
+        df = pd.DataFrame(records)
+        
+        # Remove records with missing critical data
+        if not df.empty:
+            df = df.dropna(subset=['date', 'symbol', 'expiry_date'])
+        
+        return df
+
+
+    def fetch_and_parse_options(self, from_date, to_date, symbol='NIFTY', expiry_date=None, option_type='CE'):
+        """
+        Fetch and parse options data in one step
+        
+        Args:
+            from_date: Start date in format 'DD-MM-YYYY'
+            to_date: End date in format 'DD-MM-YYYY'
+            symbol: Symbol name (default: NIFTY)
+            expiry_date: Expiry date as datetime object
+            option_type: 'CE' for Call or 'PE' for Put
+            
+        Returns:
+            DataFrame with parsed options data
+        """
+        raw_data = self.fetch_options_data(from_date, to_date, symbol, expiry_date, option_type)
+        
+        if raw_data:
+            df = self.parse_options_data(raw_data)
+            return df
         
         return pd.DataFrame()

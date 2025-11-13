@@ -18,37 +18,183 @@ def render_trade_history_tab():
     st.subheader("📊 Trade History Analysis")
     st.caption("Comprehensive analysis from Kite Console tradebook export")
     
-    # File path
-    tradebook_path = "database/tradebook.csv"
+    # Add tabs for different data input methods
+    input_tabs = st.tabs(["📁 Upload CSV File", "💾 Use Local File"])
     
-    # Check if file exists
-    if not os.path.exists(tradebook_path):
-        st.error(f"❌ Tradebook file not found at: {tradebook_path}")
-        st.info("💡 Export your tradebook from Kite Console and save it as `database/tradebook.csv`")
+    df = None
+    
+    with input_tabs[0]:
+        st.markdown("### 📤 Upload Tradebook CSV")
+        st.info("Upload your tradebook CSV file exported from Kite Console")
+        
+        # Show expected format
+        with st.expander("📋 Expected CSV Format"):
+            st.code("""
+symbol,isin,trade_date,exchange,segment,series,trade_type,auction,quantity,price,trade_id,order_id,order_execution_time,expiry_date
+NIFTY24DEC24500CE,INE000000000,2024-11-01,NFO,FO,EQ,BUY,N,25,100.50,123456,789012,2024-11-01 10:30:00,2024-12-26
+NIFTY24DEC24500CE,INE000000000,2024-11-02,NFO,FO,EQ,SELL,N,25,150.25,123457,789013,2024-11-02 14:15:00,2024-12-26
+            """, language="csv")
+            st.caption("Sample CSV format - ensure your file follows this structure")
+        
+        uploaded_file = st.file_uploader(
+            "Choose a CSV file",
+            type=['csv'],
+            help="Export your tradebook from Kite Console and upload it here"
+        )
+        
+        if uploaded_file is not None:
+            try:
+                with st.spinner("Loading uploaded tradebook..."):
+                    # Read CSV from uploaded file
+                    df = pd.read_csv(uploaded_file)
+                    df = df.dropna(axis=1, how='all')  # Drop columns that are completely empty
+                    df = df.loc[:, ~df.columns.str.contains('^Unnamed')]  # Drop unnamed columns
+                
+                st.success(f"✅ Loaded {len(df)} trades from uploaded file: **{uploaded_file.name}**")
+                
+                # Display column info for debugging
+                with st.expander("📋 Uploaded File Columns"):
+                    st.write("**Columns found:**", df.columns.tolist())
+                    st.write(f"**Shape:** {df.shape} (rows x columns)")
+                    st.dataframe(df.head(3), use_container_width=True)
+                    
+                    # Validate columns
+                    expected_cols = ['symbol', 'isin', 'trade_date', 'exchange', 'segment', 'series', 'trade_type', 'auction', 'quantity', 'price', 'trade_id', 'order_id', 'order_execution_time', 'expiry_date']
+                    found_cols = df.columns.str.strip().str.lower().tolist()
+                    missing_cols = [col for col in expected_cols if col not in found_cols]
+                    
+                    if missing_cols:
+                        st.warning(f"⚠️ Missing columns: {missing_cols}")
+                        st.info("Analysis will continue with available columns, but some features may not work optimally.")
+                    else:
+                        st.success("✅ All expected columns found!")
+                
+            except Exception as e:
+                st.error(f"❌ Error reading uploaded file: {str(e)}")
+                st.info("Please ensure your file is a valid CSV with comma-separated values.")
+                return
+    
+    with input_tabs[1]:
+        st.markdown("### 💾 Use Local Tradebook File")
+        st.info("Load tradebook from local file: `database/tradebook.csv`")
+        
+        # File path
+        tradebook_path = "database/tradebook.csv"
+        
+        # Check if file exists
+        if not os.path.exists(tradebook_path):
+            st.error(f"❌ Tradebook file not found at: `{tradebook_path}`")
+            st.markdown("""
+            **To use local file:**
+            1. Export your tradebook from Kite Console as CSV
+            2. Save it as `database/tradebook.csv` in your project folder
+            3. Refresh this page
+            """)
+        else:
+            # Show file info
+            file_size = os.path.getsize(tradebook_path)
+            file_size_mb = file_size / (1024 * 1024)
+            st.info(f"📁 Found local file: `{tradebook_path}` ({file_size_mb:.2f} MB)")
+            
+            if st.button("🔄 Load Local Tradebook", type="primary"):
+                try:
+                    # Read tradebook
+                    with st.spinner("Loading local tradebook..."):
+                        # Read CSV and drop any completely empty columns
+                        df = pd.read_csv(tradebook_path)
+                        df = df.dropna(axis=1, how='all')  # Drop columns that are completely empty
+                        df = df.loc[:, ~df.columns.str.contains('^Unnamed')]  # Drop unnamed columns
+                    
+                    st.success(f"✅ Loaded {len(df)} trades from local file")
+                    
+                    # Display column info for debugging
+                    with st.expander("📋 Local File Columns"):
+                        st.write("**Columns found:**", df.columns.tolist())
+                        st.write(f"**Shape:** {df.shape} (rows x columns)")
+                        st.dataframe(df.head(3), use_container_width=True)
+                        
+                        # Validate columns
+                        expected_cols = ['symbol', 'isin', 'trade_date', 'exchange', 'segment', 'series', 'trade_type', 'auction', 'quantity', 'price', 'trade_id', 'order_id', 'order_execution_time', 'expiry_date']
+                        found_cols = df.columns.str.strip().str.lower().tolist()
+                        missing_cols = [col for col in expected_cols if col not in found_cols]
+                        
+                        if missing_cols:
+                            st.warning(f"⚠️ Missing columns: {missing_cols}")
+                            st.info("Analysis will continue with available columns, but some features may not work optimally.")
+                        else:
+                            st.success("✅ All expected columns found!")
+                    
+                except Exception as e:
+                    st.error(f"❌ Error loading local tradebook: {str(e)}")
+                    return
+    
+    # If no data is loaded, return early
+    if df is None or len(df) == 0:
+        st.warning("⚠️ No tradebook data loaded. Please upload a CSV file or ensure the local file exists.")
+        st.markdown("""
+        ### 📋 How to Export Tradebook from Kite:
+        
+        1. **Login to Kite Console**: Go to [console.zerodha.com](https://console.zerodha.com)
+        2. **Navigate to Reports**: Click on "Reports" in the main menu
+        3. **Select Tradebook**: Choose "Tradebook" from the reports section
+        4. **Choose Date Range**: Select your desired date range
+        5. **Download CSV**: Click "Download" and select CSV format
+        6. **Upload Here**: Use the file uploader above to upload your CSV
+        
+        **Expected CSV Format:**
+        ```
+        symbol,isin,trade_date,exchange,segment,series,trade_type,auction,quantity,price,trade_id,order_id,order_execution_time,expiry_date
+        ```
+        """)
         return
     
+    # Continue with the analysis if data is loaded
     try:
-        # Read tradebook
-        with st.spinner("Loading tradebook..."):
-            # Read CSV and drop any completely empty columns
-            df = pd.read_csv(tradebook_path)
-            df = df.dropna(axis=1, how='all')  # Drop columns that are completely empty
-            df = df.loc[:, ~df.columns.str.contains('^Unnamed')]  # Drop unnamed columns
+        # Normalize column names and handle different formats
+        df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
         
-        st.success(f"✅ Loaded {len(df)} trades from tradebook")
+        # Column mapping to handle different export formats from Kite
+        column_mapping = {
+            # Common variations
+            'trading_symbol': 'symbol',
+            'tradingsymbol': 'symbol',
+            'instrument': 'symbol',
+            'script_name': 'symbol',
+            
+            # Date variations
+            'date': 'trade_date',
+            'order_date': 'trade_date',
+            'execution_time': 'order_execution_time',
+            
+            # Type variations
+            'transaction_type': 'trade_type',
+            'trans_type': 'trade_type',
+            'buy_sell': 'trade_type',
+            'side': 'trade_type',
+            
+            # Quantity variations
+            'qty': 'quantity',
+            'volume': 'quantity',
+            
+            # Price variations  
+            'execution_price': 'price',
+            'trade_price': 'price',
+            'rate': 'price',
+            
+            # ID variations
+            'order_no': 'order_id',
+            'trade_no': 'trade_id'
+        }
         
-        # Display column info for debugging
-        with st.expander("📋 Tradebook Columns"):
-            st.write(df.columns.tolist())
-            st.write(f"Shape: {df.shape}")
-            st.dataframe(df.head(3))
-            st.caption("Expected: Symbol, ISIN, Trade Date, Exchange, Segment, Series, Trade Type, Auction, Quantity, Price, Trade ID, Order ID, Order Execution Time")
+        # Apply column mapping
+        df = df.rename(columns=column_mapping)
         
-        # Normalize column names
-        df.columns = df.columns.str.strip()
+        st.info(f"📊 **Data Processing:** Normalized column names and applied mapping for different CSV formats")
         
+        # symbol,isin,trade_date,exchange,segment,series,trade_type,auction,quantity,price,trade_id,order_id,order_execution_time,expiry_date
+
         # Check for required columns
-        required_cols = ['Symbol', 'Trade Date', 'Trade Type', 'Quantity', 'Price']
+        required_cols = ['symbol', 'trade_date', 'trade_type', 'quantity', 'price']
         missing_cols = [col for col in required_cols if col not in df.columns]
         
         if missing_cols:
@@ -57,21 +203,21 @@ def render_trade_history_tab():
             return
         
         # Parse dates
-        df['Trade Date'] = pd.to_datetime(df['Trade Date'], errors='coerce')
+        df['trade_date'] = pd.to_datetime(df['trade_date'], errors='coerce')
         
         # Parse Order Execution Time if available
-        if 'Order Execution Time' in df.columns:
-            df['Order Execution Time'] = pd.to_datetime(df['Order Execution Time'], errors='coerce')
-        
+        if 'order_execution_time' in df.columns:
+            df['order_execution_time'] = pd.to_datetime(df['order_execution_time'], errors='coerce')
+
         # Calculate trade value
-        df['Trade Value'] = df['Quantity'] * df['Price']
-        
+        df['trade_value'] = df['quantity'] * df['price']
+
         # Add date range filter
         st.markdown("### 📅 Filter by Date Range")
         col1, col2, col3 = st.columns([1, 1, 2])
-        
-        min_date = df['Trade Date'].min()
-        max_date = df['Trade Date'].max()
+
+        min_date = df['trade_date'].min()
+        max_date = df['trade_date'].max()
         
         with col1:
             start_date = st.date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date)
@@ -80,7 +226,7 @@ def render_trade_history_tab():
             end_date = st.date_input("End Date", value=max_date, min_value=min_date, max_value=max_date)
         
         # Filter by date range
-        mask = (df['Trade Date'] >= pd.Timestamp(start_date)) & (df['Trade Date'] <= pd.Timestamp(end_date))
+        mask = (df['trade_date'] >= pd.Timestamp(start_date)) & (df['trade_date'] <= pd.Timestamp(end_date))
         df_filtered = df[mask].copy()
         
         with col3:
@@ -103,76 +249,76 @@ def render_trade_history_tab():
             
             # If no match, return first 15 chars (should capture underlying + expiry)
             return symbol_trimmed
-        
-        df_filtered['Expiry'] = df_filtered['Symbol'].apply(extract_expiry)
-        
+
+        df_filtered['expiry'] = df_filtered['symbol'].apply(extract_expiry)
+
         st.info("📅 Grouping trades by expiry cycle for strategy-level analysis (Iron Condor / Short Strangle)")
         
         # Show expiry extraction results
         with st.expander("🔍 Debug: Expiry Extraction"):
-            sample_df = df_filtered[['Symbol', 'Expiry']].drop_duplicates().head(10)
+            sample_df = df_filtered[['symbol', 'expiry']].drop_duplicates().head(10)
             st.dataframe(sample_df, use_container_width=True)
-            st.caption(f"Found {df_filtered['Expiry'].nunique()} unique expiry cycles")
-        
+            st.caption(f"Found {df_filtered['expiry'].nunique()} unique expiry cycles")
+
         # ========== MATCH TRADES AND GROUP BY EXPIRY ==========
         # First, match individual buy/sell pairs
         matched_trades = []
-        
-        for symbol in df_filtered['Symbol'].unique():
-            symbol_trades = df_filtered[df_filtered['Symbol'] == symbol].copy()
-            symbol_trades = symbol_trades.sort_values('Trade Date')
+
+        for symbol in df_filtered['symbol'].unique():
+            symbol_trades = df_filtered[df_filtered['symbol'] == symbol].copy()
+            symbol_trades = symbol_trades.sort_values('trade_date')
             
-            buys = symbol_trades[symbol_trades['Trade Type'].str.upper() == 'BUY'].copy()
-            sells = symbol_trades[symbol_trades['Trade Type'].str.upper() == 'SELL'].copy()
+            buys = symbol_trades[symbol_trades['trade_type'].str.upper() == 'BUY'].copy()
+            sells = symbol_trades[symbol_trades['trade_type'].str.upper() == 'SELL'].copy()
             
             # Simple FIFO matching
             for _, buy in buys.iterrows():
-                remaining_qty = buy['Quantity']
-                buy_price = buy['Price']
-                buy_date = buy['Trade Date']
-                expiry = buy['Expiry']
+                remaining_qty = buy['quantity']
+                buy_price = buy['price']
+                buy_date = buy['trade_date']
+                expiry = buy['expiry']
                 
                 for idx, sell in sells.iterrows():
                     if remaining_qty <= 0:
                         break
                     
-                    if sell['Quantity'] > 0:
-                        matched_qty = min(remaining_qty, sell['Quantity'])
+                    if sell['quantity'] > 0:
+                        matched_qty = min(remaining_qty, sell['quantity'])
                         
                         # Calculate P&L for this matched pair
-                        pnl = matched_qty * (sell['Price'] - buy_price)
+                        pnl = matched_qty * (sell['price'] - buy_price)
                         
                         # Calculate duration
-                        duration = (sell['Trade Date'] - buy_date).total_seconds() / 3600  # hours
+                        duration = (sell['trade_date'] - buy_date).total_seconds() / 3600  # hours
                         
                         matched_trades.append({
-                            'Symbol': symbol,
-                            'Expiry': expiry,
-                            'Quantity': matched_qty,
-                            'Buy Price': buy_price,
-                            'Sell Price': sell['Price'],
-                            'P&L': pnl,
-                            'Entry Date': buy_date,
-                            'Exit Date': sell['Trade Date'],
-                            'Duration (hrs)': duration,
-                            'Trade Value': matched_qty * buy_price
+                            'symbol': symbol,
+                            'expiry': expiry,
+                            'quantity': matched_qty,
+                            'buy_price': buy_price,
+                            'sell_price': sell['price'],
+                            'pnl': pnl,
+                            'entry_date': buy_date,
+                            'exit_date': sell['trade_date'],
+                            'duration_hrs': duration,
+                            'trade_value': matched_qty * buy_price
                         })
                         
                         # Update remaining quantities
                         remaining_qty -= matched_qty
-                        sells.at[idx, 'Quantity'] -= matched_qty
+                        sells.at[idx, 'quantity'] -= matched_qty
         
         matched_df = pd.DataFrame(matched_trades)
         
         # ========== GROUP BY EXPIRY FOR STRATEGY-LEVEL METRICS ==========
         if len(matched_df) > 0:
             # Group all trades by expiry
-            expiry_groups = matched_df.groupby('Expiry').agg({
-                'P&L': 'sum',
-                'Entry Date': 'min',
-                'Exit Date': 'max',
-                'Trade Value': 'sum',
-                'Symbol': 'count'  # Number of legs in the strategy
+            expiry_groups = matched_df.groupby('expiry').agg({
+                'pnl': 'sum',
+                'entry_date': 'min',
+                'exit_date': 'max',
+                'trade_value': 'sum',
+                'symbol': 'count'  # Number of legs in the strategy
             }).reset_index()
             
             expiry_groups.columns = ['Expiry', 'P&L', 'Entry Date', 'Exit Date', 'Trade Value', 'Num Legs']
@@ -236,8 +382,8 @@ def render_trade_history_tab():
                 st.info("Showing raw trade data instead")
                 
                 # Show basic stats from raw data
-                buy_value = df_filtered[df_filtered['Trade Type'].str.upper() == 'BUY']['Trade Value'].sum()
-                sell_value = df_filtered[df_filtered['Trade Type'].str.upper() == 'SELL']['Trade Value'].sum()
+                buy_value = df_filtered[df_filtered['trade_type'].str.upper() == 'BUY']['trade_value'].sum()
+                sell_value = df_filtered[df_filtered['trade_type'].str.upper() == 'SELL']['trade_value'].sum()
                 gross_pnl_raw = sell_value - buy_value
                 
                 col1, col2 = st.columns(2)
@@ -679,9 +825,9 @@ def render_trade_history_tab():
             # Individual legs by symbol
             st.markdown("#### Performance by Individual Legs (Symbols)")
             
-            symbol_performance = matched_df.groupby('Symbol').agg({
-                'P&L': ['sum', 'count', 'mean'],
-                'Quantity': 'sum'
+            symbol_performance = matched_df.groupby('symbol').agg({
+                'pnl': ['sum', 'count', 'mean'],
+                'quantity': 'sum'
             }).reset_index()
             
             symbol_performance.columns = ['Symbol', 'Total P&L', 'Leg Count', 'Avg P&L', 'Total Qty']
@@ -871,12 +1017,12 @@ def render_trade_history_tab():
                     st.markdown("#### Matched Buy-Sell Pairs")
                     st.dataframe(
                         matched_df.style.format({
-                            'Buy Price': '₹{:.2f}',
-                            'Sell Price': '₹{:.2f}',
-                            'P&L': '₹{:,.2f}',
-                            'Quantity': '{:.0f}',
-                            'Duration (hrs)': '{:.1f}',
-                            'Trade Value': '₹{:,.2f}'
+                            'buy_price': '₹{:.2f}',
+                            'sell_price': '₹{:.2f}',
+                            'pnl': '₹{:,.2f}',
+                            'quantity': '{:.0f}',
+                            'duration_hrs': '{:.1f}',
+                            'trade_value': '₹{:,.2f}'
                         }),
                         use_container_width=True,
                         height=600

@@ -74,11 +74,15 @@ def calculate_greeks(
     try:
         flag = 'c' if option_type == 'CE' else 'p'
         
+        print(f"DEBUG calculate_greeks: flag={flag}, spot={spot}, strike={strike}, t={time_to_expiry}, r={risk_free_rate}, iv={implied_vol}")
+        
         # Calculate greeks using py_vollib
         delta = greeks.delta(flag, spot, strike, time_to_expiry, risk_free_rate, implied_vol)
         gamma = greeks.gamma(flag, spot, strike, time_to_expiry, risk_free_rate, implied_vol)
         vega_raw = greeks.vega(flag, spot, strike, time_to_expiry, risk_free_rate, implied_vol)
         theta_raw = greeks.theta(flag, spot, strike, time_to_expiry, risk_free_rate, implied_vol)
+        
+        print(f"DEBUG calculate_greeks result: delta={delta}, gamma={gamma}, vega={vega_raw}, theta={theta_raw}")
 
         # py_vollib returns vega as change in price for a change in volatility of 1.0
         # (i.e. 100 percentage points). Most UIs report vega per 1% change in vol.
@@ -126,6 +130,7 @@ def enrich_position_with_greeks(
     parsed = parse_tradingsymbol(symbol)
     
     if not parsed:
+        print(f"DEBUG: Failed to parse symbol: {symbol}")
         return {**position, "error": "Could not parse symbol"}
     
     strike = parsed["strike"]
@@ -140,16 +145,23 @@ def enrich_position_with_greeks(
     # Get current option price
     last_price = position.get("last_price", 0)
     
+    # Debug: Print position details
+    print(f"DEBUG: Processing {symbol}")
+    print(f"  - Parsed: strike={strike}, expiry={expiry.date()}, type={option_type}")
+    print(f"  - DTE={dte}, spot={current_spot}, last_price={last_price}")
+    
     # Try to get IV from options_df if available
     matching_options = options_df[
         (options_df["strike_price"] == strike) &
-        (options_df["expiry"] == expiry) &
+        (options_df["expiry_date"] == expiry) &
         (options_df["option_type"] == option_type)
     ]
     
+    print(f"  - Found {len(matching_options)} matching options in df")
+    
     if not matching_options.empty:
         latest = matching_options.sort_values("date", ascending=False).iloc[0]
-        option_price = latest.get("ltp", last_price) or last_price
+        option_price = latest["ltp"] if "ltp" in latest and pd.notna(latest["ltp"]) else last_price
     else:
         option_price = last_price
     
@@ -158,13 +170,18 @@ def enrich_position_with_greeks(
         option_price, current_spot, strike, time_to_expiry, option_type
     )
     
+    print(f"  - Option price used: {option_price}, calculated IV: {implied_vol}")
+    
     if implied_vol is None or implied_vol <= 0:
         implied_vol = 0.20  # Default 20% if calculation fails
+        print(f"  - Using default IV: {implied_vol}")
     
     # Calculate Greeks
     position_greeks = calculate_greeks(
         current_spot, strike, time_to_expiry, implied_vol, option_type
     )
+    
+    print(f"  - Calculated greeks: delta={position_greeks.get('delta')}, gamma={position_greeks.get('gamma')}, vega={position_greeks.get('vega')}, theta={position_greeks.get('theta')}")
 
     # Determine position size (net quantity, negative for short)
     quantity = position.get("quantity", 0) or 0

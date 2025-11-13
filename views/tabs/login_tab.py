@@ -3,6 +3,22 @@
 import os
 import webbrowser
 import streamlit as st
+from pathlib import Path
+import json
+
+# Path to credentials file
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
+KITE_CREDS_FILE = CACHE_DIR / "kite_credentials.json"
+
+
+def clear_kite_credentials():
+    """Clear saved Kite credentials file."""
+    try:
+        if KITE_CREDS_FILE.exists():
+            KITE_CREDS_FILE.unlink()
+    except Exception as e:
+        st.error(f"Failed to clear credentials: {e}")
 
 
 def render_login_tab():
@@ -32,7 +48,11 @@ def render_login_tab():
         st.session_state.pop("kite_api_key", None)
         st.session_state.kite_login_initiated = False
         st.session_state.kite_processing_token = False
-        st.success("Logged out")
+        
+        # Clear persistent credentials file
+        clear_kite_credentials()
+        
+        st.success("Logged out and cleared saved credentials")
         st.rerun()
 
     if login_clicked and api_key and api_secret:

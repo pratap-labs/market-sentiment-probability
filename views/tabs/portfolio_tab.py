@@ -14,7 +14,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from views.utils import (
+from scripts.utils import (
     calculate_portfolio_greeks,
     calculate_var,
     calculate_stress_pnl,
@@ -39,8 +39,8 @@ def render_portfolio_tab():
     access_token = st.session_state.get("kite_access_token")
     kite_api_key = st.session_state.get("kite_api_key")
     
-    margin_available = 500000  # Default, will fetch from Kite
-    margin_used = 320000  # Default, will fetch from Kite
+    margin_available = 1150000  # Default, will fetch from Kite
+    margin_used = 1300000  # Default, will fetch from Kite
     
     if access_token and kite_api_key:
         try:
@@ -140,7 +140,7 @@ def render_portfolio_tab():
 
     with col1:
         delta_abs = abs(total_delta)
-        delta_status = "🟢" if delta_abs < 8 else ("🟡" if delta_abs < 15 else "🔴")
+        delta_status = "🟢" if delta_abs < 40 else ("🟡" if delta_abs < 100 else "🔴")
         st.metric("Net Delta (units)", f"{total_delta:.2f} {delta_status}")
 
     # Compute presentation-only conversions (no greeks math changed)
@@ -170,12 +170,12 @@ def render_portfolio_tab():
         st.metric("Vega % Capital", f"{vega_pct:.2f}%")
     
     # Greeks breakdown chart
-    st.markdown("#### Greeks Breakdown")
+    # st.markdown("#### Greeks Breakdown")
     greeks_data = pd.DataFrame({
         "Greek": ["Delta", "Gamma×100", "Vega/100", "Theta"],
         "Value": [total_delta, total_gamma * 100, total_vega / 100, total_theta]
     })
-    st.bar_chart(greeks_data.set_index("Greek"))
+    # st.bar_chart(greeks_data.set_index("Greek"))
     
     # ========== SECTION 3: RISK ANALYSIS ==========
     st.markdown("### ⚠️ Risk Analysis")
@@ -211,15 +211,15 @@ def render_portfolio_tab():
     risk_alerts = []
     
     # Delta check
-    if abs(total_delta) > 15:
-        risk_alerts.append("🔴 **CRITICAL**: Net Delta > ±15 - High directional risk")
-    elif abs(total_delta) > 8:
-        risk_alerts.append("🟡 **WARNING**: Net Delta > ±8 - Monitor directional exposure")
+    if abs(total_delta) > 100:
+        risk_alerts.append("🔴 **CRITICAL**: Net Delta > ±100 - High directional risk")
+    elif abs(total_delta) > 40:
+        risk_alerts.append("🟡 **WARNING**: Net Delta > ±40 - Monitor directional exposure")
     else:
         risk_alerts.append("🟢 **OK**: Delta is neutral")
     
     # Margin check
-    if margin_util_pct > 70:
+    if margin_util_pct > 80:
         risk_alerts.append("🔴 **CRITICAL**: Margin utilization > 70% - Limited room for adjustments")
     elif margin_util_pct > 50:
         risk_alerts.append("🟡 **WARNING**: Margin utilization > 50%")
