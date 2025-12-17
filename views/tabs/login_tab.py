@@ -46,6 +46,7 @@ def render_login_tab():
     if logout_clicked:
         st.session_state.pop("kite_access_token", None)
         st.session_state.pop("kite_api_key", None)
+        st.session_state.pop("kite_token_timestamp", None)
         st.session_state.kite_login_initiated = False
         st.session_state.kite_processing_token = False
         
@@ -70,6 +71,6 @@ def render_login_tab():
         st.warning("⏳ Complete the login in the browser window. This page will update automatically after redirect.")
 
     if st.session_state.get("kite_access_token"):
-        st.success("✅ You are logged in. Switch to the Positions tab to fetch positions.")
+        st.success("✅ You are logged in. Other dashboard tabs are now available.")
     elif st.session_state.kite_login_initiated:
         st.info("⏳ Waiting for login completion. Complete the login in your browser.")

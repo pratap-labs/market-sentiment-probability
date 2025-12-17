@@ -30,6 +30,25 @@ from .formatters import (
     DEFAULT_LOT_SIZE
 )
 
+from .stress_testing import (
+    Scenario,
+    DEFAULT_SCENARIOS,
+    STRESS_LIMIT_DEFAULTS,
+    get_regime_note,
+    get_weighted_scenarios,
+    classify_scenario_limit,
+    compute_scenario_pnl,
+    build_stress_report,
+    generate_stress_suggestions,
+    classify_bucket,
+    classify_history_bucket,
+    normalize_probabilities,
+    compute_var_es_metrics,
+    derive_thresholds,
+    compute_threshold_scenario_pnl,
+    build_threshold_report,
+)
+
 
 __all__ = [
 
@@ -61,4 +80,22 @@ __all__ = [
     # Formatters
     'format_inr',
     'DEFAULT_LOT_SIZE',
+
+    # Stress testing
+    'Scenario',
+    'DEFAULT_SCENARIOS',
+    'STRESS_LIMIT_DEFAULTS',
+    'get_regime_note',
+    'get_weighted_scenarios',
+    'classify_scenario_limit',
+    'compute_scenario_pnl',
+    'build_stress_report',
+    'generate_stress_suggestions',
+    'classify_bucket',
+    'classify_history_bucket',
+    'normalize_probabilities',
+    'compute_var_es_metrics',
+    'derive_thresholds',
+    'compute_threshold_scenario_pnl',
+    'build_threshold_report',
 ]

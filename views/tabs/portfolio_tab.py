@@ -247,6 +247,9 @@ def render_portfolio_tab():
     for alert in risk_alerts:
         st.markdown(alert)
     
+    st.markdown("---")
+    st.info("💡 For detailed zone-based risk analysis, see the **Risk Analysis** tab")
+    
     # ========== SECTION 4: POSITION CONCENTRATION ==========
     st.markdown("### 🎯 Position Concentration")
     

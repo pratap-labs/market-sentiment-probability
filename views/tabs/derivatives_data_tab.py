@@ -5,10 +5,10 @@ import pandas as pd
 import requests
 from datetime import datetime, timedelta
 from pathlib import Path
-import json
 import os
 import sys
 import time
+from typing import Dict, List, Optional
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if ROOT not in sys.path:
@@ -19,24 +19,56 @@ from scripts.data import NSEDataFetcher
 # Cache directory
 CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_TTL = timedelta(days=1)
 
 
-def get_cache_filename(data_type: str, date: str = None) -> Path:
-    """Generate cache filename based on data type and date."""
-    if date is None:
-        date = datetime.now().strftime('%Y-%m-%d')
-    return CACHE_DIR / f"{data_type}_{date}.csv"
+def get_cache_filename(data_type: str) -> Path:
+    """Generate cache filename based on data type."""
+    return CACHE_DIR / f"{data_type}.csv"
 
 
-def load_from_cache(data_type: str) -> pd.DataFrame:
-    """Load data from most recent cache file."""
+def get_cache_status(data_type: str) -> Dict[str, Optional[datetime]]:
+    """Return cache metadata including freshness flag."""
     cache_file = get_cache_filename(data_type)
-    if cache_file.exists():
-        df = pd.read_csv(cache_file)
-        st.success(f"✅ Loaded from cache: {cache_file.name}")
+    if not cache_file.exists():
+        return {
+            "path": cache_file,
+            "exists": False,
+            "fresh": False,
+            "last_updated": None,
+            "expires_at": None
+        }
+    last_updated = datetime.fromtimestamp(cache_file.stat().st_mtime)
+    expires_at = last_updated + CACHE_TTL
+    is_fresh = datetime.now() <= expires_at
+    return {
+        "path": cache_file,
+        "exists": True,
+        "fresh": is_fresh,
+        "last_updated": last_updated,
+        "expires_at": expires_at
+    }
+
+
+def load_from_cache(data_type: str, silent: bool = False) -> pd.DataFrame:
+    """Load data from cache if it exists and is within TTL."""
+    status = get_cache_status(data_type)
+    if not status["exists"]:
+        if not silent:
+            st.warning(f"⚠️ No cache found for {data_type}. Please fetch fresh data.")
+        return pd.DataFrame()
+    if not status["fresh"]:
+        if not silent:
+            st.warning(f"⚠️ Cache for {data_type} has expired. Fetch fresh data from the Derivatives Data tab.")
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(status["path"])
+        if not silent:
+            st.success(f"✅ Loaded from cache: {status['path'].name}")
         return df
-    else:
-        st.warning(f"⚠️ No cache found for {data_type}. Please fetch fresh data.")
+    except Exception as exc:
+        if not silent:
+            st.error(f"❌ Failed to read cache for {data_type}: {exc}")
         return pd.DataFrame()
 
 
@@ -44,21 +76,106 @@ def save_to_cache(df: pd.DataFrame, data_type: str):
     """Save dataframe to cache file."""
     cache_file = get_cache_filename(data_type)
     df.to_csv(cache_file, index=False)
-    st.success(f"💾 Saved to cache: {cache_file.name}")
+    st.success(f"💾 Saved to cache: {cache_file.name} (valid for 24h)")
+
+
+def load_cached_derivatives_data_for_session() -> List[str]:
+    """
+    Load cached derivatives datasets into session state after login.
+    
+    Returns:
+        List of data categories that are missing or expired.
+    """
+    missing_categories: List[str] = []
+
+    # NIFTY OHLCV
+    nifty_status = get_cache_status("nifty_ohlcv")
+    if nifty_status["fresh"]:
+        try:
+            st.session_state["nifty_df_cache"] = pd.read_csv(nifty_status["path"])
+        except Exception:
+            missing_categories.append("NIFTY OHLCV")
+            st.session_state.pop("nifty_df_cache", None)
+    else:
+        missing_categories.append("NIFTY OHLCV")
+        st.session_state.pop("nifty_df_cache", None)
+
+    # Futures
+    futures_status = get_cache_status("nifty_futures")
+    if futures_status["fresh"]:
+        try:
+            st.session_state["nifty_futures_df_cache"] = pd.read_csv(futures_status["path"])
+        except Exception:
+            missing_categories.append("NIFTY Futures")
+            st.session_state.pop("nifty_futures_df_cache", None)
+    else:
+        missing_categories.append("NIFTY Futures")
+        st.session_state.pop("nifty_futures_df_cache", None)
+
+    # Options CE/PE
+    ce_status = get_cache_status("nifty_options_ce")
+    pe_status = get_cache_status("nifty_options_pe")
+
+    ce_df = pd.DataFrame()
+    pe_df = pd.DataFrame()
+
+    if ce_status["fresh"]:
+        try:
+            ce_df = pd.read_csv(ce_status["path"])
+            st.session_state["options_ce_df_cache"] = ce_df
+        except Exception:
+            ce_df = pd.DataFrame()
+    else:
+        st.session_state.pop("options_ce_df_cache", None)
+
+    if ce_df.empty:
+        missing_categories.append("NIFTY Options (CE)")
+
+    if pe_status["fresh"]:
+        try:
+            pe_df = pd.read_csv(pe_status["path"])
+            st.session_state["options_pe_df_cache"] = pe_df
+        except Exception:
+            pe_df = pd.DataFrame()
+    else:
+        st.session_state.pop("options_pe_df_cache", None)
+
+    if pe_df.empty:
+        missing_categories.append("NIFTY Options (PE)")
+
+    if not ce_df.empty and not pe_df.empty:
+        st.session_state["options_df_cache"] = pd.concat([ce_df, pe_df], ignore_index=True)
+    elif not ce_df.empty:
+        st.session_state["options_df_cache"] = ce_df.copy()
+    elif not pe_df.empty:
+        st.session_state["options_df_cache"] = pe_df.copy()
+    else:
+        st.session_state.pop("options_df_cache", None)
+
+    return missing_categories
 
 
 # ==================== NIFTY OHLCV SUBTAB ====================
 def render_nifty_ohlcv_subtab():
     """Fetch NIFTY daily data from Kite for last 2 years."""
     
+    cache_status = get_cache_status("nifty_ohlcv")
+    load_disabled = not cache_status["fresh"]
+
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("📂 Load from Cache", key="nifty_load_cache"):
+        load_help = None
+        if load_disabled:
+            load_help = "Cache unavailable" if not cache_status["exists"] else "Cache expired (older than 24h)"
+        if st.button("📂 Load from Cache", key="nifty_load_cache", disabled=load_disabled, help=load_help):
             df = load_from_cache("nifty_ohlcv")
             if not df.empty:
+                st.session_state["nifty_df_cache"] = df
                 st.dataframe(df, use_container_width=True, height=400)
                 st.info(f"📊 Loaded {len(df)} rows")
+        if load_disabled:
+            st.caption("ℹ️ Fetch fresh data to enable cache loading.")
     
     with col2:
         if st.button("🔄 Fetch Fresh Data", key="nifty_fetch_fresh"):
@@ -106,7 +223,9 @@ def render_nifty_ohlcv_subtab():
                         
                         # Save to cache
                         save_to_cache(df, "nifty_ohlcv")
-                        
+                        cache_status = get_cache_status("nifty_ohlcv")
+                        st.session_state["nifty_df_cache"] = df
+                    
                         # Display data
                         st.dataframe(df, use_container_width=True, height=400)
                         st.success(f"✅ Fetched {len(df)} rows of NIFTY data")
@@ -130,10 +249,11 @@ def render_nifty_ohlcv_subtab():
                     st.error(f"❌ Error fetching NIFTY data: {str(e)}")
     
     # Show cache info
-    cache_file = get_cache_filename("nifty_ohlcv")
-    if cache_file.exists():
-        mod_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
-        st.caption(f"🕐 Cache last updated: {mod_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    if cache_status["last_updated"]:
+        mod_time = cache_status["last_updated"]
+        st.caption(f"🕐 Cache last updated: {mod_time.strftime('%Y-%m-%d %H:%M:%S')} (expires after 24h)")
+    else:
+        st.caption("🕐 Cache last updated: never")
 
 
 # ==================== FUTURES DATA SUBTAB ====================
@@ -143,15 +263,23 @@ def render_futures_data_subtab():
     # Hardcoded expiries (next 3 monthly expiries)
     expiries = ["25-Nov-2025", "30-Dec-2025", "27-Jan-2026"]
     st.info(f"📅 Expiries: {', '.join(expiries)}")
+    cache_status = get_cache_status("nifty_futures")
+    load_disabled = not cache_status["fresh"]
     
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("📂 Load from Cache", key="futures_load_cache"):
+        load_help = None
+        if load_disabled:
+            load_help = "Cache unavailable" if not cache_status["exists"] else "Cache expired (older than 24h)"
+        if st.button("📂 Load from Cache", key="futures_load_cache", disabled=load_disabled, help=load_help):
             df = load_from_cache("nifty_futures")
             if not df.empty:
+                st.session_state["nifty_futures_df_cache"] = df
                 st.dataframe(df, use_container_width=True, height=400)
                 st.info(f"📊 Loaded {len(df)} rows")
+        if load_disabled:
+            st.caption("ℹ️ Fetch fresh data to enable cache loading.")
     
     with col2:
         if st.button("🔄 Fetch Fresh Data", key="futures_fetch_fresh"):
@@ -195,6 +323,8 @@ def render_futures_data_subtab():
                     if all_futures_data:
                         df_combined = pd.concat(all_futures_data, ignore_index=True)
                         save_to_cache(df_combined, "nifty_futures")
+                        cache_status = get_cache_status("nifty_futures")
+                        st.session_state["nifty_futures_df_cache"] = df_combined
                         st.dataframe(df_combined, use_container_width=True, height=400)
                         st.success(f"✅ Total {len(df_combined)} rows fetched")
                     else:
@@ -207,10 +337,11 @@ def render_futures_data_subtab():
 
     
     # Show cache info
-    cache_file = get_cache_filename("nifty_futures")
-    if cache_file.exists():
-        mod_time = datetime.fromtimestamp(cache_file.stat().st_mtime)
-        st.caption(f"🕐 Cache last updated: {mod_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    if cache_status["last_updated"]:
+        mod_time = cache_status["last_updated"]
+        st.caption(f"🕐 Cache last updated: {mod_time.strftime('%Y-%m-%d %H:%M:%S')} (expires after 24h)")
+    else:
+        st.caption("🕐 Cache last updated: never")
 
 
 # ==================== OPTIONS DATA SUBTAB ====================
@@ -219,15 +350,37 @@ def render_options_data_subtab():
     # Hardcoded expiries (next 3 monthly expiries)
     expiries = ["25-Nov-2025", "30-Dec-2025", "27-Jan-2026"]
     st.info(f"📅 Expiries: {', '.join(expiries)}")
+    cache_status_ce = get_cache_status("nifty_options_ce")
+    cache_status_pe = get_cache_status("nifty_options_pe")
+    load_disabled = not (cache_status_ce["fresh"] and cache_status_pe["fresh"])
     
     col1, col2 = st.columns(2)
     
     with col1:
-        if st.button("📂 Load from Cache", key="options_load_cache"):
+        if load_disabled:
+            if not cache_status_ce["exists"] or not cache_status_pe["exists"]:
+                load_help = "Cache unavailable"
+            else:
+                load_help = "Cache expired (older than 24h)"
+        else:
+            load_help = None
+
+        if st.button("📂 Load from Cache", key="options_load_cache", disabled=load_disabled, help=load_help):
             df_ce = load_from_cache("nifty_options_ce")
             df_pe = load_from_cache("nifty_options_pe")
             
             if not df_ce.empty or not df_pe.empty:
+                if not df_ce.empty:
+                    st.session_state["options_ce_df_cache"] = df_ce
+                if not df_pe.empty:
+                    st.session_state["options_pe_df_cache"] = df_pe
+                if not df_ce.empty and not df_pe.empty:
+                    st.session_state["options_df_cache"] = pd.concat([df_ce, df_pe], ignore_index=True)
+                elif not df_ce.empty:
+                    st.session_state["options_df_cache"] = df_ce.copy()
+                elif not df_pe.empty:
+                    st.session_state["options_df_cache"] = df_pe.copy()
+
                 tab1, tab2 = st.tabs(["📈 Call Options (CE)", "📉 Put Options (PE)"])
                 
                 with tab1:
@@ -239,6 +392,8 @@ def render_options_data_subtab():
                     if not df_pe.empty:
                         st.dataframe(df_pe, use_container_width=True, height=400)
                         st.info(f"📊 Loaded {len(df_pe)} PE rows")
+        if load_disabled:
+            st.caption("ℹ️ Fetch fresh CE & PE data to enable cache loading.")
     
     with col2:
         if st.button("🔄 Fetch Fresh Data", key="options_fetch_fresh"):
@@ -305,10 +460,21 @@ def render_options_data_subtab():
                     if all_ce_data:
                         df_ce_combined = pd.concat(all_ce_data, ignore_index=True)
                         save_to_cache(df_ce_combined, "nifty_options_ce")
+                        cache_status_ce = get_cache_status("nifty_options_ce")
+                        st.session_state["options_ce_df_cache"] = df_ce_combined
                     
                     if all_pe_data:
                         df_pe_combined = pd.concat(all_pe_data, ignore_index=True)
                         save_to_cache(df_pe_combined, "nifty_options_pe")
+                        cache_status_pe = get_cache_status("nifty_options_pe")
+                        st.session_state["options_pe_df_cache"] = df_pe_combined
+
+                    if all_ce_data and all_pe_data:
+                        st.session_state["options_df_cache"] = pd.concat([df_ce_combined, df_pe_combined], ignore_index=True)
+                    elif all_ce_data:
+                        st.session_state["options_df_cache"] = df_ce_combined.copy()
+                    elif all_pe_data:
+                        st.session_state["options_df_cache"] = df_pe_combined.copy()
                     
                     # Display
                     if all_ce_data or all_pe_data:
@@ -332,18 +498,22 @@ def render_options_data_subtab():
                     st.code(traceback.format_exc())
     
     # Show cache info
-    cache_file_ce = get_cache_filename("nifty_options_ce")
-    cache_file_pe = get_cache_filename("nifty_options_pe")
+    cache_file_ce = cache_status_ce["path"]
+    cache_file_pe = cache_status_pe["path"]
     
     col1, col2 = st.columns(2)
     with col1:
-        if cache_file_ce.exists():
-            mod_time = datetime.fromtimestamp(cache_file_ce.stat().st_mtime)
-            st.caption(f"🕐 CE cache updated: {mod_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        if cache_status_ce["last_updated"]:
+            mod_time = cache_status_ce["last_updated"]
+            st.caption(f"🕐 CE cache updated: {mod_time.strftime('%Y-%m-%d %H:%M:%S')} (expires after 24h)")
+        else:
+            st.caption("🕐 CE cache updated: never")
     with col2:
-        if cache_file_pe.exists():
-            mod_time = datetime.fromtimestamp(cache_file_pe.stat().st_mtime)
-            st.caption(f"🕐 PE cache updated: {mod_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        if cache_status_pe["last_updated"]:
+            mod_time = cache_status_pe["last_updated"]
+            st.caption(f"🕐 PE cache updated: {mod_time.strftime('%Y-%m-%d %H:%M:%S')} (expires after 24h)")
+        else:
+            st.caption("🕐 PE cache updated: never")
 
 
 # ==================== MAIN TAB RENDER ====================

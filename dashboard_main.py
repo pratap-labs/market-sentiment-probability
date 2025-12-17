@@ -9,6 +9,8 @@ import streamlit as st
 import pandas as pd
 import json
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from typing import Optional
 
 # Add project root to path
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -19,6 +21,7 @@ if ROOT not in sys.path:
 CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 KITE_CREDS_FILE = CACHE_DIR / "kite_credentials.json"
+KITE_TOKEN_TTL = timedelta(hours=12)
 
 try:
     from kiteconnect import KiteConnect
@@ -47,10 +50,14 @@ from views.tabs import (
     render_trade_history_tab,
     render_data_hub_tab,
     render_kite_instruments_tab,
-    render_nifty_overview_tab
+    render_nifty_overview_tab,
+    render_risk_analysis_tab
 )
 
-from views.tabs.derivatives_data_tab import render_derivatives_data_tab
+from views.tabs.derivatives_data_tab import (
+    render_derivatives_data_tab,
+    load_cached_derivatives_data_for_session
+)
 
 try:
     from views.tabs import data_hub_tab
@@ -59,17 +66,21 @@ except Exception as e:
     print(f"Failed to import data_hub: {e}")
 
 
-def save_kite_credentials(access_token: str, api_key: str):
+def save_kite_credentials(access_token: str, api_key: str, saved_at: Optional[str] = None):
     """Save Kite credentials to persistent file."""
     try:
+        saved_at = saved_at or datetime.now(timezone.utc).isoformat()
         creds = {
             "access_token": access_token,
-            "api_key": api_key
+            "api_key": api_key,
+            "saved_at": saved_at
         }
         with open(KITE_CREDS_FILE, 'w') as f:
             json.dump(creds, f)
+        return saved_at
     except Exception as e:
         st.error(f"Failed to save credentials: {e}")
+        return None
 
 
 def load_kite_credentials():
@@ -78,10 +89,14 @@ def load_kite_credentials():
         if KITE_CREDS_FILE.exists():
             with open(KITE_CREDS_FILE, 'r') as f:
                 creds = json.load(f)
-                return creds.get("access_token"), creds.get("api_key")
+                return (
+                    creds.get("access_token"),
+                    creds.get("api_key"),
+                    creds.get("saved_at")
+                )
     except Exception as e:
         st.error(f"Failed to load credentials: {e}")
-    return None, None
+    return None, None, None
 
 
 def clear_kite_credentials():
@@ -91,6 +106,38 @@ def clear_kite_credentials():
             KITE_CREDS_FILE.unlink()
     except Exception as e:
         st.error(f"Failed to clear credentials: {e}")
+
+
+def clear_kite_session_state():
+    """Remove Kite auth info from Streamlit session state."""
+    st.session_state.pop("kite_access_token", None)
+    st.session_state.pop("kite_api_key", None)
+    st.session_state.pop("kite_token_timestamp", None)
+
+
+def is_token_expired(saved_at: Optional[str]) -> bool:
+    """Return True if the stored Kite token timestamp is older than the TTL."""
+    if not saved_at:
+        return True
+    try:
+        saved_dt = datetime.fromisoformat(saved_at)
+    except ValueError:
+        return True
+    if saved_dt.tzinfo is None:
+        saved_dt = saved_dt.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - saved_dt >= KITE_TOKEN_TTL
+
+
+def enforce_kite_token_ttl():
+    """Expire the in-memory/session token if it is older than the TTL."""
+    token_ts = st.session_state.get("kite_token_timestamp")
+    token_present = st.session_state.get("kite_access_token") and st.session_state.get("kite_api_key")
+    if not token_present:
+        return
+    if is_token_expired(token_ts):
+        clear_kite_session_state()
+        clear_kite_credentials()
+        st.warning("Kite login expired. Please login again to continue.")
 
 
 def render():
@@ -173,11 +220,19 @@ def render():
     
     # Load credentials from file if not in session
     if "kite_access_token" not in st.session_state or "kite_api_key" not in st.session_state:
-        saved_token, saved_key = load_kite_credentials()
+        saved_token, saved_key, saved_at = load_kite_credentials()
         if saved_token and saved_key:
-            st.session_state["kite_access_token"] = saved_token
-            st.session_state["kite_api_key"] = saved_key
-            st.success("✅ Loaded saved Kite credentials from file")
+            if is_token_expired(saved_at):
+                clear_kite_credentials()
+                st.info("Saved Kite credentials have expired. Please login again.")
+            else:
+                st.session_state["kite_access_token"] = saved_token
+                st.session_state["kite_api_key"] = saved_key
+                st.session_state["kite_token_timestamp"] = saved_at
+                st.success("✅ Loaded saved Kite credentials from file")
+
+    # Ensure session tokens are still within TTL before rendering rest of the dashboard
+    enforce_kite_token_ttl()
 
     # Check for request_token in URL
     query_params = st.query_params
@@ -200,9 +255,11 @@ def render():
                     if access_token:
                         st.session_state["kite_access_token"] = access_token
                         st.session_state["kite_api_key"] = api_key
+                        token_timestamp = datetime.now(timezone.utc).isoformat()
+                        st.session_state["kite_token_timestamp"] = token_timestamp
                         
                         # Save credentials to persistent file
-                        save_kite_credentials(access_token, api_key)
+                        save_kite_credentials(access_token, api_key, token_timestamp)
                         
                         st.success("✅ Successfully logged in and saved credentials!")
                         
@@ -233,6 +290,7 @@ def render():
         "📊 Positions", 
         "📈 Portfolio Overview",
         "🔍 Position Diagnostics",
+        "🎯 Risk Analysis",
         "🌡️ Market Regime",
         "💾 Derivatives Data"
     ])
@@ -240,6 +298,21 @@ def render():
     # Render each tab
     with tabs[0]:
         render_login_tab()
+
+    kite_logged_in = bool(st.session_state.get("kite_access_token") and st.session_state.get("kite_api_key"))
+
+    if not kite_logged_in:
+        disabled_msg = "🔒 Login with Kite to unlock this tab."
+        st.warning("Kite authentication required. Use the Login tab to connect before accessing the dashboard.")
+        for tab in tabs[1:]:
+            with tab:
+                st.info(disabled_msg)
+        return
+
+    missing_derivative_cache = load_cached_derivatives_data_for_session()
+    if missing_derivative_cache:
+        missing_str = ", ".join(missing_derivative_cache)
+        st.info(f"⚠️ Derivatives cache missing or expired for: {missing_str}. Please load fresh data from the Derivatives Data tab.")
 
     with tabs[1]:
         render_overview_tab()
@@ -254,11 +327,16 @@ def render():
         render_diagnostics_tab()
     
     with tabs[5]:
-        render_market_regime_tab()
+        render_risk_analysis_tab()
     
     with tabs[6]:
+        render_market_regime_tab()
+    
+    with tabs[7]:
         render_derivatives_data_tab()
 
 
 if __name__ == "__main__":
     render()
+    # Ensure session tokens are still within TTL
+    enforce_kite_token_ttl()
