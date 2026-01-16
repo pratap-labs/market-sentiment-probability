@@ -9,4 +9,3 @@ sqlalchemy>=2.0.44
 streamlit>=1.50.0
 kiteconnect>=5.0.1
 py_vollib>=1.0.1
-kiteconnect>=3.11.0
