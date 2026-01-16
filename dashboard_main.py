@@ -17,6 +17,29 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+
+def load_env_file(env_path: Path) -> None:
+    """Load simple KEY=VALUE pairs into environment if not already set."""
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text().splitlines():
+            line = raw_line.strip()
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and (key not in os.environ or not os.environ.get(key)):
+                os.environ[key] = value
+    except Exception:
+        return
+
+
+load_env_file(Path(ROOT) / ".env")
+
 # Cache directory for credentials
 CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -38,26 +61,25 @@ except Exception:
 
 
 # Import tab render functions
-from views.tabs import (
-    render_login_tab,
-    render_overview_tab,
-    render_positions_tab,
-    render_portfolio_tab,
-    render_diagnostics_tab,
-    render_market_regime_tab,
-    render_alerts_tab,
-    render_advanced_analytics_tab,
-    render_trade_history_tab,
-    render_data_hub_tab,
-    render_kite_instruments_tab,
-    render_nifty_overview_tab,
-    render_risk_analysis_tab
-)
-
-from views.tabs.derivatives_data_tab import (
-    render_derivatives_data_tab,
-    load_cached_derivatives_data_for_session
-)
+from views.tabs.login_tab import render_login_tab
+from views.tabs.portfolio_dashboard_tab import render_portfolio_dashboard_tab
+from views.tabs.diagnostics_tab import render_diagnostics_tab
+from views.tabs.market_regime_tab import render_market_regime_tab
+from views.tabs.alerts_tab import render_alerts_tab
+from views.tabs.advanced_analytics_tab import render_advanced_analytics_tab
+from views.tabs.trade_history_tab import render_trade_history_tab
+from views.tabs.data_hub_tab import render_data_hub_tab
+from views.tabs.kite_instruments_tab import render_kite_instruments_tab
+from views.tabs.nifty_overview_simple import render_nifty_overview_tab
+from views.tabs.risk_analysis_tab import render_risk_analysis_tab
+from views.tabs.risk_buckets_tab import render_risk_buckets_tab
+from views.tabs.portfolio_buckets_tab import render_portfolio_buckets_tab
+from views.tabs.stress_testing_tab import render_stress_testing_tab
+from views.tabs.hedge_lab_tab import render_hedge_lab_tab
+from views.tabs.historical_performance_tab import render_historical_performance_tab
+from views.tabs.greeks_debug_tab import render_greeks_debug_tab
+from views.tabs.product_overview_tab import render_product_overview_tab
+from views.tabs.derivatives_data_tab import render_derivatives_data_tab, load_cached_derivatives_data_for_session
 
 try:
     from views.tabs import data_hub_tab
@@ -142,8 +164,6 @@ def enforce_kite_token_ttl():
 
 def render():
     """Main entrypoint for the Streamlit view."""
-    st.title("🎯 Options Dashboard")
-
     # set wider page layout
     st.set_page_config(layout="wide")
     
@@ -165,6 +185,10 @@ def render():
 
         /* Headings slightly smaller */
         h1, h2, h3, h4, h5 { font-size: 1.05rem !important; }
+
+        /* Allow custom big headings in Risk Analysis */
+        .risk-big-title { font-size: 2.2rem !important; margin-bottom: 0.2rem; }
+        .risk-big-subtitle { font-size: 1.2rem !important; margin-top: 0.4rem; }
 
         /* Table cells smaller */
         table, th, td, .stDataFrame, .element-container table { font-size: 12px !important; }
@@ -217,6 +241,13 @@ def render():
         st.session_state.kite_login_initiated = False
     if "kite_processing_token" not in st.session_state:
         st.session_state.kite_processing_token = False
+
+    if st.session_state.get("kite_force_logout"):
+        clear_kite_session_state()
+        clear_kite_credentials()
+        for key in ("kite_login_initiated", "kite_processing_token", "kite_api_key_stored", "kite_api_secret_stored"):
+            st.session_state.pop(key, None)
+        st.session_state.pop("kite_force_logout", None)
     
     # Load credentials from file if not in session
     if "kite_access_token" not in st.session_state or "kite_api_key" not in st.session_state:
@@ -283,57 +314,173 @@ def render():
     # Initialize empty dataframes - data will be loaded from Derivatives Data tab
     # Each tab will load data from cache using their own reload buttons
     
-    # Create tabs - Only show essential tabs
-    tabs = st.tabs([
-        "🔐 Login",
-        "🧭 Overview",
-        "📊 Positions", 
-        "📈 Portfolio Overview",
-        "🔍 Position Diagnostics",
-        "🎯 Risk Analysis",
-        "🌡️ Market Regime",
-        "💾 Derivatives Data"
-    ])
+    # Top navigation bar (single active tab controls)
+    tabs = [
+        {"key": "login", "label": "🔐 Login"},
+        {"key": "portfolio", "label": "📊 Portfolio"},
+        {"key": "risk_analysis", "label": "🎯 Risk Analysis"},
+        {"key": "risk_buckets", "label": "Risk Buckets (50/30/20)"},
+        {"key": "portfolio_buckets", "label": "Portfolio Buckets"},
+        {"key": "market_regime", "label": "🌡️ Market Regime"},
+        {"key": "stress_testing", "label": "🧪 Stress Testing"},
+        {"key": "diagnostics", "label": "🔍 Position Diagnostics"},
+        {"key": "hedge_lab", "label": "🛡️ Hedge Lab"},
+        {"key": "historical", "label": "📈 Historical Performance"},
+        {"key": "greeks_debug", "label": "🧪 Greeks Debug"},
+        {"key": "product_overview", "label": "✨ Product Overview"},
+        {"key": "derivatives_data", "label": "💾 Derivatives Data"},
+    ]
+    tab_map = {t["key"]: t["label"] for t in tabs}
+    st.session_state.setdefault("active_tab_key", "login")
+    if st.session_state["active_tab_key"] not in tab_map:
+        st.session_state["active_tab_key"] = "login"
 
-    # Render each tab
-    with tabs[0]:
-        render_login_tab()
+    visible_keys = ["login", "portfolio", "risk_analysis", "risk_buckets", "stress_testing"]
+    overflow_keys = [t["key"] for t in tabs if t["key"] not in visible_keys]
+    overflow_labels = ["⋯"] + [tab_map[key] for key in overflow_keys]
+    if st.session_state["active_tab_key"] in overflow_keys:
+        overflow_default = tab_map[st.session_state["active_tab_key"]]
+    else:
+        overflow_default = "⋯"
 
-    kite_logged_in = bool(st.session_state.get("kite_access_token") and st.session_state.get("kite_api_key"))
-
-    if not kite_logged_in:
-        disabled_msg = "🔒 Login with Kite to unlock this tab."
-        st.warning("Kite authentication required. Use the Login tab to connect before accessing the dashboard.")
-        for tab in tabs[1:]:
-            with tab:
-                st.info(disabled_msg)
-        return
-
-    missing_derivative_cache = load_cached_derivatives_data_for_session()
-    if missing_derivative_cache:
-        missing_str = ", ".join(missing_derivative_cache)
-        st.info(f"⚠️ Derivatives cache missing or expired for: {missing_str}. Please load fresh data from the Derivatives Data tab.")
-
-    with tabs[1]:
-        render_overview_tab()
-
-    with tabs[2]:
-        render_positions_tab()
+    st.markdown(
+        """
+        <style>
+        /* Active button styling */
+        button[key="nav_login"][aria-pressed="true"],
+        button[key="nav_portfolio"][aria-pressed="true"],
+        button[key="nav_risk_analysis"][aria-pressed="true"],
+        button[key="nav_risk_buckets"][aria-pressed="true"],
+        button[key="nav_stress_testing"][aria-pressed="true"] {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
+            border: 2px solid #8b5cf6 !important;
+            color: white !important;
+            font-weight: 700 !important;
+        }
+        .controls-marker, .content-marker { display: none; }
+        .controls-col {
+            background: #182131;
+            border: 1px solid #2a3548;
+            border-radius: 12px;
+            padding: 12px 16px;
+        }
+        .content-col {
+            background: #0e141f;
+            border: 1px solid #1e2836;
+            border-radius: 12px;
+            padding: 12px 16px;
+        }
+        [data-testid="stSidebar"] {
+            background: #14171f;
+        }
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: 58px;
+        }
+        [data-testid="stSidebar"] { display: none; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     
-    with tabs[3]:
-        render_portfolio_tab()
-    
-    with tabs[4]:
-        render_diagnostics_tab()
-    
-    with tabs[5]:
-        render_risk_analysis_tab()
-    
-    with tabs[6]:
-        render_market_regime_tab()
-    
-    with tabs[7]:
-        render_derivatives_data_tab()
+    with st.container():
+        nav_cols = st.columns(6)
+        for idx, key in enumerate(visible_keys):
+            label = tab_map[key]
+            is_active = st.session_state["active_tab_key"] == key
+            with nav_cols[idx]:
+                if st.button(label, key=f"nav_{key}", use_container_width=True, type="primary" if is_active else "secondary"):
+                    st.session_state["active_tab_key"] = key
+                    st.rerun()
+        with nav_cols[5]:
+            selection = st.selectbox(
+                "More",
+                overflow_labels,
+                index=overflow_labels.index(overflow_default),
+                key="nav_more",
+                label_visibility="collapsed",
+            )
+            if selection != "⋯":
+                selected_key = next(
+                    (k for k, v in tab_map.items() if v == selection),
+                    None,
+                )
+                if selected_key:
+                    st.session_state["active_tab_key"] = selected_key
+    active_key = st.session_state["active_tab_key"]
+
+    # Two-column layout: left controls, right content
+    controls_col, content_col = st.columns([1, 4], gap="large")
+    st.sidebar = controls_col
+
+    with controls_col:
+        st.markdown("<div class='controls-marker'></div>", unsafe_allow_html=True)
+    with content_col:
+        st.markdown("<div class='content-marker'></div>", unsafe_allow_html=True)
+
+        if active_key == "login":
+            render_login_tab()
+            return
+
+        kite_logged_in = bool(st.session_state.get("kite_access_token") and st.session_state.get("kite_api_key"))
+        if not kite_logged_in:
+            st.warning("Kite authentication required. Use the Login tab to connect before accessing the dashboard.")
+            st.info("🔒 Login with Kite to unlock this tab.")
+            return
+
+        missing_derivative_cache = load_cached_derivatives_data_for_session()
+        if missing_derivative_cache:
+            missing_str = ", ".join(missing_derivative_cache)
+            st.info(f"⚠️ Derivatives cache missing or expired for: {missing_str}. Please load fresh data from the Derivatives Data tab.")
+
+        if active_key == "portfolio":
+            render_portfolio_dashboard_tab()
+        elif active_key == "risk_analysis":
+            render_risk_analysis_tab()
+        elif active_key == "risk_buckets":
+            render_risk_buckets_tab()
+        elif active_key == "portfolio_buckets":
+            render_portfolio_buckets_tab()
+        elif active_key == "market_regime":
+            render_market_regime_tab()
+        elif active_key == "stress_testing":
+            render_stress_testing_tab()
+        elif active_key == "diagnostics":
+            render_diagnostics_tab()
+        elif active_key == "hedge_lab":
+            render_hedge_lab_tab()
+        elif active_key == "historical":
+            render_historical_performance_tab()
+        elif active_key == "greeks_debug":
+            render_greeks_debug_tab()
+        elif active_key == "product_overview":
+            render_product_overview_tab()
+        elif active_key == "derivatives_data":
+            render_derivatives_data_tab()
+
+    # markers are hidden via CSS; no closing tags required
+    st.markdown(
+        """
+        <script>
+        (function() {
+          const applyClasses = () => {
+            const controlsMarker = document.querySelector('.controls-marker');
+            const contentMarker = document.querySelector('.content-marker');
+            if (controlsMarker) {
+              const controlsCol = controlsMarker.closest('[data-testid="column"]');
+              if (controlsCol) controlsCol.classList.add('controls-col');
+            }
+            if (contentMarker) {
+              const contentCol = contentMarker.closest('[data-testid="column"]');
+              if (contentCol) contentCol.classList.add('content-col');
+            }
+          };
+          setTimeout(applyClasses, 50);
+          setTimeout(applyClasses, 250);
+        })();
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":

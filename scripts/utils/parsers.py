@@ -2,7 +2,7 @@
 
 import re
 import calendar
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict
 
 
@@ -71,9 +71,13 @@ def parse_tradingsymbol(symbol: str) -> Optional[Dict]:
         if not month:
             return None
 
-        # Monthly expiry: last day of the month
-        last_day = calendar.monthrange(year, month)[1]
-        expiry = datetime(year, month, last_day)
+        # Monthly expiry: last Tuesday of the month
+        last_day = datetime(year, month, calendar.monthrange(year, month)[1])
+        while last_day.weekday() != 1:
+            last_day -= timedelta(days=1)
+        if last_day.month == 3 and last_day.day == 31:
+            last_day -= timedelta(days=1)
+        expiry = last_day
 
         return {
             "strike": float(strike_str),

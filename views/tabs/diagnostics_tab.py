@@ -247,7 +247,12 @@ def analyze_strategy(strategy_data: Dict, current_spot: float) -> Dict:
 
 def render_diagnostics_tab():
     """Render position diagnostics tab with strategy analysis."""
+
     st.subheader("🔍 Position Diagnostics & Strategy Analysis")
+    
+    # Sync positions button
+    if st.sidebar.button("🔄 Sync Positions", key="diagnostics_sync_positions", help="Fetch latest positions from Kite", use_container_width=True):
+        st.rerun()
     
     if "enriched_positions" not in st.session_state:
         st.info("No positions loaded. Fetch positions from the Positions tab first.")
@@ -277,25 +282,18 @@ def render_diagnostics_tab():
     
     # Add expiry filter
     st.markdown("---")
-    col1, col2, col3 = st.columns([2, 2, 1])
-    
-    with col1:
-        selected_expiry = st.selectbox(
-            "📅 Select Expiry to Analyze",
-            ["All Expiries"] + expiries,
-            help="Filter positions by expiry date"
-        )
-    
-    with col2:
-        view_mode = st.radio(
-            "View Mode",
-            ["Strategy View", "Individual Positions"],
-            horizontal=True,
-            help="Strategy View groups positions into spreads/Iron Condors"
-        )
-    
-    with col3:
-        show_only_risky = st.checkbox("⚠️ Only Risky", help="Show only positions with priority >= 5")
+    selected_expiry = st.sidebar.selectbox(
+        "📅 Select Expiry to Analyze",
+        ["All Expiries"] + expiries,
+        help="Filter positions by expiry date"
+    )
+    view_mode = st.sidebar.radio(
+        "View Mode",
+        ["Strategy View", "Individual Positions"],
+        horizontal=True,
+        help="Strategy View groups positions into spreads/Iron Condors"
+    )
+    show_only_risky = st.sidebar.checkbox("⚠️ Only Risky", help="Show only positions with priority >= 5")
     
     st.markdown("---")
     

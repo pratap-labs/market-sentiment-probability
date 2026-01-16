@@ -2,8 +2,11 @@
 
 import streamlit as st
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from collections import Counter
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import sys
 import os
@@ -19,8 +22,31 @@ from scripts.utils import (
     classify_history_bucket,
     compute_var_es_metrics,
 )
+try:
+    from py_vollib.black_scholes import black_scholes as bs
+except Exception:
+    bs = None
 
-from views.tabs.derivatives_data_tab import load_from_cache
+from views.tabs.derivatives_data_tab import load_from_cache as _load_from_cache
+
+
+STRATEGY_MAX_DRAWDOWN = 12.0  # % NAV
+DEFAULT_ES99_LIMIT = 4.0  # % NAV
+VAR99_LIMIT = 5.0  # % NAV
+VAR95_LIMIT = 2.5  # % NAV
+DEFAULT_THRESHOLD_MASTER_PCT = 1.0
+DEFAULT_THRESHOLD_HARD_STOP_PCT = 1.2
+DEFAULT_THRESHOLD_NORMAL_SHARE = 0.5
+DEFAULT_THRESHOLD_STRESS_SHARE = 0.9
+
+
+def _load_cache_silent(data_type: str) -> pd.DataFrame:
+    return _load_from_cache(data_type, silent=True)
+
+
+def get_active_es_limit() -> float:
+    """Return the ES99 limit currently set in session."""
+    return float(st.session_state.get("strategy_es_limit", DEFAULT_ES99_LIMIT))
 
 
 def get_iv_regime(iv_percentile):
@@ -105,10 +131,69 @@ def classify_zone(theta_norm, gamma_norm, vega_norm, iv_regime):
     return 0, "OUT OF BOUNDS", "⚠️", "Portfolio greeks outside defined zone limits. Review and adjust."
 
 
+BUCKET_DEFINITIONS = [
+    {
+        "Bucket": "A",
+        "Scenario": "Calm",
+        "Move": "|Return| ≤ 0.5% and |IV proxy| ≤ 1",
+        "Note": "Low-vol day; small drift and muted intraday range.",
+    },
+    {
+        "Bucket": "B",
+        "Scenario": "Normal",
+        "Move": "|Return| ≤ 1.0% and |IV proxy| ≤ 2",
+        "Note": "Routine session with modest moves.",
+    },
+    {
+        "Bucket": "C",
+        "Scenario": "Elevated",
+        "Move": "|Return| ≤ 1.5% and |IV proxy| ≤ 3",
+        "Note": "Elevated range with IV pickup.",
+    },
+    {
+        "Bucket": "D",
+        "Scenario": "Stress",
+        "Move": "|Return| ≤ 2.5% and |IV proxy| ≤ 5",
+        "Note": "Large range day; risk controls should trigger.",
+    },
+    {
+        "Bucket": "E",
+        "Scenario": "Gap / Tail",
+        "Move": "|Return| > 2.5% or |IV proxy| > 5",
+        "Note": "Tail event bucket; gap or volatility shock.",
+    },
+]
+
+
 def render_risk_analysis_tab():
     """Render zone-based risk analysis tab."""
     
-    st.header("🎯 Zone-Based Risk Analysis")
+    st.markdown(
+        "<h1 class='risk-big-title'>📉 Expected Shortfall (Historical-calibrated)</h1>",
+        unsafe_allow_html=True,
+    )
+
+    # Sync positions button
+    if st.sidebar.button("🔄 Sync Positions", key="risk_analysis_sync_positions", help="Fetch latest positions from Kite", use_container_width=True):
+        st.rerun()
+    
+    current_es_limit = st.sidebar.number_input(
+        "ES99 limit (% NAV)",
+        min_value=1.0,
+        max_value=12.0,
+        step=0.1,
+        format="%.1f",
+        value=get_active_es_limit(),
+        key="strategy_es_limit",
+    )
+    lookback_days = st.sidebar.number_input(
+        "Lookback trading days",
+        value=504,
+        min_value=126,
+        max_value=756,
+        step=21,
+        key="risk_es_lookback_days",
+    )
     
     # Check if positions are loaded
     if "enriched_positions" not in st.session_state:
@@ -152,18 +237,135 @@ def render_risk_analysis_tab():
     total_gamma = portfolio_greeks["net_gamma"]
     total_vega = portfolio_greeks["net_vega"]
     
-    # ========== SECTION 1: CURRENT PORTFOLIO ANALYSIS ==========
-    st.markdown("## 📊 Your Portfolio Analysis")
-    
-    # Calculate IV percentile
+    # Calculate IV percentile and regime before ES computation
     iv_percentile = 30  # Default
     options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
     if not options_df_cache.empty and "iv" in options_df_cache.columns:
         current_iv = options_df_cache["iv"].median()
         iv_percentile = 35
-    
+
     iv_regime, iv_color = get_iv_regime(iv_percentile)
-    
+
+    scenarios = get_weighted_scenarios(iv_regime)
+    threshold_context = build_threshold_report(
+        portfolio={
+            "delta": portfolio_greeks.get("net_delta", 0.0),
+            "gamma": portfolio_greeks.get("net_gamma", 0.0),
+            "vega": portfolio_greeks.get("net_vega", 0.0),
+            "spot": current_spot,
+            "nav": account_size,
+            "margin": margin_deployed,
+        },
+        scenarios=[
+            {
+                "name": scenario.name,
+                "dS_pct": scenario.ds_pct,
+                "dIV_pts": scenario.div_pts,
+                "type": scenario.category.upper(),
+            }
+            for scenario in scenarios
+        ],
+        master_pct=current_es_limit,
+        hard_stop_pct=current_es_limit * 1.2,
+        normal_share=DEFAULT_THRESHOLD_NORMAL_SHARE,
+        stress_share=DEFAULT_THRESHOLD_STRESS_SHARE,
+    )
+
+    st.markdown("### Bucket Definitions")
+    st.dataframe(pd.DataFrame(BUCKET_DEFINITIONS), use_container_width=True, hide_index=True)
+
+    render_expected_shortfall_panel(
+        threshold_context.get("rows", []),
+        account_size,
+        scenarios,
+        key_prefix="risk_",
+        es_limit=current_es_limit,
+        lookback_override=int(lookback_days),
+    )
+
+    st.markdown("### Scenario Table (with calibrated probabilities)")
+    derived_rows = threshold_context.get("rows", [])
+    repriced_map: Dict[str, Dict[str, object]] = {}
+    repriced_skipped = {"missing_fields": 0, "no_price": 0}
+    if bs is not None:
+        positions = st.session_state.get("enriched_positions", [])
+        if positions:
+            repriced_rows, repriced_skipped = _repriced_scenario_rows(
+                positions,
+                scenarios,
+                current_spot,
+                account_size,
+            )
+            repriced_map = {row["Scenario"]: row for row in repriced_rows}
+    def _parse_inr(val: str) -> float:
+        cleaned = str(val).replace("₹", "").replace(",", "").strip()
+        try:
+            return float(cleaned)
+        except ValueError:
+            return 0.0
+
+    derived_rows = sorted(
+        derived_rows,
+        key=lambda row: _parse_inr(
+            repriced_map.get(row["scenario"]["name"], {}).get("Repriced P&L (₹)", 0.0)
+        ),
+        reverse=False,
+    )
+    if derived_rows:
+        table_rows = []
+        for row in derived_rows:
+            scenario = row["scenario"]
+            status = row.get("status", "INFO")
+            if status == "PASS":
+                status_display = "🟢 PASS"
+            elif status == "FAIL":
+                status_display = "🔴 FAIL"
+            else:
+                status_display = "ℹ️ INFO"
+            repriced = repriced_map.get(scenario["name"])
+            table_rows.append(
+                {
+                    "Scenario": scenario["name"],
+                    "Bucket": row["bucket"],
+                    "dS% / dIV": f"{scenario['dS_pct']:+.2f}% / {scenario['dIV_pts']:+.1f}",
+                    "Δ P&L (₹)": format_inr(row["pnl_delta"]),
+                    "Γ P&L (₹)": format_inr(row["pnl_gamma"]),
+                    "Vega P&L (₹)": format_inr(row["pnl_vega"]),
+                    "Total P&L (₹)": format_inr(row["pnl_total"]),
+                    "Repriced P&L (₹)": repriced.get("Repriced P&L (₹)") if repriced else "—",
+                    "Repriced Loss % NAV": repriced.get("Repriced Loss % NAV") if repriced else "—",
+                    "Loss % NAV": f"{row['loss_pct_nav']:.2f}%",
+                    "Threshold % NAV": f"{row['threshold_pct']:.2f}%",
+                    "Probability": f"{row.get('probability', 0.0) * 100:.2f}%",
+                    "Status": status_display,
+                }
+            )
+        scenario_df = pd.DataFrame(table_rows)
+
+        def _status_bg(val: str) -> str:
+            val = str(val).upper()
+            if "FAIL" in val:
+                return "background-color: #f8d7da; color: #842029;"
+            if "PASS" in val:
+                return "background-color: #d1e7dd; color: #0f5132;"
+            return ""
+
+        styled = scenario_df.style.applymap(_status_bg, subset=["Status"])
+        st.dataframe(styled, use_container_width=True, hide_index=True, height=320)
+        if repriced_skipped["missing_fields"] or repriced_skipped["no_price"]:
+            st.caption(
+                f"Repricing skipped: {repriced_skipped['missing_fields']} missing fields, "
+                f"{repriced_skipped['no_price']} missing prices."
+            )
+    else:
+        st.info("No scenario rows available to display.")
+
+    # ========== SECTION 1: CURRENT PORTFOLIO ANALYSIS ==========
+    st.markdown("---")
+    st.markdown(
+        "<h1 class='risk-big-title'>🧭 Zone-Based Testing</h1>",
+        unsafe_allow_html=True,
+    )
     st.markdown(f"### Current Volatility Regime: {iv_color} **{iv_regime}**")
     st.caption(f"IV Percentile: {iv_percentile:.0f}")
     
@@ -314,22 +516,6 @@ def render_risk_analysis_tab():
     
     st.markdown("---")
 
-    scenarios = get_weighted_scenarios(iv_regime)
-    threshold_context = render_threshold_builder_panel(
-        scenarios,
-        portfolio_greeks,
-        account_size,
-        margin_deployed,
-        current_spot,
-    )
-    
-    render_expected_shortfall_panel(
-        threshold_context,
-        account_size,
-        margin_deployed,
-        scenarios
-    )
-    
     # Display zone classification
     st.markdown(f"## {zone_color} ZONE {zone_num} — {zone_name}")
     
@@ -641,154 +827,140 @@ def render_risk_analysis_tab():
     st.markdown("---")
 
 
-def render_threshold_builder_panel(
-    scenarios,
-    portfolio_greeks,
+def render_expected_shortfall_panel(
+    derived_rows,
     account_size,
-    margin_deployed,
-    spot,
+    scenarios,
+    key_prefix: str = "",
+    es_limit: float = DEFAULT_ES99_LIMIT,
+    lookback_override: int = None,
 ):
-    """Render threshold builder derived from master NAV limits."""
-    st.markdown("## 🧱 Threshold Builder (Derived from Master NAV Limit)")
-    if not scenarios:
-        st.info("No scenarios available. Run scenario stress tests first.")
-        return
-
-    if account_size <= 0 or margin_deployed <= 0:
-        st.warning("NAV or margin unavailable. Cannot compute threshold breaches.")
-        return
-
-    controls = st.columns(4)
-    master_pct = controls[0].number_input(
-        "Master loss budget (% NAV)",
-        value=1.0,
-        step=0.1,
-        format="%.2f",
-        key="threshold_master_pct",
-    )
-    hard_stop_pct = controls[1].number_input(
-        "Hard stop (% NAV)",
-        value=1.2,
-        step=0.1,
-        format="%.2f",
-        key="threshold_hard_stop_pct",
-    )
-    normal_share = controls[2].number_input(
-        "Normal share (fraction of master)",
-        value=0.5,
-        step=0.05,
-        format="%.2f",
-        key="threshold_normal_share",
-    )
-    stress_share = controls[3].number_input(
-        "Stress share (fraction of master)",
-        value=0.9,
-        step=0.05,
-        format="%.2f",
-        key="threshold_stress_share",
-    )
-
-    derived = build_threshold_report(
-        portfolio={
-            "delta": portfolio_greeks.get("net_delta", 0.0),
-            "gamma": portfolio_greeks.get("net_gamma", 0.0),
-            "vega": portfolio_greeks.get("net_vega", 0.0),
-            "spot": spot,
-            "nav": account_size,
-            "margin": margin_deployed,
-        },
-        scenarios=[
-            {
-                "name": scenario.name,
-                "dS_pct": scenario.ds_pct,
-                "dIV_pts": scenario.div_pts,
-                "type": scenario.category.upper(),
-            }
-            for scenario in scenarios
-        ],
-        master_pct=master_pct,
-        hard_stop_pct=hard_stop_pct,
-        normal_share=normal_share,
-        stress_share=stress_share,
-    )
-
-    thresholds = derived["thresholds"]
-    st.caption(
-        f"Normal threshold: {thresholds['limitA']:.2f}% | "
-        f"Stress threshold: {thresholds['limitB']:.2f}% | "
-        f"Extreme threshold: {thresholds['limitC']:.2f}%"
-    )
-
-    worst = derived["worst"]
-    worst_name = worst["scenario"]["name"] if worst else "N/A"
-    worst_loss_value = worst["pnl_total"] if worst else 0.0
-    worst_loss_value = min(0.0, worst_loss_value)
-    worst_loss_pct = derived["worst_loss_pct"]
-
-    summary_cols = st.columns(4)
-    summary_cols[0].metric("Worst Scenario", worst_name)
-    summary_cols[1].metric("Worst Loss (₹)", format_inr(worst_loss_value))
-    summary_cols[2].metric("Worst Loss % NAV", f"{worst_loss_pct:.2f}%")
-    summary_cols[3].metric("Failed Scenarios", str(derived["fail_count"]))
-
-    within_master = derived["within_master"]
-    status_badge = "PASS" if within_master else "FAIL"
-    badge_icon = "🟢" if within_master else "🔴"
-    st.markdown(f"**Within Master Rule?** {badge_icon} {status_badge}")
-
-    table_rows = []
-    for row in derived["rows"]:
-        scenario = row["scenario"]
-        table_rows.append(
-            {
-                "Scenario": scenario["name"],
-                "Bucket": row["bucket"],
-                "dS% / dIV": f"{scenario['dS_pct']:+.2f}% / {scenario['dIV_pts']:+.1f}",
-                "Δ P&L (₹)": format_inr(row["pnl_delta"]),
-                "Γ P&L (₹)": format_inr(row["pnl_gamma"]),
-                "Vega P&L (₹)": format_inr(row["pnl_vega"]),
-                "Total P&L (₹)": format_inr(row["pnl_total"]),
-                "Loss % NAV": row["loss_pct_nav"],
-                "Threshold % NAV": row["threshold_pct"],
-                "Status": row["status"],
-            }
-        )
-
-    threshold_df = pd.DataFrame(table_rows)
-    derived["table_df"] = threshold_df
-    return derived
-
-
-def render_expected_shortfall_panel(threshold_context, account_size, margin_deployed, scenarios):
     """Render probability-weighted ES/VaR panel."""
-    st.markdown("## 📉 Expected Shortfall (Historical-calibrated)")
 
-    if not threshold_context:
-        st.info("Run the Threshold Builder to compute scenario P&L before calibrating ES.")
-        return
-
-    derived_rows = threshold_context.get("rows") if isinstance(threshold_context, dict) else threshold_context
     if not derived_rows:
         st.info("No scenario rows available for ES calculation.")
         return
 
-    lookback = st.number_input("Lookback trading days", value=504, min_value=126, max_value=756, step=21, key="es_lookback_days")
-    smoothing_enabled = st.checkbox("Apply EWMA smoothing", value=False, key="es_smoothing_toggle")
-    smoothing_span = 63
-    if smoothing_enabled:
-        smoothing_span = st.slider("EWMA span (days)", min_value=21, max_value=min(252, lookback), value=63, step=7, key="es_smoothing_span")
+    lookback = lookback_override or 504
 
     bucket_probs, history_count, used_fallback = compute_historical_bucket_probabilities(
         lookback=int(lookback),
-        smoothing_enabled=smoothing_enabled,
-        smoothing_span=int(smoothing_span),
+        smoothing_enabled=False,
+        smoothing_span=63,
     )
 
-    p_caption = f"Bucket probabilities (lookback {history_count}d): "
-    p_caption += f"A {bucket_probs['A']*100:.1f}%, B {bucket_probs['B']*100:.1f}%, C {bucket_probs['C']*100:.1f}%"
-    st.caption(p_caption)
-    if used_fallback:
-        st.warning("Historical cache unavailable; using default manual probabilities (A/B/C = 60/30/10).")
+    st.markdown("### Bucket Probabilities")
+    prob_cols = st.columns(6)
+    prob_cols[0].metric("Lookback", f"{history_count}d")
+    prob_cols[1].metric("Bucket A", f"{bucket_probs['A']*100:.1f}%")
+    prob_cols[2].metric("Bucket B", f"{bucket_probs['B']*100:.1f}%")
+    prob_cols[3].metric("Bucket C", f"{bucket_probs['C']*100:.1f}%")
+    prob_cols[4].metric("Bucket D", f"{bucket_probs['D']*100:.1f}%")
+    prob_cols[5].metric("Bucket E", f"{bucket_probs['E']*100:.1f}%")
+    # Fallback message suppressed per UX request.
+
+    bucket_colors = {
+        "A": "#2ca02c",
+        "B": "#98df8a",
+        "C": "#ffbf00",
+        "D": "#ff7f0e",
+        "E": "#d62728",
+    }
+
+    history_df = _build_bucket_history(lookback)
+    if not history_df.empty:
+        st.markdown("### NIFTY Lookback Bucket Map")
+        drift_pct = history_df["returnPct"] * 100
+        bins = [-10, -9, -8, -7, -6, -5, -4, -3, -2, -1, -0.5, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        labels = [
+            "-10 to -9",
+            "-9 to -8",
+            "-8 to -7",
+            "-7 to -6",
+            "-6 to -5",
+            "-5 to -4",
+            "-4 to -3",
+            "-3 to -2",
+            "-2 to -1",
+            "-1 to -0.5",
+            "-0.5 to 0.5",
+            "0.5 to 1",
+            "1 to 2",
+            "2 to 3",
+            "3 to 4",
+            "4 to 5",
+            "5 to 6",
+            "6 to 7",
+            "7 to 8",
+            "8 to 9",
+            "9 to 10",
+        ]
+        drift_bins = pd.cut(drift_pct, bins=bins, labels=labels, include_lowest=True)
+        drift_counts = drift_bins.value_counts().reindex(labels, fill_value=0)
+        drift_df = drift_counts.rename_axis("Drift (%)").reset_index(name="Count")
+        bin_midpoints = []
+        for label in drift_df["Drift (%)"]:
+            parts = str(label).replace("to", "").split()
+            try:
+                low = float(parts[0])
+                high = float(parts[1])
+                bin_midpoints.append((low + high) / 2.0)
+            except Exception:
+                bin_midpoints.append(0.0)
+        drift_df["bucket"] = [
+            classify_history_bucket(mid / 100.0, 0.0) for mid in bin_midpoints
+        ]
+        count_chart = px.bar(
+            drift_df,
+            x="Drift (%)",
+            y="Count",
+            title="Raw Drift Counts (Lookback)",
+            labels={"Count": "Days"},
+            text="Count",
+            color="bucket",
+            color_discrete_map=bucket_colors,
+        )
+        count_chart.update_traces(textposition="outside")
+        count_chart.update_layout(
+            xaxis_tickangle=-45,
+            xaxis=dict(categoryorder="array", categoryarray=labels),
+        )
+        st.plotly_chart(
+            count_chart,
+            use_container_width=True,
+            key=f"{key_prefix}bucket_drift_chart_{lookback}",
+        )
+
+        ohlc_fig = make_subplots(rows=1, cols=1)
+        for bucket, color in bucket_colors.items():
+            subset = history_df[history_df["bucket"] == bucket]
+            if subset.empty:
+                continue
+            ohlc_fig.add_trace(
+                go.Candlestick(
+                    x=subset["date"],
+                    open=subset["open"],
+                    high=subset["high"],
+                    low=subset["low"],
+                    close=subset["close"],
+                    name=f"Bucket {bucket}",
+                    increasing_line_color=color,
+                    decreasing_line_color=color,
+                )
+            )
+        ohlc_fig.update_layout(
+            title="NIFTY OHLC with Bucket Classification",
+            showlegend=True,
+            xaxis_rangeslider_visible=True,
+            dragmode="pan",
+        )
+        st.plotly_chart(
+            ohlc_fig,
+            use_container_width=True,
+            key=f"{key_prefix}bucket_ohlc_chart_{lookback}",
+        )
+    else:
+        st.info("No NIFTY history available to render bucket distribution.")
 
     bucket_counts = Counter(row["bucket"] for row in derived_rows)
     for row in derived_rows:
@@ -815,27 +987,9 @@ def render_expected_shortfall_panel(threshold_context, account_size, margin_depl
     ]
 
     metrics = compute_var_es_metrics(loss_distribution, account_size)
+    status_info = evaluate_strategy_status(metrics, es_limit)
 
-    limit_cols = st.columns(4)
-    es99_limit = limit_cols[0].number_input("ES99 limit (% NAV)", value=1.0, step=0.1, format="%.2f", key="es99_limit")
-    es95_limit = limit_cols[1].number_input("ES95 limit (% NAV)", value=0.7, step=0.1, format="%.2f", key="es95_limit")
-    var99_limit = limit_cols[2].number_input("VaR99 limit (% NAV)", value=1.2, step=0.1, format="%.2f", key="var99_limit")
-    var95_limit = limit_cols[3].number_input("VaR95 limit (% NAV)", value=0.7, step=0.1, format="%.2f", key="var95_limit")
-
-    breach_flags = [
-        metrics["ES99"] > es99_limit,
-        metrics["ES95"] > es95_limit,
-        metrics["VaR99"] > var99_limit,
-    ]
-    breach_count = sum(1 for flag in breach_flags if flag)
-    if breach_count == 0:
-        badge = ("SAFE", "🟢")
-    elif breach_count == 1:
-        badge = ("WATCH", "🟡")
-    else:
-        badge = ("REDUCE", "🔴")
-
-    render_risk_governance_block(metrics, var99_limit, es99_limit, var95_limit, threshold_context)
+    render_risk_governance_block(metrics, None, status_info, es_limit)
 
     summary_cols = st.columns(4)
     summary_cols[0].metric("ES99", f"{metrics['ES99']:.2f}%", format_inr(metrics["ES99Value"]))
@@ -843,7 +997,12 @@ def render_expected_shortfall_panel(threshold_context, account_size, margin_depl
     summary_cols[2].metric("ES95", f"{metrics['ES95']:.2f}%", format_inr(metrics["ES95Value"]))
     summary_cols[3].metric("VaR95", f"{metrics['VaR95']:.2f}%", format_inr(metrics["VaR95Value"]))
 
-    st.markdown(f"**ES Status:** {badge[1]} {badge[0]}")
+    status_label, status_icon, detail_text = status_info
+    st.markdown(f"**Risk Status:** {status_icon} {status_label}")
+    st.caption(detail_text)
+    if status_label == "REDUCE SIZE" and metrics["ES99"] > 0:
+        scale = es_limit / max(metrics["ES99"], 1e-6)
+        st.warning(f"To pass ES99, reduce position size to {scale*100:.0f}% of current.")
 
     tail_set = metrics.get("tail_set_99", [])
     expected_loss, prob_sum, bucket_shares, scenario_tail_contribs = compute_es_attribution(
@@ -856,7 +1015,7 @@ def render_expected_shortfall_panel(threshold_context, account_size, margin_depl
         share_text = "ES99 driven by: " + ", ".join(
             [
                 f"{bucket} {bucket_shares.get(bucket, 0.0) * 100:.1f}%"
-                for bucket in ["A", "B", "C"]
+                for bucket in ["A", "B", "C", "D", "E"]
             ]
         )
         st.markdown(share_text)
@@ -912,35 +1071,22 @@ def render_expected_shortfall_panel(threshold_context, account_size, margin_depl
     else:
         st.info("No tail contributions available for ES99.")
 
-    if metrics["ES99"] > es99_limit and scenario_tail_contribs:
+    if metrics["ES99"] > es_limit and scenario_tail_contribs:
         dominant_bucket = max(bucket_shares, key=bucket_shares.get)
         dominant_entry = max(scenario_tail_contribs, key=lambda x: x["tail_contribution"])
-        reduction_needed = compute_needed_reduction(metrics["ES99"], es99_limit)
+        reduction_needed = compute_needed_reduction(metrics["ES99"], es_limit)
         st.warning(
             f"Primary driver: Bucket {dominant_bucket} / {dominant_entry['scenario']['name']}.\n"
             f"Required ES99 reduction: {reduction_needed * 100:.1f}%. Reduce Bucket {dominant_bucket} tail risk to pass ES99."
         )
 
-    scenario_table_df = threshold_context.get("table_df")
-    if scenario_table_df is not None and not scenario_table_df.empty:
-        display_df = scenario_table_df.copy()
-        display_df["Loss % NAV"] = display_df["Loss % NAV"].map(lambda x: f"{x:.2f}%")
-        display_df["Threshold % NAV"] = display_df["Threshold % NAV"].map(lambda x: f"{x:.2f}%")
-        prob_values = [f"{row.get('probability', 0.0) * 100:.2f}%" for row in derived_rows]
-        if len(prob_values) == len(display_df):
-            display_df["Probability"] = prob_values
-        st.markdown("### Scenario Table (with calibrated probabilities)")
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    # Scenario table is rendered in the parent tab using derived rows.
 
 
-DEFAULT_BUCKET_PROBS = {"A": 0.6, "B": 0.3, "C": 0.1}
-
-
-def compute_historical_bucket_probabilities(lookback: int, smoothing_enabled: bool, smoothing_span: int):
-    """Load cached history and compute empirical bucket probabilities."""
-    history_df = load_from_cache("nifty_ohlcv")
+def _build_bucket_history(lookback: int) -> pd.DataFrame:
+    history_df = _load_cache_silent("nifty_ohlcv")
     if history_df is None or history_df.empty:
-        return DEFAULT_BUCKET_PROBS.copy(), 0, True
+        return pd.DataFrame()
     df = history_df.copy()
     if "date" in df.columns:
         df["date"] = pd.to_datetime(df["date"])
@@ -948,10 +1094,109 @@ def compute_historical_bucket_probabilities(lookback: int, smoothing_enabled: bo
     if "returnPct" not in df.columns and "close" in df.columns:
         df["returnPct"] = df["close"].pct_change()
     if "ivChange" not in df.columns:
-        if "ivClose" in df.columns:
-            df["ivChange"] = df["ivClose"].diff()
+        if "high" in df.columns and "low" in df.columns and "close" in df.columns:
+            df["intraday_vol"] = (df["high"] - df["low"]) / df["close"] * 100
+            df["ivChange"] = df["intraday_vol"].diff()
         else:
             df["ivChange"] = 0.0
+    df = df.dropna(subset=["returnPct", "ivChange", "close"])
+    if df.empty:
+        return pd.DataFrame()
+    df = df.tail(lookback).reset_index(drop=True)
+    df["bucket"] = df.apply(
+        lambda row: classify_history_bucket(float(row["returnPct"]), float(row["ivChange"])), axis=1
+    )
+    return df
+
+
+def _repriced_scenario_rows(
+    positions: List[Dict[str, object]],
+    scenarios: List[object],
+    spot: float,
+    capital: float,
+    risk_free_rate: float = 0.07,
+) -> Tuple[List[Dict[str, object]], Dict[str, int]]:
+    rows: List[Dict[str, object]] = []
+    skipped = {"missing_fields": 0, "no_price": 0}
+    if not positions or spot <= 0:
+        return rows, skipped
+
+    for scenario in scenarios:
+        scenario_spot = spot * (1 + scenario.ds_pct / 100.0)
+        scenario_iv_shift = scenario.div_pts / 100.0
+        total_pnl = 0.0
+        used_positions = 0
+
+        for pos in positions:
+            option_type = pos.get("option_type")
+            strike = pos.get("strike")
+            tte = pos.get("time_to_expiry")
+            iv = pos.get("implied_vol")
+            last_price = pos.get("last_price", 0.0)
+            qty = pos.get("quantity", 0)
+
+            if option_type not in {"CE", "PE"}:
+                continue
+            if strike is None or tte is None or iv is None:
+                skipped["missing_fields"] += 1
+                continue
+            if last_price is None:
+                skipped["no_price"] += 1
+                continue
+
+            shock_iv = max(float(iv) + scenario_iv_shift, 0.0001)
+            flag = "c" if option_type == "CE" else "p"
+            try:
+                new_price = bs(flag, scenario_spot, float(strike), float(tte), risk_free_rate, shock_iv)
+            except Exception:
+                continue
+
+            total_pnl += (new_price - float(last_price)) * float(qty)
+            used_positions += 1
+
+        loss_pct = (-total_pnl / capital * 100.0) if total_pnl < 0 and capital > 0 else 0.0
+        rows.append(
+            {
+                "Scenario": scenario.name,
+                "Repriced P&L (₹)": format_inr(total_pnl),
+                "Repriced Loss % NAV": f"{loss_pct:.2f}%",
+                "Positions Used": used_positions,
+            }
+        )
+
+    return rows, skipped
+
+
+DEFAULT_BUCKET_PROBS = {"A": 0.45, "B": 0.25, "C": 0.15, "D": 0.10, "E": 0.05}
+
+
+def compute_historical_bucket_probabilities(lookback: int, smoothing_enabled: bool, smoothing_span: int):
+    """Load cached history and compute empirical bucket probabilities.
+    
+    Uses intraday volatility (high-low range) as proxy for IV changes since
+    KiteConnect OHLCV data doesn't include implied volatility.
+    """
+    history_df = _load_cache_silent("nifty_ohlcv")
+    if history_df is None or history_df.empty:
+        return DEFAULT_BUCKET_PROBS.copy(), 0, True
+    df = history_df.copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values("date")
+    
+    # Calculate daily return percentage
+    if "returnPct" not in df.columns and "close" in df.columns:
+        df["returnPct"] = df["close"].pct_change()
+    
+    # Use intraday range as volatility proxy (no IV data available from KiteConnect)
+    if "ivChange" not in df.columns:
+        if "high" in df.columns and "low" in df.columns and "close" in df.columns:
+            # Normalized high-low range as volatility measure
+            df["intraday_vol"] = (df["high"] - df["low"]) / df["close"] * 100
+            df["ivChange"] = df["intraday_vol"].diff()
+        else:
+            df["ivChange"] = 0.0
+    
     df = df.dropna(subset=["returnPct", "ivChange"])
     if df.empty:
         return DEFAULT_BUCKET_PROBS.copy(), 0, True
@@ -968,7 +1213,7 @@ def compute_historical_bucket_probabilities(lookback: int, smoothing_enabled: bo
     total_weight = sum(counts.values())
     if total_weight <= 0:
         return DEFAULT_BUCKET_PROBS.copy(), len(df), True
-    probs = {bucket: counts.get(bucket, 0.0) / total_weight for bucket in ["A", "B", "C"]}
+    probs = {bucket: counts.get(bucket, 0.0) / total_weight for bucket in ["A", "B", "C", "D", "E"]}
     return probs, len(df), False
 
 
@@ -984,35 +1229,41 @@ def exponential_weights(length: int, span: int) -> List[float]:
     return weights
 
 
-def render_risk_governance_block(metrics, var99_limit, es99_limit, var95_limit, threshold_context):
-    """Display ordered governance rules."""
-    st.markdown("### Risk Governance")
-    hard_stop_pass = metrics["VaR99"] <= var99_limit
-    tail_pass = metrics["ES99"] <= es99_limit
-    normal_pass = metrics["VaR95"] <= var95_limit
-    scenario_pass = threshold_context.get("fail_count", 0) == 0
+def evaluate_strategy_status(metrics, es_limit: float = DEFAULT_ES99_LIMIT):
+    """Return status tuple (label, icon, detail) based on fixed strategy limits."""
+    var99 = metrics.get("VaR99", 0.0)
+    es99 = metrics.get("ES99", 0.0)
+    var95 = metrics.get("VaR95", 0.0)
 
-    statuses = [
-        ("Hard Stop", hard_stop_pass, f"VaR99 {metrics['VaR99']:.2f}% ≤ {var99_limit:.2f}%"),
-        ("Tail Limit", tail_pass, f"ES99 {metrics['ES99']:.2f}% ≤ {es99_limit:.2f}%"),
-        ("Normal-Day Limit", normal_pass, f"VaR95 {metrics['VaR95']:.2f}% ≤ {var95_limit:.2f}%"),
-        ("Scenario Caps", scenario_pass, f"Bucket breaches: {threshold_context.get('fail_count', 0)}"),
-    ]
+    if var99 > VAR99_LIMIT:
+        detail = f"VaR99 {var99:.2f}% exceeds hard stop {VAR99_LIMIT:.1f}%."
+        return "FORCED REDUCE", "🛑", detail
+    if es99 > es_limit:
+        detail = f"ES99 {es99:.2f}% exceeds limit {es_limit:.1f}%."
+        return "REDUCE SIZE", "🔴", detail
+    if var95 > VAR95_LIMIT:
+        detail = f"VaR95 {var95:.2f}% exceeds limit {VAR95_LIMIT:.1f}%."
+        return "TRIM RISK", "🟡", detail
+    detail = (
+        f"Within limits: VaR99 {var99:.2f}% ≤ {VAR99_LIMIT:.1f}%, "
+        f"ES99 {es99:.2f}% ≤ {es_limit:.1f}%, "
+        f"VaR95 {var95:.2f}% ≤ {VAR95_LIMIT:.1f}%."
+    )
+    return "OK", "🟢", detail
 
-    for label, passed, detail in statuses:
-        icon = "✅" if passed else "❌"
-        st.markdown(f"{icon} **{label}:** {detail}")
 
-    if not hard_stop_pass:
-        decision = "FORCED REDUCE (hard stop)"
-    elif not tail_pass:
-        decision = "REDUCE (tail risk)"
-    elif not normal_pass:
-        decision = "TRIM (normal-day risk)"
-    else:
-        decision = "OK"
+def render_risk_governance_block(metrics, threshold_context, status_info=None, es_limit: float = DEFAULT_ES99_LIMIT):
+    """Display simplified governance using fixed single-strategy limits."""
+    if status_info is None:
+        status_info = evaluate_strategy_status(metrics, es_limit)
 
-    st.markdown(f"**Governance Decision:** {decision}")
+    status_label, status_icon, detail = status_info
+    st.markdown(f"**Status:** {status_icon} {status_label}")
+    st.caption(detail)
+
+    if status_label == "REDUCE SIZE" and metrics["ES99"] > 0:
+        scale = es_limit / max(metrics["ES99"], 1e-6)
+        st.warning(f"To pass ES99, reduce position size to {scale*100:.0f}% of current.")
 
 
 def compute_es_attribution(rows, tail_entries, tail_level: float, es_value: float):
@@ -1024,7 +1275,7 @@ def compute_es_attribution(rows, tail_entries, tail_level: float, es_value: floa
     tail_prob = 1.0 - tail_level
     tail_loss_total = sum(entry["tail_contribution"] for entry in tail_entries)
 
-    bucket_shares = {"A": 0.0, "B": 0.0, "C": 0.0}
+    bucket_shares = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0, "E": 0.0}
     scenario_entries = []
 
     if tail_loss_total > 0 and es_value > 0 and tail_prob > 0:

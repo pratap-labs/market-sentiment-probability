@@ -330,6 +330,7 @@ def render_nifty_overview_tab():
     
     st.header("📈 NIFTY Overview & Future Movement Prediction")
     st.markdown("Analysis of max pain trends and prediction of NIFTY movements based on options data")
+
     
     # Load options data using the same loader as Data Hub
     with st.spinner("📊 Loading options data..."):
@@ -500,7 +501,7 @@ def render_nifty_overview_tab():
         
         # Select expiry for detailed analysis
         expiry_options = [item['expiry_date'] for item in max_pain_trends]
-        selected_expiry = st.selectbox(
+        selected_expiry = st.sidebar.selectbox(
             "Choose expiry for detailed analysis:",
             expiry_options,
             help="Select an expiry date to see detailed max pain breakdown"

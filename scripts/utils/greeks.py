@@ -1,8 +1,14 @@
 """Greeks calculation utilities using Black-Scholes model."""
 
 import pandas as pd
+import numpy as np
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, List
+try:
+    import streamlit as st
+except Exception:
+    st = None
 
 try:
     from py_vollib.black_scholes import black_scholes as bs
@@ -14,13 +20,17 @@ except Exception:
 from .parsers import parse_tradingsymbol
 
 
+RISK_FREE_RATE = 0.06
+CALENDAR_DAYS_PER_YEAR = 365.0
+
+
 def calculate_implied_volatility(
-    option_price: float, 
-    spot: float, 
-    strike: float, 
-    time_to_expiry: float, 
-    option_type: str, 
-    risk_free_rate: float = 0.07
+    option_price: float,
+    spot: float,
+    strike: float,
+    time_to_expiry: float,
+    option_type: str,
+    risk_free_rate: float = RISK_FREE_RATE,
 ) -> Optional[float]:
     """Calculate implied volatility using py_vollib.
     
@@ -48,12 +58,12 @@ def calculate_implied_volatility(
 
 
 def calculate_greeks(
-    spot: float, 
-    strike: float, 
-    time_to_expiry: float, 
-    implied_vol: float, 
-    option_type: str, 
-    risk_free_rate: float = 0.07
+    spot: float,
+    strike: float,
+    time_to_expiry: float,
+    implied_vol: float,
+    option_type: str,
+    risk_free_rate: float = RISK_FREE_RATE,
 ) -> Dict[str, float]:
     """Calculate option greeks using py_vollib.
     
@@ -84,9 +94,8 @@ def calculate_greeks(
         
         print(f"DEBUG calculate_greeks result: delta={delta}, gamma={gamma}, vega={vega_raw}, theta={theta_raw}")
 
-        # py_vollib returns vega as change in price for a change in volatility of 1.0
-        # (i.e. 100 percentage points). Most UIs report vega per 1% change in vol.
-        # Likewise theta from py_vollib is typically per-year; convert to per-day.
+        # py_vollib returns vega per 1% vol (0.01) and theta per day.
+        # Keep theta as-is to match broker UI units.
         try:
             vega_per_pct = float(vega_raw)
         except Exception:
@@ -127,6 +136,12 @@ def enrich_position_with_greeks(
         Enhanced position dict with Greeks and parsed fields
     """
     symbol = position.get("tradingsymbol", "")
+    if st is not None:
+        spot_override = st.session_state.get("greeks_spot_override")
+        if spot_override is None:
+            spot_override = st.session_state.get("stress_spot_override")
+        if spot_override is not None:
+            current_spot = float(spot_override)
     parsed = parse_tradingsymbol(symbol)
     
     if not parsed:
@@ -139,8 +154,17 @@ def enrich_position_with_greeks(
     
     # Calculate time to expiry
     today = datetime.now()
-    dte = (expiry - today).days
-    time_to_expiry = max(dte / 365.0, 0.001)  # Avoid division by zero
+    dte = max((expiry - today).days, 0)
+    expiry_dt = expiry
+    try:
+        if expiry_dt.tzinfo is None:
+            expiry_dt = expiry_dt.replace(tzinfo=ZoneInfo("Asia/Kolkata"))
+        expiry_dt = expiry_dt.replace(hour=15, minute=30, second=0, microsecond=0)
+        now_dt = datetime.now(ZoneInfo("Asia/Kolkata"))
+        minutes_to_expiry = max((expiry_dt - now_dt).total_seconds() / 60.0, 0.0)
+        time_to_expiry = max((minutes_to_expiry / (60.0 * 24.0)) / CALENDAR_DAYS_PER_YEAR, 1.0 / CALENDAR_DAYS_PER_YEAR)
+    except Exception:
+        time_to_expiry = max(dte / CALENDAR_DAYS_PER_YEAR, 1.0 / CALENDAR_DAYS_PER_YEAR)
     
     # Get current option price
     last_price = position.get("last_price", 0)
@@ -150,22 +174,10 @@ def enrich_position_with_greeks(
     print(f"  - Parsed: strike={strike}, expiry={expiry.date()}, type={option_type}")
     print(f"  - DTE={dte}, spot={current_spot}, last_price={last_price}")
     
-    # Try to get IV from options_df if available
-    matching_options = options_df[
-        (options_df["strike_price"] == strike) &
-        (options_df["expiry_date"] == expiry) &
-        (options_df["option_type"] == option_type)
-    ]
+    # Use position last_price only for IV calculation.
+    option_price = last_price
     
-    print(f"  - Found {len(matching_options)} matching options in df")
-    
-    if not matching_options.empty:
-        latest = matching_options.sort_values("date", ascending=False).iloc[0]
-        option_price = latest["ltp"] if "ltp" in latest and pd.notna(latest["ltp"]) else last_price
-    else:
-        option_price = last_price
-    
-    # Calculate IV
+    # Calculate IV if not sourced from options_df
     implied_vol = calculate_implied_volatility(
         option_price, current_spot, strike, time_to_expiry, option_type
     )
@@ -213,6 +225,13 @@ def enrich_position_with_greeks(
         "time_to_expiry": time_to_expiry,
         "implied_vol": implied_vol,
         "spot_price": current_spot,
+        "iv_debug": {
+            "spot_used": current_spot,
+            "option_price_used": option_price,
+            "time_to_expiry": time_to_expiry,
+            "expiry_date": expiry.date().isoformat(),
+            "match_count": 0,
+        },
         # include raw greeks and scaled position-level greeks
         **position_greeks,
         **scaled_greeks

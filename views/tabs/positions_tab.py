@@ -36,38 +36,7 @@ def load_from_cache(data_type: str) -> pd.DataFrame:
 def render_positions_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame = None):
     """Render the positions tab with enriched data."""
     st.subheader("Positions")
-    
-    # Add button to reload derivatives data from cache
-    col1, col2 = st.columns([1, 4])
-    with col1:
-        if st.button("🔄 Reload Data", help="Load latest derivatives data from cache"):
-            with st.spinner("Loading data from cache..."):
-                # Load options data (combine CE and PE)
-                df_ce = load_from_cache("nifty_options_ce")
-                df_pe = load_from_cache("nifty_options_pe")
-                
-                if not df_ce.empty and not df_pe.empty:
-                    options_df = pd.concat([df_ce, df_pe], ignore_index=True)
-                    st.session_state["options_df_cache"] = options_df
-                    st.success(f"✅ Loaded {len(options_df)} options records")
-                elif not df_ce.empty:
-                    options_df = df_ce
-                    st.session_state["options_df_cache"] = options_df
-                    st.success(f"✅ Loaded {len(options_df)} CE records")
-                elif not df_pe.empty:
-                    options_df = df_pe
-                    st.session_state["options_df_cache"] = options_df
-                    st.success(f"✅ Loaded {len(options_df)} PE records")
-                else:
-                    st.warning("⚠️ No options data in cache")
-                
-                # Load NIFTY OHLCV data
-                nifty_df = load_from_cache("nifty_ohlcv")
-                if not nifty_df.empty:
-                    st.session_state["nifty_df_cache"] = nifty_df
-                    st.success(f"✅ Loaded {len(nifty_df)} NIFTY records")
-                else:
-                    st.warning("⚠️ No NIFTY data in cache")
+
     
     # Use cached data if available
     if "options_df_cache" in st.session_state:
@@ -101,7 +70,7 @@ def render_positions_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame
     kite = KiteConnect(api_key=kite_api_key)
     kite.set_access_token(access_token)
 
-    if st.button("🔄 Fetch Latest Positions", type="primary"):
+    if st.sidebar.button("🔄 Fetch Latest Positions", type="primary"):
         try:
             with st.spinner("Fetching positions..."):
                 positions = kite.positions()
@@ -114,6 +83,11 @@ def render_positions_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame
                 # Get current spot price
                 market_regime = calculate_market_regime(options_df, nifty_df)
                 current_spot = market_regime.get("current_spot", 25000)
+                if nifty_df is not None and not nifty_df.empty and "close" in nifty_df.columns:
+                    try:
+                        current_spot = float(nifty_df["close"].dropna().iloc[-1])
+                    except Exception:
+                        pass
                 
                 # Enrich positions with Greeks
                 enriched = []
@@ -140,9 +114,25 @@ def render_positions_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame
         enriched = st.session_state["enriched_positions"]
         
         if enriched:
+            expiries = sorted(
+                {
+                    pos.get("expiry").date()
+                    for pos in enriched
+                    if isinstance(pos.get("expiry"), datetime)
+                }
+            )
+            expiry_options = ["All"] + [exp.strftime("%Y-%m-%d") for exp in expiries]
+            selected_expiry = st.sidebar.selectbox("Filter by Expiry", expiry_options)
+            if selected_expiry != "All":
+                enriched = [
+                    pos for pos in enriched
+                    if isinstance(pos.get("expiry"), datetime)
+                    and pos.get("expiry").strftime("%Y-%m-%d") == selected_expiry
+                ]
+
             # Create display dataframe
             display_cols = [
-                "tradingsymbol", "quantity", "strike", "option_type", "dte",
+                "tradingsymbol", "quantity", "strike", "option_type", "expiry", "dte",
                 "last_price", "pnl", "implied_vol",
                 "delta", "gamma", "vega", "theta",
                 "position_delta", "position_gamma", "position_vega", "position_theta"
@@ -154,6 +144,22 @@ def render_positions_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame
                 display_data.append(row)
             
             df = pd.DataFrame(display_data)
+            expiry_values = sorted(
+                {
+                    exp.strftime("%Y-%m-%d")
+                    for exp in df["expiry"].dropna()
+                    if hasattr(exp, "strftime")
+                }
+            )
+            expiry_options = ["All"] + expiry_values
+            selected_expiry = st.sidebar.selectbox("Filter by Expiry", expiry_options, key="positions_table_expiry")
+            if selected_expiry != "All":
+                df = df[
+                    df["expiry"].apply(
+                        lambda exp: exp.strftime("%Y-%m-%d") if hasattr(exp, "strftime") else str(exp)
+                    )
+                    == selected_expiry
+                ]
             
             # Format display
             if not df.empty:

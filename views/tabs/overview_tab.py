@@ -265,42 +265,38 @@ def get_alignment_status(market_iv_rank: float, portfolio_vega: float,
 def render_overview_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame = None):
     """Render the Ultimate Overview Tab with key decision metrics."""
     
-    # Add refresh and reload data buttons at the top
-    col1, col2, col3 = st.columns([3, 1, 1])
-    with col1:
-        st.header("🧭 Portfolio Overview — Decision View")
-    with col2:
-        if st.button("🔄 Reload Data", key="overview_reload_data", help="Load latest derivatives data from cache"):
-            with st.spinner("Loading data from cache..."):
-                # Load options data (combine CE and PE)
-                df_ce = load_from_cache("nifty_options_ce")
-                df_pe = load_from_cache("nifty_options_pe")
-                
-                if not df_ce.empty and not df_pe.empty:
-                    options_df = pd.concat([df_ce, df_pe], ignore_index=True)
-                    st.session_state["options_df_cache"] = options_df
-                    st.success(f"✅ Loaded {len(options_df)} options records")
-                elif not df_ce.empty:
-                    options_df = df_ce
-                    st.session_state["options_df_cache"] = options_df
-                    st.success(f"✅ Loaded {len(options_df)} CE records")
-                elif not df_pe.empty:
-                    options_df = df_pe
-                    st.session_state["options_df_cache"] = options_df
-                    st.success(f"✅ Loaded {len(options_df)} PE records")
-                else:
-                    st.warning("⚠️ No options data in cache")
-                
-                # Load NIFTY OHLCV data
-                nifty_df = load_from_cache("nifty_ohlcv")
-                if not nifty_df.empty:
-                    st.session_state["nifty_df_cache"] = nifty_df
-                    st.success(f"✅ Loaded {len(nifty_df)} NIFTY records")
-                else:
-                    st.warning("⚠️ No NIFTY data in cache")
-    with col3:
-        if st.button("🔄 Refresh", key="overview_refresh", help="Refresh overview with latest data"):
-            st.rerun()
+    st.header("🧭 Portfolio Overview — Decision View")
+
+    if st.sidebar.button("🔄 Reload Data", key="overview_reload_data", help="Load latest derivatives data from cache"):
+        with st.spinner("Loading data from cache..."):
+            # Load options data (combine CE and PE)
+            df_ce = load_from_cache("nifty_options_ce")
+            df_pe = load_from_cache("nifty_options_pe")
+            
+            if not df_ce.empty and not df_pe.empty:
+                options_df = pd.concat([df_ce, df_pe], ignore_index=True)
+                st.session_state["options_df_cache"] = options_df
+                st.success(f"✅ Loaded {len(options_df)} options records")
+            elif not df_ce.empty:
+                options_df = df_ce
+                st.session_state["options_df_cache"] = options_df
+                st.success(f"✅ Loaded {len(options_df)} CE records")
+            elif not df_pe.empty:
+                options_df = df_pe
+                st.session_state["options_df_cache"] = options_df
+                st.success(f"✅ Loaded {len(options_df)} PE records")
+            else:
+                st.warning("⚠️ No options data in cache")
+            
+            # Load NIFTY OHLCV data
+            nifty_df = load_from_cache("nifty_ohlcv")
+            if not nifty_df.empty:
+                st.session_state["nifty_df_cache"] = nifty_df
+                st.success(f"✅ Loaded {len(nifty_df)} NIFTY records")
+            else:
+                st.warning("⚠️ No NIFTY data in cache")
+    if st.sidebar.button("🔄 Refresh", key="overview_refresh", help="Refresh overview with latest data"):
+        st.rerun()
     
     # Use cached data if available
     if "options_df_cache" in st.session_state:
@@ -816,4 +812,3 @@ def render_overview_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame 
     
     {f'🔄 Roll {near_expiry_count} near-expiry positions to avoid gamma risk.' if near_expiry_count > 5 and regime_data.get('term_structure', 0) < -0.02 else ''}
     """)
-

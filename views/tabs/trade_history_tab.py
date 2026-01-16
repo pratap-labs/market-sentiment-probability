@@ -17,6 +17,7 @@ def render_trade_history_tab():
     """Render trade history analysis tab from tradebook.csv."""
     st.subheader("📊 Trade History Analysis")
     st.caption("Comprehensive analysis from Kite Console tradebook export")
+
     
     # Add tabs for different data input methods
     input_tabs = st.tabs(["📁 Upload CSV File", "💾 Use Local File"])
@@ -36,7 +37,7 @@ NIFTY24DEC24500CE,INE000000000,2024-11-02,NFO,FO,EQ,SELL,N,25,150.25,123457,7890
             """, language="csv")
             st.caption("Sample CSV format - ensure your file follows this structure")
         
-        uploaded_file = st.file_uploader(
+        uploaded_file = st.sidebar.file_uploader(
             "Choose a CSV file",
             type=['csv'],
             help="Export your tradebook from Kite Console and upload it here"
@@ -96,7 +97,7 @@ NIFTY24DEC24500CE,INE000000000,2024-11-02,NFO,FO,EQ,SELL,N,25,150.25,123457,7890
             file_size_mb = file_size / (1024 * 1024)
             st.info(f"📁 Found local file: `{tradebook_path}` ({file_size_mb:.2f} MB)")
             
-            if st.button("🔄 Load Local Tradebook", type="primary"):
+            if st.sidebar.button("🔄 Load Local Tradebook", type="primary"):
                 try:
                     # Read tradebook
                     with st.spinner("Loading local tradebook..."):
@@ -214,23 +215,18 @@ NIFTY24DEC24500CE,INE000000000,2024-11-02,NFO,FO,EQ,SELL,N,25,150.25,123457,7890
 
         # Add date range filter
         st.markdown("### 📅 Filter by Date Range")
-        col1, col2, col3 = st.columns([1, 1, 2])
 
         min_date = df['trade_date'].min()
         max_date = df['trade_date'].max()
         
-        with col1:
-            start_date = st.date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date)
-        
-        with col2:
-            end_date = st.date_input("End Date", value=max_date, min_value=min_date, max_value=max_date)
+        start_date = st.sidebar.date_input("Start Date", value=min_date, min_value=min_date, max_value=max_date)
+        end_date = st.sidebar.date_input("End Date", value=max_date, min_value=min_date, max_value=max_date)
         
         # Filter by date range
         mask = (df['trade_date'] >= pd.Timestamp(start_date)) & (df['trade_date'] <= pd.Timestamp(end_date))
         df_filtered = df[mask].copy()
         
-        with col3:
-            st.metric("Trades in Period", len(df_filtered), delta=f"{len(df_filtered)/len(df)*100:.1f}% of total")
+        st.metric("Trades in Period", len(df_filtered), delta=f"{len(df_filtered)/len(df)*100:.1f}% of total")
         
         if len(df_filtered) == 0:
             st.warning("No trades in selected period")

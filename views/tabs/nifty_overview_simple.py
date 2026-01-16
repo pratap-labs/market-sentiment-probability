@@ -38,7 +38,7 @@ def get_nse_session():
 
 
 def get_active_expiries(months_ahead=3):
-    """Get next N months of NIFTY expiries (last Thursday)."""
+    """Get next N months of NIFTY expiries (last Tuesday)."""
     expiries = []
     current_date = datetime.now()
     
@@ -50,7 +50,7 @@ def get_active_expiries(months_ahead=3):
             target_month -= 12
             target_year += 1
         
-        # Find last Thursday
+        # Find last Tuesday
         if target_month == 12:
             last_day = 31
         else:
@@ -59,11 +59,14 @@ def get_active_expiries(months_ahead=3):
         
         for day in range(last_day, 0, -1):
             date = datetime(target_year, target_month, day)
-            if date.weekday() == 3:  # Thursday
-                if date >= current_date.replace(hour=0, minute=0, second=0, microsecond=0):
+            if date.weekday() == 1:  # Tuesday
+                expiry_date = date
+                if expiry_date.month == 3 and expiry_date.day == 31:
+                    expiry_date -= timedelta(days=1)
+                if expiry_date >= current_date.replace(hour=0, minute=0, second=0, microsecond=0):
                     expiries.append({
-                        'date': date.strftime('%d-%b-%Y').upper(),
-                        'datetime': date
+                        'date': expiry_date.strftime('%d-%b-%Y').upper(),
+                        'datetime': expiry_date
                     })
                 break
     
@@ -119,6 +122,7 @@ def render_nifty_overview_tab():
     """Render NIFTY Overview tab with live NSE data."""
     
     st.header("📈 NIFTY Overview - Live NSE Data")
+
     
     # Hardcoded active expiries
     active_expiries = [
@@ -137,7 +141,7 @@ def render_nifty_overview_tab():
     st.success(f"📅 {len(active_expiries)} active expiries available")
     
     # Expiry selector
-    selected_expiry = st.selectbox(
+    selected_expiry = st.sidebar.selectbox(
         "Select Expiry:",
         active_expiries
     )
@@ -149,7 +153,7 @@ def render_nifty_overview_tab():
     to_date_str = to_date.strftime('%d-%m-%Y')
     
     # Load button
-    if st.button("📊 Load Data", type="primary"):
+    if st.sidebar.button("📊 Load Data", type="primary"):
         with st.spinner(f"� Fetching data for {selected_expiry}..."):
             session = get_nse_session()
             

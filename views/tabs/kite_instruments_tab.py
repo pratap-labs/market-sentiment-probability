@@ -275,13 +275,14 @@ def render_kite_instruments_tab():
     
     st.header("� NIFTY Futures Data Export")
     st.markdown("Fetch historical data for all NIFTY futures contracts and download as CSV files (one per expiry)")
+
     
     # Check if user is logged in
     if not st.session_state.get("kite_access_token"):
         st.warning("⚠️ Not logged in to Kite. Please go to the **Login** tab and sign in first.")
         
         # Add refresh button to check for login
-        if st.button("🔄 Refresh Login Status", help="Check if you've logged in via the Login tab"):
+        if st.sidebar.button("🔄 Refresh Login Status", help="Check if you've logged in via the Login tab"):
             st.rerun()
         return
     
@@ -294,31 +295,24 @@ def render_kite_instruments_tab():
     st.markdown("### ⚙️ Data Fetch Settings")
     
     col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        days_back = st.number_input(
-            "� Days of Historical Data",
-            min_value=1,
-            max_value=365,
-            value=30,
-            help="Number of days of historical data to fetch"
-        )
-    
-    with col2:
-        interval = st.selectbox(
-            "📊 Data Interval",
-            ["day", "minute", "3minute", "5minute", "10minute", "15minute", "30minute", "60minute"],
-            help="Time interval for the data"
-        )
-    
-    with col3:
-        if st.button("🚀 Fetch NIFTY Futures Data", type="primary"):
-            with st.spinner("🔄 Connecting to Kite API..."):
-                kite = get_kite_client_from_session()
-                
-                if not kite:
-                    st.error("❌ Failed to connect to Kite API. Please check your login status.")
-                    return
+    days_back = st.sidebar.number_input(
+        "� Days of Historical Data",
+        min_value=1,
+        max_value=365,
+        value=30,
+        help="Number of days of historical data to fetch"
+    )
+    interval = st.sidebar.selectbox(
+        "📊 Data Interval",
+        ["day", "minute", "3minute", "5minute", "10minute", "15minute", "30minute", "60minute"],
+        help="Time interval for the data"
+    )
+    if st.sidebar.button("🚀 Fetch NIFTY Futures Data", type="primary"):
+        with st.spinner("🔄 Connecting to Kite API..."):
+            kite = get_kite_client_from_session()
+            if not kite:
+                st.error("❌ Failed to connect to Kite API. Please check your login status.")
+                return
             
             with st.spinner("📡 Fetching all instruments..."):
                 all_instruments = fetch_all_instruments(kite)
@@ -414,7 +408,7 @@ def render_kite_instruments_tab():
         # Download all as ZIP
         st.markdown("#### 📦 Download All Files")
         
-        if st.button("🗜️ Generate ZIP File"):
+        if st.sidebar.button("🗜️ Generate ZIP File"):
             with st.spinner("📦 Creating ZIP file..."):
                 zip_content = create_zip_download(csv_files)
                 
@@ -426,7 +420,7 @@ def render_kite_instruments_tab():
                 )
         
         # Option to clear data
-        if st.button("🗑️ Clear Data", help="Clear downloaded data from session"):
+        if st.sidebar.button("🗑️ Clear Data", help="Clear downloaded data from session"):
             if "nifty_futures_csv" in st.session_state:
                 del st.session_state["nifty_futures_csv"]
             if "nifty_futures_data" in st.session_state:

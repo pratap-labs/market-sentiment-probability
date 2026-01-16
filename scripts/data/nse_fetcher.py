@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from dateutil.relativedelta import relativedelta
+import calendar
 import time
 import json
 import gzip
@@ -80,7 +81,7 @@ class NSEDataFetcher:
 
     def get_monthly_expiry_dates(self, start_date, months_back=3):
         """
-        Get NIFTY monthly expiry dates (hardcoded values)
+        Get NIFTY monthly expiry dates (last Tuesday of the month).
         
         Args:
             start_date: Reference date
@@ -89,35 +90,32 @@ class NSEDataFetcher:
         Returns:
             List of expiry dates (sorted) within the range
         """
-        from datetime import datetime
-        
-        # Hardcoded monthly expiry dates from the options chain
-        all_expiry_dates = [
-            datetime(2025, 1, 30),   # 30-JAN-2025
-            datetime(2025, 2, 27),   # 27-FEB-2025
-            datetime(2025, 3, 27),   # 27-MAR-2025
-            datetime(2025, 4, 24),   # 24-APR-2025
-            datetime(2025, 5, 29),   # 29-MAY-2025
-            datetime(2025, 6, 26),   # 26-JUN-2025
-            datetime(2025, 7, 31),   # 31-JUL-2025
-            datetime(2025, 8, 28),   # 28-AUG-2025
-            datetime(2025, 9, 25),   # 25-SEP-2025
-            datetime(2025, 9, 30),   # 30-SEP-2025
-            datetime(2025, 10, 28),  # 28-OCT-2025
-            datetime(2025, 11, 25),  # 25-NOV-2025
-            datetime(2025, 12, 30),  # 30-DEC-2025
-        ]
-        
-        # Filter dates based on start_date and months_back
-        filtered_dates = []
-        for expiry_date in all_expiry_dates:
-            if expiry_date <= start_date:
-                # Check if within months_back range
-                months_diff = (start_date.year - expiry_date.year) * 12 + (start_date.month - expiry_date.month)
-                if months_diff < months_back:
-                    filtered_dates.append(expiry_date)
-        
-        return sorted(all_expiry_dates)
+        if isinstance(start_date, datetime):
+            ref_date = start_date
+        else:
+            ref_date = datetime.combine(start_date, datetime.min.time())
+
+        def _last_tuesday(year: int, month: int) -> datetime:
+            last_day = datetime(year, month, calendar.monthrange(year, month)[1])
+            while last_day.weekday() != 1:
+                last_day -= timedelta(days=1)
+            if last_day.month == 3 and last_day.day == 31:
+                last_day -= timedelta(days=1)
+            return last_day
+
+        expiries = []
+        year = ref_date.year
+        month = ref_date.month
+        while len(expiries) < months_back:
+            expiry = _last_tuesday(year, month)
+            if expiry <= ref_date:
+                expiries.append(expiry)
+            month -= 1
+            if month < 1:
+                month = 12
+                year -= 1
+
+        return sorted(expiries)
 
 
     def fetch_futures_data(self, from_date, to_date, symbol, expiry_str, year=2025):

@@ -19,18 +19,36 @@ from scripts.utils import (
     calculate_var,
     calculate_stress_pnl,
     format_inr,
-    DEFAULT_LOT_SIZE
+    DEFAULT_LOT_SIZE,
+    enrich_position_with_greeks,
 )
 
 
 def render_portfolio_tab():
     """Render portfolio overview tab with complete metrics."""
     st.subheader("📈 Portfolio Overview")
+
     
     if "enriched_positions" not in st.session_state:
         st.info("No positions loaded. Fetch positions from the Positions tab first.")
         return
     
+    spot_override = st.sidebar.number_input(
+        "Spot Override (NIFTY)",
+        value=float(st.session_state.get("current_spot", 25000)),
+        step=10.0,
+        format="%.2f",
+        key="portfolio_spot_override",
+    )
+    if st.sidebar.button("Recompute Greeks (Portfolio)", type="primary", key="portfolio_recompute"):
+        options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
+        refreshed = []
+        for pos in st.session_state["enriched_positions"]:
+            refreshed.append(enrich_position_with_greeks(pos, options_df_cache, spot_override))
+        st.session_state["enriched_positions"] = refreshed
+        st.session_state["current_spot"] = spot_override
+        st.rerun()
+
     enriched = st.session_state["enriched_positions"]
     portfolio_greeks = calculate_portfolio_greeks(enriched)
     current_spot = st.session_state.get("current_spot", 25000)
@@ -55,6 +73,9 @@ def render_portfolio_tab():
             pass  # Use defaults if fetch fails
     
     account_size = margin_available + margin_used
+    st.session_state["account_size"] = account_size
+    st.session_state["margin_used"] = margin_used
+    st.session_state["margin_available"] = margin_available
     
     # Calculate portfolio metrics
     total_pnl = sum(p.get("pnl", 0) for p in enriched)
@@ -169,6 +190,33 @@ def render_portfolio_tab():
     with col2:
         st.metric("Vega % Capital", f"{vega_pct:.2f}%")
     
+    # Positions table (raw)
+    st.markdown("### Positions (Raw)")
+    expiry_values = sorted(
+        {
+            pos.get("expiry").strftime("%Y-%m-%d")
+            for pos in enriched
+            if pos.get("expiry")
+        }
+    )
+    expiry_options = ["All"] + expiry_values
+    selected_expiry = st.sidebar.selectbox("Filter by Expiry", expiry_options, key="portfolio_positions_expiry")
+    positions_df = pd.DataFrame(enriched)
+    if selected_expiry != "All" and "expiry" in positions_df.columns:
+        positions_df = positions_df[
+            positions_df["expiry"].apply(
+                lambda exp: exp.strftime("%Y-%m-%d") if hasattr(exp, "strftime") else str(exp)
+            ) == selected_expiry
+        ]
+    display_cols = [
+        "tradingsymbol", "quantity", "strike", "option_type", "dte",
+        "last_price", "pnl", "implied_vol",
+        "delta", "gamma", "vega", "theta",
+        "position_delta", "position_gamma", "position_vega", "position_theta",
+    ]
+    available_cols = [col for col in display_cols if col in positions_df.columns]
+    st.dataframe(positions_df[available_cols], use_container_width=True)
+
     # Greeks breakdown chart
     # st.markdown("#### Greeks Breakdown")
     greeks_data = pd.DataFrame({

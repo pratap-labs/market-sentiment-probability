@@ -22,6 +22,8 @@ from scripts.utils import calculate_portfolio_greeks
 def render_advanced_analytics_tab():
     """Render advanced analytics tab with professional metrics."""
     st.subheader("🎯 Advanced Analytics")
+
+    st.sidebar.caption("No controls for this tab.")
     
     if "enriched_positions" not in st.session_state:
         st.info("No positions loaded. Fetch positions from the Positions tab first.")

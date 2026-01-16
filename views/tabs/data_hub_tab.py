@@ -32,6 +32,7 @@ def render_data_hub_tab():
     
     st.info("💡 For data fetching and management, please use the **Derivatives Data** tab.")
 
+
     tab1, tab2, tab3 = st.tabs(["Futures Data", "Options Data", "Analysis"])
 
     with tab1:
@@ -70,7 +71,7 @@ def render_data_hub_tab():
         options_df = pd.concat([ce_df, pe_df], ignore_index=True) if not ce_df.empty and not pe_df.empty else (ce_df if not ce_df.empty else pe_df)
 
         # Fetch futures data for the selected symbol
-        symbol = st.selectbox("Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0, key="analysis_symbol")
+        symbol = st.sidebar.selectbox("Symbol", ["NIFTY", "BANKNIFTY", "FINNIFTY"], index=0, key="analysis_symbol")
 
         # get expiries from both sources (union)
         expiries = set()
@@ -96,7 +97,7 @@ def render_data_hub_tab():
 
         expiries = sorted(list(expiries))
         expiries_str = [d.strftime('%Y-%m-%d') for d in expiries]
-        sel = st.multiselect("Select expiries to analyse", expiries_str, default=[expiries_str[-1]])
+        sel = st.sidebar.multiselect("Select expiries to analyse", expiries_str, default=[expiries_str[-1]])
 
         for choice in sel:
             expiry_dt = pd.to_datetime(choice)

@@ -34,6 +34,10 @@ DEFAULT_SCENARIOS: List[Scenario] = [
     # Gap risk
     Scenario("Gap Down -2% & IV +5", ds_pct=-2.0, div_pts=5.0, category="gap"),
     Scenario("Gap Up +2% & IV +4", ds_pct=2.0, div_pts=4.0, category="gap"),
+    Scenario("Gap Down -5% & IV +8", ds_pct=-5.0, div_pts=8.0, category="gap"),
+    Scenario("Gap Up +5% & IV +7", ds_pct=5.0, div_pts=7.0, category="gap"),
+    Scenario("Gap Down -10% & IV +12", ds_pct=-10.0, div_pts=12.0, category="gap"),
+    Scenario("Gap Up +10% & IV +10", ds_pct=10.0, div_pts=10.0, category="gap"),
 ]
 
 
@@ -224,39 +228,49 @@ def normalize_ds_pct(ds_pct: float) -> float:
 
 
 def classify_bucket(scenario: Dict[str, Union[str, float]]) -> str:
-    """Classify scenario into buckets A/B/C."""
+    """Classify scenario into buckets A/B/C/D/E."""
     scenario_type = str(scenario.get("type", "PRICE")).upper()
     ds_pct = normalize_ds_pct(float(scenario.get("dS_pct", 0.0)))
     abs_ds = abs(ds_pct)
     d_iv = float(scenario.get("dIV_pts", 0.0))
 
-    if scenario_type == "GAP" or abs_ds > 0.015 or d_iv > 5.0:
-        return "C"
+    if scenario_type == "GAP":
+        return "E"
+    if abs_ds > 0.05 or d_iv > 8.0:
+        return "E"
+    if abs_ds > 0.025 or d_iv > 5.0:
+        return "D"
 
     if scenario_type == "IV":
         if d_iv <= 0:
             return "A"  # informational but treat as A for display
-        if d_iv <= 2.0:
+        if d_iv <= 1.0:
             return "A"
-        if d_iv <= 5.0:
+        if d_iv <= 2.0:
             return "B"
-        return "C"
+        if d_iv <= 3.0:
+            return "C"
+        return "D"
 
     if scenario_type == "PRICE":
-        if abs_ds <= 0.010:
+        if abs_ds <= 0.005:
             return "A"
-        if abs_ds <= 0.015:
+        if abs_ds <= 0.010:
             return "B"
-        return "C"
+        if abs_ds <= 0.015:
+            return "C"
+        return "D"
 
     if scenario_type == "COMBINED":
-        if abs_ds <= 0.010 and d_iv <= 2.0:
+        if abs_ds <= 0.005 and d_iv <= 1.0:
             return "A"
-        if abs_ds <= 0.015 and d_iv <= 3.0:
+        if abs_ds <= 0.010 and d_iv <= 2.0:
             return "B"
-        return "C"
+        if abs_ds <= 0.015 and d_iv <= 3.0:
+            return "C"
+        return "D"
 
-    return "B"
+    return "C"
 
 
 def derive_thresholds(
@@ -269,7 +283,15 @@ def derive_thresholds(
     limit_a = master_pct * normal_share
     limit_b = master_pct * stress_share
     limit_c = hard_stop_pct
-    return {"limitA": limit_a, "limitB": limit_b, "limitC": limit_c}
+    limit_d = hard_stop_pct
+    limit_e = hard_stop_pct
+    return {
+        "limitA": limit_a,
+        "limitB": limit_b,
+        "limitC": limit_c,
+        "limitD": limit_d,
+        "limitE": limit_e,
+    }
 
 
 def compute_threshold_scenario_pnl(
@@ -325,8 +347,12 @@ def build_threshold_report(
             threshold_pct = thresholds["limitA"]
         elif bucket == "B":
             threshold_pct = thresholds["limitB"]
-        else:
+        elif bucket == "C":
             threshold_pct = thresholds["limitC"]
+        elif bucket == "D":
+            threshold_pct = thresholds["limitD"]
+        else:
+            threshold_pct = thresholds["limitE"]
 
         status = "PASS"
         if scenario.get("type", "").upper() == "IV" and float(scenario.get("dIV_pts", 0.0)) < 0:
@@ -367,18 +393,18 @@ def build_threshold_report(
 
 
 def classify_history_bucket(return_pct: float, iv_change: float) -> str:
-    """Assign historical move to bucket A/B/C."""
+    """Assign historical move to bucket A/B/C/D/E."""
     abs_ret = abs(return_pct)
     abs_iv = abs(iv_change)
-    if abs_ret > 0.015 or abs_iv > 5.0:
-        return "C"
-    if (abs_ret <= 0.01 and abs_iv <= 2.0):
+    if abs_ret <= 0.005 and abs_iv <= 1.0:
         return "A"
-    if (0.01 < abs_ret <= 0.015 and abs_iv <= 2.0):
+    if abs_ret <= 0.01 and abs_iv <= 2.0:
         return "B"
-    if (abs_ret <= 0.015 and 2.0 < abs_iv <= 5.0):
-        return "B"
-    return "B"
+    if abs_ret <= 0.015 and abs_iv <= 3.0:
+        return "C"
+    if abs_ret <= 0.025 and abs_iv <= 5.0:
+        return "D"
+    return "E"
 
 
 def normalize_probabilities(prob_map: Dict[str, float]) -> Dict[str, float]:
