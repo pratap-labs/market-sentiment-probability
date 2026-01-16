@@ -25,7 +25,6 @@ from views.tabs.portfolio_buckets_tab import (
     _compute_trade_es99,
     _derive_underlying,
     _extract_margin,
-    _extract_expiry,
     _group_positions_by_trade,
 )
 from views.tabs.risk_analysis_tab import (

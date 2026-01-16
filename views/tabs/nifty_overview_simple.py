@@ -5,7 +5,6 @@ Simple NIFTY Overview tab - loads data directly from NSE API
 import streamlit as st
 import pandas as pd
 import requests
-import plotly.graph_objects as go
 from datetime import datetime, timedelta
 import time
 

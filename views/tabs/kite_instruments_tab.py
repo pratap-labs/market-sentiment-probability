@@ -5,7 +5,7 @@ Kite Instruments tab for loading NIFTY futures data from Kite API
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import List, Dict
 import io
 import zipfile
 

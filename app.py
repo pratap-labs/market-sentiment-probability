@@ -6,7 +6,6 @@ Enhanced with Options Analytics Dashboard - Refactored with modular tabs.
 import os
 import sys
 import streamlit as st
-import pandas as pd
 import json
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
@@ -72,12 +71,6 @@ from views.tabs.login_tab import render_login_tab
 from views.tabs.portfolio_dashboard_tab import render_portfolio_dashboard_tab
 from views.tabs.diagnostics_tab import render_diagnostics_tab
 from views.tabs.market_regime_tab import render_market_regime_tab
-from views.tabs.alerts_tab import render_alerts_tab
-from views.tabs.advanced_analytics_tab import render_advanced_analytics_tab
-from views.tabs.trade_history_tab import render_trade_history_tab
-from views.tabs.data_hub_tab import render_data_hub_tab
-from views.tabs.kite_instruments_tab import render_kite_instruments_tab
-from views.tabs.nifty_overview_simple import render_nifty_overview_tab
 from views.tabs.risk_analysis_tab import render_risk_analysis_tab
 from views.tabs.risk_buckets_tab import render_risk_buckets_tab
 from views.tabs.portfolio_buckets_tab import render_portfolio_buckets_tab
@@ -87,12 +80,6 @@ from views.tabs.historical_performance_tab import render_historical_performance_
 from views.tabs.greeks_debug_tab import render_greeks_debug_tab
 from views.tabs.product_overview_tab import render_product_overview_tab
 from views.tabs.derivatives_data_tab import render_derivatives_data_tab, load_cached_derivatives_data_for_session
-
-try:
-    from views.tabs import data_hub_tab
-except Exception as e:
-    data_hub_tab = None
-    print(f"Failed to import data_hub: {e}")
 
 
 def save_kite_credentials(access_token: str, api_key: str, saved_at: Optional[str] = None):

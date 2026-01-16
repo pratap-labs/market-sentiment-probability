@@ -1,10 +1,9 @@
 """Greeks calculation utilities using Black-Scholes model."""
 
 import pandas as pd
-import numpy as np
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, List
+from typing import Optional, Dict
 try:
     import streamlit as st
 except Exception:

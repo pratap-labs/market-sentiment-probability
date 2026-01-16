@@ -5,9 +5,8 @@ Provides one-glance decision signals on market conditions, portfolio health, and
 
 import streamlit as st
 import pandas as pd
-import numpy as np
 import plotly.graph_objects as go
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 # Import utility functions
 import sys

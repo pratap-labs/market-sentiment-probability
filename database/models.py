@@ -1,4 +1,3 @@
-import os
 from datetime import datetime, date
 from typing import Dict, Any
 from supabase import create_client, Client

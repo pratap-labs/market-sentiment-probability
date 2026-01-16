@@ -1,17 +1,12 @@
-import requests
-import pandas as pd
-from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
 import calendar
-import time
+from datetime import datetime, timedelta
 import json
-import gzip
-import subprocess
-import json
-import subprocess
-import json
-import tempfile
 import os
+import pandas as pd
+import requests
+import subprocess
+import tempfile
+import time
 
 
 class NSEDataFetcher:

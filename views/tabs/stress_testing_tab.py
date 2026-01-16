@@ -27,8 +27,6 @@ from views.tabs.risk_analysis_tab import (
     compute_historical_bucket_probabilities,
     render_expected_shortfall_panel,
     DEFAULT_ES99_LIMIT,
-    DEFAULT_THRESHOLD_MASTER_PCT,
-    DEFAULT_THRESHOLD_HARD_STOP_PCT,
     DEFAULT_THRESHOLD_NORMAL_SHARE,
     DEFAULT_THRESHOLD_STRESS_SHARE,
 )

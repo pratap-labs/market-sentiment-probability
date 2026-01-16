@@ -21,7 +21,6 @@ http://127.0.0.1:8080/ (or whichever host/port you choose).
 import os
 import threading
 import webbrowser
-import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 

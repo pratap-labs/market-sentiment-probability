@@ -6,11 +6,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

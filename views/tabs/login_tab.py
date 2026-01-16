@@ -3,7 +3,6 @@
 import os
 import streamlit as st
 from pathlib import Path
-import json
 import streamlit.components.v1 as components
 
 # Path to credentials file

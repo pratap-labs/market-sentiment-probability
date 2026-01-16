@@ -1,5 +1,4 @@
 import streamlit as st
-import importlib
 import os
 import sys
 import pandas as pd
@@ -19,7 +18,6 @@ if ROOT not in sys.path:
 if __name__ == "__main__":
     st.set_page_config(layout="wide")
 
-from database.models import supabase
 # Import derivatives data tab for data loading
 from views.tabs.derivatives_data_tab import load_from_cache
 
@@ -78,18 +76,7 @@ def render_data_hub_tab():
         if hasattr(options_df, 'expiry'):
             expiries.update([pd.to_datetime(x) for x in options_df['expiry'].dropna().unique()])
 
-        try:
-            fut_res = supabase.table('futures_data')\
-                .select('date, expiry_date, underlying_value, open_interest, change_in_oi, symbol')\
-                .eq('symbol', symbol)\
-                .order('date', desc=False)\
-                .execute()
-            fut_df = pd.DataFrame(fut_res.data or [])
-            if not fut_df.empty and 'expiry_date' in fut_df.columns:
-                fut_df['expiry_date'] = pd.to_datetime(fut_df['expiry_date'], errors='coerce')
-                expiries.update([pd.to_datetime(x) for x in fut_df['expiry_date'].dropna().unique()])
-        except Exception:
-            fut_df = pd.DataFrame()
+        fut_df = pd.DataFrame()
 
         if not expiries:
             st.info("No expiries found in futures or options data sources.")
