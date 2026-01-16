@@ -13,7 +13,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 # Add project root to path
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
@@ -39,6 +39,13 @@ def load_env_file(env_path: Path) -> None:
 
 
 load_env_file(Path(ROOT) / ".env")
+try:
+    if "KITE_API_KEY" in st.secrets and not os.getenv("KITE_API_KEY"):
+        os.environ["KITE_API_KEY"] = st.secrets["KITE_API_KEY"]
+    if "KITE_API_SECRET" in st.secrets and not os.getenv("KITE_API_SECRET"):
+        os.environ["KITE_API_SECRET"] = st.secrets["KITE_API_SECRET"]
+except Exception:
+    pass
 
 # Cache directory for credentials
 CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
