@@ -54,8 +54,9 @@ KITE_TOKEN_TTL = timedelta(hours=12)
 
 try:
     from kiteconnect import KiteConnect
-except Exception:
+except Exception as e:
     KiteConnect = None
+    print(f"⚠️ Failed to import kiteconnect: {e}")
 
 try:
     from py_vollib.black_scholes import black_scholes as bs
