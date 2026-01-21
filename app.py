@@ -43,6 +43,10 @@ try:
         os.environ["KITE_API_KEY"] = st.secrets["KITE_API_KEY"]
     if "KITE_API_SECRET" in st.secrets and not os.getenv("KITE_API_SECRET"):
         os.environ["KITE_API_SECRET"] = st.secrets["KITE_API_SECRET"]
+    if "KITE_API_KEY_2" in st.secrets and not os.getenv("KITE_API_KEY_2"):
+        os.environ["KITE_API_KEY_2"] = st.secrets["KITE_API_KEY_2"]
+    if "KITE_API_SECRET_2" in st.secrets and not os.getenv("KITE_API_SECRET_2"):
+        os.environ["KITE_API_SECRET_2"] = st.secrets["KITE_API_SECRET_2"]
 except Exception:
     pass
 
@@ -50,6 +54,7 @@ except Exception:
 CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 KITE_CREDS_FILE = CACHE_DIR / "kite_credentials.json"
+KITE_CREDS_FILE_2 = CACHE_DIR / "kite_credentials_2.json"
 KITE_TOKEN_TTL = timedelta(hours=12)
 
 try:
@@ -74,6 +79,7 @@ from views.tabs.diagnostics_tab import render_diagnostics_tab
 from views.tabs.market_regime_tab import render_market_regime_tab
 from views.tabs.risk_analysis_tab import render_risk_analysis_tab
 from views.tabs.risk_buckets_tab import render_risk_buckets_tab
+from views.tabs.equities_tab import render_equities_tab
 from views.tabs.portfolio_buckets_tab import render_portfolio_buckets_tab
 from views.tabs.stress_testing_tab import render_stress_testing_tab
 from views.tabs.hedge_lab_tab import render_hedge_lab_tab
@@ -83,7 +89,34 @@ from views.tabs.product_overview_tab import render_product_overview_tab
 from views.tabs.derivatives_data_tab import render_derivatives_data_tab, load_cached_derivatives_data_for_session
 
 
-def save_kite_credentials(access_token: str, api_key: str, saved_at: Optional[str] = None):
+KITE_ACCOUNT_PRIMARY = "primary"
+KITE_ACCOUNT_SECONDARY = "secondary"
+
+
+def _account_suffix(account: str) -> str:
+    return "primary" if account == KITE_ACCOUNT_PRIMARY else "secondary"
+
+
+def _account_session_key(base: str, account: str) -> str:
+    return f"{base}_{_account_suffix(account)}"
+
+
+def _account_env_key(account: str, base: str) -> str:
+    if account == KITE_ACCOUNT_PRIMARY:
+        return base
+    return f"{base}_2"
+
+
+def _account_creds_file(account: str) -> Path:
+    return KITE_CREDS_FILE if account == KITE_ACCOUNT_PRIMARY else KITE_CREDS_FILE_2
+
+
+def save_kite_credentials(
+    access_token: str,
+    api_key: str,
+    saved_at: Optional[str] = None,
+    account: str = KITE_ACCOUNT_PRIMARY,
+):
     """Save Kite credentials to persistent file."""
     try:
         saved_at = saved_at or datetime.now(timezone.utc).isoformat()
@@ -92,7 +125,7 @@ def save_kite_credentials(access_token: str, api_key: str, saved_at: Optional[st
             "api_key": api_key,
             "saved_at": saved_at
         }
-        with open(KITE_CREDS_FILE, 'w') as f:
+        with open(_account_creds_file(account), 'w') as f:
             json.dump(creds, f)
         return saved_at
     except Exception as e:
@@ -100,11 +133,12 @@ def save_kite_credentials(access_token: str, api_key: str, saved_at: Optional[st
         return None
 
 
-def load_kite_credentials():
+def load_kite_credentials(account: str = KITE_ACCOUNT_PRIMARY):
     """Load Kite credentials from persistent file."""
     try:
-        if KITE_CREDS_FILE.exists():
-            with open(KITE_CREDS_FILE, 'r') as f:
+        creds_file = _account_creds_file(account)
+        if creds_file.exists():
+            with open(creds_file, 'r') as f:
                 creds = json.load(f)
                 return (
                     creds.get("access_token"),
@@ -116,11 +150,12 @@ def load_kite_credentials():
     return None, None, None
 
 
-def clear_kite_credentials():
+def clear_kite_credentials(account: str = KITE_ACCOUNT_PRIMARY):
     """Clear saved Kite credentials file."""
     try:
-        if KITE_CREDS_FILE.exists():
-            KITE_CREDS_FILE.unlink()
+        creds_file = _account_creds_file(account)
+        if creds_file.exists():
+            creds_file.unlink()
     except Exception as e:
         st.error(f"Failed to clear credentials: {e}")
 
@@ -130,6 +165,12 @@ def clear_kite_session_state():
     st.session_state.pop("kite_access_token", None)
     st.session_state.pop("kite_api_key", None)
     st.session_state.pop("kite_token_timestamp", None)
+
+
+def clear_kite_account_state(account: str) -> None:
+    st.session_state.pop(_account_session_key("kite_access_token", account), None)
+    st.session_state.pop(_account_session_key("kite_api_key", account), None)
+    st.session_state.pop(_account_session_key("kite_token_timestamp", account), None)
 
 
 def is_token_expired(saved_at: Optional[str]) -> bool:
@@ -152,8 +193,10 @@ def enforce_kite_token_ttl():
     if not token_present:
         return
     if is_token_expired(token_ts):
+        active_account = st.session_state.get("kite_active_account", KITE_ACCOUNT_PRIMARY)
         clear_kite_session_state()
-        clear_kite_credentials()
+        clear_kite_account_state(active_account)
+        clear_kite_credentials(active_account)
         st.warning("Kite login expired. Please login again to continue.")
 
 
@@ -232,30 +275,65 @@ def render():
         return
 
     # Initialize session state
-    if "kite_login_initiated" not in st.session_state:
-        st.session_state.kite_login_initiated = False
+    st.session_state.setdefault(_account_session_key("kite_login_initiated", KITE_ACCOUNT_PRIMARY), False)
+    st.session_state.setdefault(_account_session_key("kite_login_initiated", KITE_ACCOUNT_SECONDARY), False)
     if "kite_processing_token" not in st.session_state:
         st.session_state.kite_processing_token = False
+    st.session_state.setdefault("kite_active_account", KITE_ACCOUNT_PRIMARY)
 
     if st.session_state.get("kite_force_logout"):
         clear_kite_session_state()
-        clear_kite_credentials()
-        for key in ("kite_login_initiated", "kite_processing_token", "kite_api_key_stored", "kite_api_secret_stored"):
+        clear_kite_credentials(KITE_ACCOUNT_PRIMARY)
+        clear_kite_credentials(KITE_ACCOUNT_SECONDARY)
+        clear_kite_account_state(KITE_ACCOUNT_PRIMARY)
+        clear_kite_account_state(KITE_ACCOUNT_SECONDARY)
+        for key in (
+            _account_session_key("kite_login_initiated", KITE_ACCOUNT_PRIMARY),
+            _account_session_key("kite_login_initiated", KITE_ACCOUNT_SECONDARY),
+            "kite_processing_token",
+            _account_session_key("kite_api_key_stored", KITE_ACCOUNT_PRIMARY),
+            _account_session_key("kite_api_secret_stored", KITE_ACCOUNT_PRIMARY),
+            _account_session_key("kite_api_key_stored", KITE_ACCOUNT_SECONDARY),
+            _account_session_key("kite_api_secret_stored", KITE_ACCOUNT_SECONDARY),
+            "kite_login_account",
+            "kite_active_account",
+        ):
             st.session_state.pop(key, None)
         st.session_state.pop("kite_force_logout", None)
-    
-    # Load credentials from file if not in session
-    if "kite_access_token" not in st.session_state or "kite_api_key" not in st.session_state:
-        saved_token, saved_key, saved_at = load_kite_credentials()
+
+    def load_account_credentials(account: str) -> None:
+        token_key = _account_session_key("kite_access_token", account)
+        api_key_key = _account_session_key("kite_api_key", account)
+        ts_key = _account_session_key("kite_token_timestamp", account)
+        if token_key in st.session_state and api_key_key in st.session_state:
+            return
+        saved_token, saved_key, saved_at = load_kite_credentials(account)
         if saved_token and saved_key:
             if is_token_expired(saved_at):
-                clear_kite_credentials()
-                st.info("Saved Kite credentials have expired. Please login again.")
+                clear_kite_credentials(account)
+                st.info(f"Saved Kite credentials ({account}) have expired. Please login again.")
             else:
-                st.session_state["kite_access_token"] = saved_token
-                st.session_state["kite_api_key"] = saved_key
-                st.session_state["kite_token_timestamp"] = saved_at
-                st.success("✅ Loaded saved Kite credentials from file")
+                st.session_state[token_key] = saved_token
+                st.session_state[api_key_key] = saved_key
+                st.session_state[ts_key] = saved_at
+
+    def apply_active_account(account: str) -> None:
+        token_key = _account_session_key("kite_access_token", account)
+        api_key_key = _account_session_key("kite_api_key", account)
+        ts_key = _account_session_key("kite_token_timestamp", account)
+        access_token = st.session_state.get(token_key)
+        api_key = st.session_state.get(api_key_key)
+        if access_token and api_key:
+            st.session_state["kite_access_token"] = access_token
+            st.session_state["kite_api_key"] = api_key
+            st.session_state["kite_token_timestamp"] = st.session_state.get(ts_key)
+        else:
+            clear_kite_session_state()
+
+    # Load credentials from file if not in session
+    load_account_credentials(KITE_ACCOUNT_PRIMARY)
+    load_account_credentials(KITE_ACCOUNT_SECONDARY)
+    apply_active_account(st.session_state.get("kite_active_account", KITE_ACCOUNT_PRIMARY))
 
     # Ensure session tokens are still within TTL before rendering rest of the dashboard
     enforce_kite_token_ttl()
@@ -267,9 +345,14 @@ def render():
     # Exchange request token for access token
     if incoming_request_token and not st.session_state.kite_processing_token:
         st.session_state.kite_processing_token = True
-        
-        api_key = st.session_state.get("kite_api_key_stored") or os.getenv("KITE_API_KEY")
-        api_secret = st.session_state.get("kite_api_secret_stored") or os.getenv("KITE_API_SECRET")
+
+        account = st.session_state.get("kite_login_account", KITE_ACCOUNT_PRIMARY)
+        api_key = st.session_state.get(_account_session_key("kite_api_key_stored", account)) or os.getenv(
+            _account_env_key(account, "KITE_API_KEY")
+        )
+        api_secret = st.session_state.get(_account_session_key("kite_api_secret_stored", account)) or os.getenv(
+            _account_env_key(account, "KITE_API_SECRET")
+        )
             
         if api_key and api_secret:
             try:
@@ -279,18 +362,22 @@ def render():
                     access_token = data.get("access_token")
                     
                     if access_token:
-                        st.session_state["kite_access_token"] = access_token
-                        st.session_state["kite_api_key"] = api_key
                         token_timestamp = datetime.now(timezone.utc).isoformat()
-                        st.session_state["kite_token_timestamp"] = token_timestamp
+                        st.session_state[_account_session_key("kite_access_token", account)] = access_token
+                        st.session_state[_account_session_key("kite_api_key", account)] = api_key
+                        st.session_state[_account_session_key("kite_token_timestamp", account)] = token_timestamp
+                        if st.session_state.get("kite_active_account", KITE_ACCOUNT_PRIMARY) == account:
+                            st.session_state["kite_access_token"] = access_token
+                            st.session_state["kite_api_key"] = api_key
+                            st.session_state["kite_token_timestamp"] = token_timestamp
                         
                         # Save credentials to persistent file
-                        save_kite_credentials(access_token, api_key, token_timestamp)
+                        save_kite_credentials(access_token, api_key, token_timestamp, account=account)
                         
                         st.success("✅ Successfully logged in and saved credentials!")
                         
                         st.query_params.clear()
-                        st.session_state.kite_login_initiated = False
+                        st.session_state[_account_session_key("kite_login_initiated", account)] = False
                         st.session_state.kite_processing_token = False
                         st.rerun()
                     else:
@@ -314,6 +401,7 @@ def render():
         {"key": "login", "label": "🔐 Login"},
         {"key": "portfolio", "label": "📊 Portfolio"},
         {"key": "risk_analysis", "label": "🎯 Risk Analysis"},
+        {"key": "equities", "label": "📈 Equities"},
         {"key": "risk_buckets", "label": "Risk Buckets (50/30/20)"},
         {"key": "portfolio_buckets", "label": "Portfolio Buckets"},
         {"key": "market_regime", "label": "🌡️ Market Regime"},
@@ -431,6 +519,8 @@ def render():
             render_portfolio_dashboard_tab()
         elif active_key == "risk_analysis":
             render_risk_analysis_tab()
+        elif active_key == "equities":
+            render_equities_tab()
         elif active_key == "risk_buckets":
             render_risk_buckets_tab()
         elif active_key == "portfolio_buckets":
