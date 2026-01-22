@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import math
@@ -18,6 +19,7 @@ from scripts.utils import (
     calculate_portfolio_greeks,
     compute_var_es_metrics,
     get_weighted_scenarios,
+    enrich_position_with_greeks,
 )
 from scripts.utils.formatters import format_inr
 from views.tabs.portfolio_buckets_tab import (
@@ -69,13 +71,45 @@ def _init_tba_state() -> None:
     st.session_state.setdefault("tba_iv_mode", "IV Flat")
     st.session_state.setdefault("tba_iv_shock", 2.0)
     st.session_state.setdefault("tba_spot_overlay", False)
+    st.session_state.setdefault("tba_spot_input", 0.0)
     st.session_state.setdefault("tba_bucket_sim_target", "Portfolio")
     st.session_state.setdefault("tba_trade_filter_underlying", "All")
     st.session_state.setdefault("tba_trade_filter_week", "All")
+    st.session_state.setdefault("tba_trade_filter_side", "All")
     st.session_state.setdefault("tba_trade_filter_bucket", "All")
     st.session_state.setdefault("tba_trade_filter_zone", "All")
     st.session_state.setdefault("tba_trade_sort", "trade_es99_inr")
     st.session_state.setdefault("tba_selected_trade", "")
+    if "tba_saved_trades" not in st.session_state:
+        st.session_state["tba_saved_trades"] = _load_saved_groups()
+    st.session_state.setdefault("tba_trade_group_name", "")
+    st.session_state.setdefault("tba_trade_group_selection", [])
+    st.session_state.setdefault("tba_clear_trade_group", False)
+    st.session_state.setdefault("tba_use_saved_groups", False)
+
+
+def _saved_groups_path() -> Path:
+    return Path("database") / "trade_groups.json"
+
+
+def _load_saved_groups() -> List[Dict[str, object]]:
+    path = _saved_groups_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_saved_groups(groups: List[Dict[str, object]]) -> None:
+    path = _saved_groups_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(groups, ensure_ascii=True, indent=2), encoding="utf-8")
+    except Exception:
+        return
 
 
 def _sync_total_capital_from_account() -> None:
@@ -101,19 +135,89 @@ def _iso_week_id(expiry: Optional[object]) -> str:
         dt = expiry
     else:
         try:
-            dt = pd.to_datetime(expiry)
+            dt = pd.to_datetime(expiry, errors="coerce")
         except Exception:
             return "UNKNOWN"
+    if dt is None or pd.isna(dt):
+        return "UNKNOWN"
     iso_year, iso_week, _ = dt.isocalendar()
     return f"{iso_year}-W{int(iso_week):02d}"
 
 
+def _derive_option_side(position: Dict[str, object]) -> str:
+    raw = position.get("option_type") or position.get("instrument_type")
+    if raw is None:
+        return "OTHER"
+    value = str(raw).upper().strip()
+    if value in {"CE", "PE"}:
+        return value
+    return value or "OTHER"
+
+
+def _position_label(position: Dict[str, object], idx: int) -> str:
+    symbol = position.get("tradingsymbol") or "UNKNOWN"
+    expiry = position.get("expiry")
+    if isinstance(expiry, datetime):
+        expiry_label = expiry.strftime("%Y-%m-%d")
+    else:
+        expiry_label = str(expiry) if expiry else "—"
+    option_type = position.get("option_type") or position.get("instrument_type") or ""
+    qty = position.get("quantity") or 0
+    strike = position.get("strike") or ""
+    return f"{idx} | {symbol} | {option_type} {strike} | {expiry_label} | qty {qty}"
+
+
+def build_trades_from_saved_groups(
+    positions: List[Dict[str, object]],
+    saved_groups: List[Dict[str, object]],
+) -> List[Dict[str, object]]:
+    if not saved_groups:
+        return []
+    trades = []
+    for group in saved_groups:
+        leg_ids = set(group.get("legs", []))
+        legs = []
+        for idx, pos in enumerate(positions):
+            pos_id = str(idx)
+            if pos_id in leg_ids:
+                legs.append(pos)
+        if not legs:
+            continue
+        expiries = []
+        for leg in legs:
+            exp = leg.get("expiry")
+            if isinstance(exp, datetime):
+                expiries.append(exp)
+            else:
+                try:
+                    dt = pd.to_datetime(exp, errors="coerce")
+                except Exception:
+                    continue
+                if dt is None or pd.isna(dt):
+                    continue
+                expiries.append(dt)
+        trade_name = group.get("name") or "Manual Trade"
+        trades.append(
+            {
+                "underlying": _derive_underlying(legs[0]),
+                "expiry": trade_name,
+                "legs": legs,
+                "option_side": trade_name,
+                "earliest_expiry": min(expiries).strftime("%Y-%m-%d") if expiries else "—",
+                "latest_expiry": max(expiries).strftime("%Y-%m-%d") if expiries else "—",
+                "trade_name": trade_name,
+            }
+        )
+    return trades
+
+
 def build_trades_using_existing_grouping(positions: List[Dict[str, object]]) -> List[Dict[str, object]]:
-    def _key_func(pos: Dict[str, object]) -> Tuple[str, str]:
+    def _key_func(pos: Dict[str, object]) -> Tuple[str, str, str]:
         underlying = _derive_underlying(pos)
         expiry = pos.get("expiry")
         week_id = _iso_week_id(expiry)
-        return (underlying, week_id)
+        option_side = _derive_option_side(pos)
+        return (underlying, week_id, option_side)
 
     trades = _group_positions_by_trade(positions, key_func=_key_func)
     for trade in trades:
@@ -122,11 +226,14 @@ def build_trades_using_existing_grouping(positions: List[Dict[str, object]]) -> 
             exp = leg.get("expiry")
             if isinstance(exp, datetime):
                 expiries.append(exp)
-            else:
-                try:
-                    expiries.append(pd.to_datetime(exp))
-                except Exception:
-                    continue
+                continue
+            try:
+                dt = pd.to_datetime(exp, errors="coerce")
+            except Exception:
+                continue
+            if dt is None or pd.isna(dt):
+                continue
+            expiries.append(dt)
         if expiries:
             trade["earliest_expiry"] = min(expiries).strftime("%Y-%m-%d")
             trade["latest_expiry"] = max(expiries).strftime("%Y-%m-%d")
@@ -155,6 +262,160 @@ def _parse_zone_map(raw: str) -> Dict[str, str]:
     return mappings
 
 
+ 
+
+
+def _label_theta_zone(theta_per_lakh: float) -> str:
+    if theta_per_lakh < 120:
+        return "TOO_SAFE"
+    if 120 <= theta_per_lakh <= 180:
+        return "Z1"
+    if 180 < theta_per_lakh <= 220:
+        return "Z2"
+    if 220 < theta_per_lakh <= 300:
+        return "Z3"
+    return "OUT"
+
+
+def _label_gamma_zone(gamma_per_lakh: float) -> str:
+    if gamma_per_lakh > -0.020:
+        return "TOO_SAFE"
+    if -0.020 <= gamma_per_lakh <= 0:
+        return "Z1"
+    if -0.035 <= gamma_per_lakh < -0.020:
+        return "Z2"
+    if -0.055 <= gamma_per_lakh < -0.035:
+        return "Z3"
+    return "OUT"
+
+
+def _label_vega_zone(vega_per_lakh: float, iv_regime: str) -> str:
+    ranges = {
+        "Low IV": {"Z1": (0, -200), "Z2": (0, -350), "Z3": (None, None)},
+        "Mid IV": {"Z1": (-200, -450), "Z2": (-350, -650), "Z3": (-650, -1000)},
+        "High IV": {"Z1": (-450, -700), "Z2": (-650, -900), "Z3": (-1000, -1300)},
+    }
+    regime = ranges.get(iv_regime, ranges["Mid IV"])
+    z1_low, z1_high = regime["Z1"]
+    if z1_low is not None and z1_high is not None and vega_per_lakh > z1_low:
+        return "TOO_SAFE"
+    for label, rng in regime.items():
+        if rng[0] is None or rng[1] is None:
+            continue
+        low, high = rng
+        if high <= vega_per_lakh <= low:
+            return label
+    return "OUT"
+
+
+def _zone_rules_table(iv_regime: str) -> pd.DataFrame:
+    zone1_theta_range = (120, 180)
+    zone1_gamma_range = (0, -0.020)
+    zone1_vega_ranges = {
+        "Low IV": (0, -200),
+        "Mid IV": (-200, -450),
+        "High IV": (-450, -700),
+    }
+    zone2_theta_range = (180, 220)
+    zone2_gamma_range = (-0.020, -0.035)
+    zone2_vega_ranges = {
+        "Low IV": (0, -350),
+        "Mid IV": (-350, -650),
+        "High IV": (-650, -900),
+    }
+    zone3_theta_range = (220, 300)
+    zone3_gamma_range = (-0.035, -0.055)
+    zone3_vega_ranges = {
+        "Low IV": (None, None),
+        "Mid IV": (-650, -1000),
+        "High IV": (-1000, -1300),
+    }
+
+    def _fmt_range(rng: Tuple[Optional[float], Optional[float]]) -> str:
+        low, high = rng
+        if low is None or high is None:
+            return "Avoid"
+        return f"{low:.0f} to {high:.0f}"
+
+    return pd.DataFrame(
+        [
+            {
+                "Zone": "Zone 1 (SAFE / PROFESSIONAL)",
+                "Theta (per 1L)": f"{zone1_theta_range[0]} to {zone1_theta_range[1]}",
+                "Gamma": f"{zone1_gamma_range[1]:.3f} to {zone1_gamma_range[0]:.3f}",
+                "Vega (per 1L)": _fmt_range(zone1_vega_ranges[iv_regime]),
+            },
+            {
+                "Zone": "Zone 2 (BALANCED / CONTROLLED)",
+                "Theta (per 1L)": f"{zone2_theta_range[0]} to {zone2_theta_range[1]}",
+                "Gamma": f"{zone2_gamma_range[1]:.3f} to {zone2_gamma_range[0]:.3f}",
+                "Vega (per 1L)": _fmt_range(zone2_vega_ranges[iv_regime]),
+            },
+            {
+                "Zone": "Zone 3 (AGGRESSIVE / FRAGILE)",
+                "Theta (per 1L)": f"{zone3_theta_range[0]} to {zone3_theta_range[1]}",
+                "Gamma": f"{zone3_gamma_range[1]:.3f} to {zone3_gamma_range[0]:.3f}",
+                "Vega (per 1L)": _fmt_range(zone3_vega_ranges[iv_regime]),
+            },
+        ]
+    )
+
+
+def _compute_trade_sim_metrics(
+    legs: List[Dict[str, object]],
+    config: SimulationConfig,
+    account_size: float,
+) -> Tuple[float, float, float, float, float]:
+    if not legs or account_size <= 0:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+    sigma, sigma_source = _get_sigma_source(legs)
+    iv_shift = 0.0
+    if config.iv_mode == "IV Up Shock":
+        iv_shift = config.iv_shock
+    elif config.iv_mode == "IV Down Shock":
+        iv_shift = -config.iv_shock
+    if "IV" not in sigma_source and iv_shift != 0.0:
+        iv_shift = math.copysign(max(sigma * 100.0 * 0.10, 0.5), iv_shift)
+
+    spot = _get_spot_from_positions(legs)
+    if not spot:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    greeks = calculate_portfolio_greeks(legs)
+    delta = greeks.get("net_delta", 0.0)
+    gamma = greeks.get("net_gamma", 0.0)
+    vega = greeks.get("net_vega", 0.0)
+    theta = greeks.get("net_theta", 0.0)
+
+    dt = 1.0 / 252.0
+    paths = max(200, int(config.paths))
+    horizon = max(1, min(int(config.horizon_days), 20))
+    z = np.random.normal(size=(paths, horizon))
+    drift = 0.0
+    increments = (drift - 0.5 * sigma**2) * dt + sigma * math.sqrt(dt) * z
+    log_paths = np.cumsum(increments, axis=1)
+    s_paths = spot * np.exp(log_paths)
+
+    pnl_paths = np.zeros_like(s_paths)
+    for t in range(horizon):
+        dS = s_paths[:, t] - spot
+        pnl_paths[:, t] = delta * dS + 0.5 * gamma * (dS ** 2) + vega * iv_shift + theta * (t + 1)
+
+    pnl_tn = pnl_paths[:, -1]
+    expected_pnl_inr = float(np.mean(pnl_tn))
+    expected_pnl_pct = (expected_pnl_inr / account_size * 100.0) if account_size else 0.0
+    mean_loss_inr = float(-np.mean(pnl_tn[pnl_tn < 0])) if np.any(pnl_tn < 0) else 0.0
+
+    worst_count = max(1, int(math.ceil(0.01 * len(pnl_tn))))
+    worst_slice = np.sort(pnl_tn)[:worst_count]
+    es99_tail_mean = float(np.mean(worst_slice)) if worst_slice.size else 0.0
+    es99_inr = abs(es99_tail_mean)
+    es99_pct = (es99_inr / account_size * 100.0) if account_size else 0.0
+
+    return expected_pnl_inr, expected_pnl_pct, es99_inr, es99_pct, es99_tail_mean, mean_loss_inr
+
+
 def compute_trade_risk(
     trades: List[Dict[str, object]],
     account_size: float,
@@ -166,38 +427,119 @@ def compute_trade_risk(
         iv_percentile = 35
     iv_regime, _ = get_iv_regime(iv_percentile)
     scenarios = get_weighted_scenarios(iv_regime)
+    sim_cfg = SimulationConfig(
+        horizon_days=int(st.session_state.get("tba_sim_days", 10)),
+        paths=int(st.session_state.get("tba_sim_paths", 2000)),
+        iv_mode=st.session_state.get("tba_iv_mode", "IV Flat"),
+        iv_shock=float(st.session_state.get("tba_iv_shock", 2.0)),
+        include_spot_shocks=False,
+    )
+    horizon_days = max(1, min(int(sim_cfg.horizon_days), 20))
 
     rows = []
     legs_by_trade: Dict[str, List[Dict[str, object]]] = {}
     for trade in trades:
         legs = trade["legs"]
-        trade_id = f"{trade['underlying']}|{trade['expiry']}"
+        option_side = trade.get("option_side", "OTHER")
+        trade_name = trade.get("trade_name", "")
+        trade_id = (
+            f"{trade['underlying']}|{trade['expiry']}|{trade_name}"
+            if trade_name
+            else f"{trade['underlying']}|{trade['expiry']}|{option_side}"
+        )
         legs_by_trade[trade_id] = legs
         try:
-            es99_pct, es99_value = _compute_trade_es99(
+            es99_pct, es99_value, _, _ = _compute_trade_es99(
                 legs, account_size, scenarios, iv_regime, int(lookback_days)
             )
+            exp_pnl_value, exp_pnl_pct, _, _, es99_tail_mean, mean_loss_inr = _compute_trade_sim_metrics(
+                legs, sim_cfg, account_size
+            )
+            trade_greeks = calculate_portfolio_greeks(legs)
+            capital_in_lakhs = account_size / 100000.0 if account_size else 0.0
+            theta_per_lakh = abs(trade_greeks.get("net_theta", 0.0)) / capital_in_lakhs if capital_in_lakhs else 0.0
+            gamma_per_lakh = trade_greeks.get("net_gamma", 0.0) / capital_in_lakhs if capital_in_lakhs else 0.0
+            vega_per_lakh = trade_greeks.get("net_vega", 0.0) / capital_in_lakhs if capital_in_lakhs else 0.0
+            theta_label = _label_theta_zone(theta_per_lakh)
+            gamma_label = _label_gamma_zone(gamma_per_lakh)
+            vega_label = _label_vega_zone(vega_per_lakh, iv_regime)
+            theta_carry = float(trade_greeks.get("net_theta", 0.0)) * horizon_days
             zone_label, _ = _classify_trade_zone(legs, account_size, iv_regime)
             risk_error = ""
         except Exception as exc:
             es99_pct, es99_value = 0.0, 0.0
+            exp_pnl_pct, exp_pnl_value = 0.0, 0.0
+            es99_tail_mean = 0.0
+            mean_loss_inr = 0.0
+            theta_carry = 0.0
+            theta_per_lakh = 0.0
+            gamma_per_lakh = 0.0
+            vega_per_lakh = 0.0
+            theta_label = "OUT"
+            gamma_label = "OUT"
+            vega_label = "OUT"
+            trade_greeks = {"net_theta": 0.0, "net_gamma": 0.0, "net_vega": 0.0}
             zone_label = "UNKNOWN"
             risk_error = str(exc)
         mtd_pnl = sum(float(leg.get("pnl", leg.get("m2m", 0.0)) or 0.0) for leg in legs)
+        premium_received = 0.0
+        for leg in legs:
+            try:
+                qty = float(leg.get("quantity") or 0.0)
+                avg_price = float(leg.get("average_price") or 0.0)
+            except Exception:
+                continue
+            premium_received += -avg_price * qty
+        dte_values = []
+        for leg in legs:
+            try:
+                dte = float(leg.get("dte"))
+            except Exception:
+                continue
+            if dte > 0:
+                dte_values.append(dte)
+        min_dte = min(dte_values) if dte_values else 0.0
+        premium_prorated = 0.0
+        if min_dte > 0:
+            premium_prorated = premium_received * min(horizon_days, min_dte) / min_dte
+        exp_pnl_value += premium_prorated
+        exp_pnl_pct = (exp_pnl_value / account_size * 100.0) if account_size else 0.0
         margin_total = sum(_extract_margin(leg) for leg in legs)
         rows.append(
             {
                 "trade_id": trade_id,
                 "underlying": trade["underlying"],
                 "week_id": trade["expiry"],
+                "option_side": trade_name or option_side,
                 "earliest_expiry": trade.get("earliest_expiry", "—"),
                 "latest_expiry": trade.get("latest_expiry", "—"),
                 "legs": len(legs),
                 "trade_es99_inr": es99_value,
                 "trade_es99_pct": es99_pct,
+                "expected_pnl_inr": exp_pnl_value,
+                "expected_pnl_pct": exp_pnl_pct,
+                "risk_reward": (exp_pnl_value / abs(es99_value)) if es99_value else 0.0,
+                "es99_tail_pnl_inr": es99_tail_mean,
+                "tail_loss_inr": abs(es99_tail_mean) if es99_tail_mean < 0 else 0.0,
+                "theta_carry_inr": theta_carry,
+                "mean_loss_inr": mean_loss_inr,
+                "mean_tail_ratio": (mean_loss_inr / abs(es99_tail_mean))
+                if es99_tail_mean < 0
+                else 0.0,
+                "net_theta": trade_greeks.get("net_theta", 0.0),
+                "net_gamma": trade_greeks.get("net_gamma", 0.0),
+                "net_vega": trade_greeks.get("net_vega", 0.0),
+                "theta_per_lakh": theta_per_lakh,
+                "gamma_per_lakh": gamma_per_lakh,
+                "vega_per_lakh": vega_per_lakh,
+                "theta_label": theta_label,
+                "gamma_label": gamma_label,
+                "vega_label": vega_label,
                 "zone_label": zone_label,
                 "risk_error": risk_error,
                 "mtd_pnl": mtd_pnl,
+                "premium_received_inr": premium_received,
+                "premium_prorated_inr": premium_prorated,
                 "margin": margin_total if margin_total > 0 else None,
                 "legs_detail": legs,
             }
@@ -330,7 +672,7 @@ def _compute_portfolio_es99(positions: List[Dict[str, object]], account_size: fl
     iv_regime, _ = get_iv_regime(iv_percentile)
     scenarios = get_weighted_scenarios(iv_regime)
     trade_greeks = calculate_portfolio_greeks(positions)
-    spot = st.session_state.get("current_spot", 0.0)
+    spot = _get_spot_from_positions(positions)
     threshold_context = build_threshold_report(
         portfolio={
             "delta": trade_greeks.get("net_delta", 0.0),
@@ -398,11 +740,34 @@ def _get_sigma_source(positions: List[Dict[str, object]]) -> Tuple[float, str]:
     return 0.15, "Fallback 15% vol"
 
 
-def _get_spot_from_positions(positions: List[Dict[str, object]]) -> float:
+def _get_spot_fallback(positions: List[Dict[str, object]]) -> float:
     spot = st.session_state.get("current_spot", 0.0)
     if spot:
         return float(spot)
     return float(next((p.get("spot_price") for p in positions if p.get("spot_price")), 0.0) or 0.0)
+
+
+def _get_spot_from_positions(positions: List[Dict[str, object]]) -> float:
+    spot_override = st.session_state.get("tba_spot_input", 0.0)
+    if spot_override:
+        return float(spot_override)
+    return _get_spot_fallback(positions)
+
+
+def _recompute_positions_with_spot(
+    positions: List[Dict[str, object]],
+    spot: float,
+) -> List[Dict[str, object]]:
+    options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
+    if spot <= 0 or not isinstance(options_df_cache, pd.DataFrame) or options_df_cache.empty:
+        return positions
+    recomputed = []
+    for pos in positions:
+        try:
+            recomputed.append(enrich_position_with_greeks(pos, options_df_cache, float(spot)))
+        except Exception:
+            recomputed.append(pos)
+    return recomputed
 
 
 def _render_scenario_table(
@@ -1397,6 +1762,18 @@ def render_risk_buckets_tab() -> None:
         st.warning("No positions loaded. Fetch positions from Portfolio tab first.")
         return
 
+    if not st.session_state.get("tba_spot_input"):
+        fallback_spot = _get_spot_fallback(positions)
+        if fallback_spot > 0:
+            st.session_state["tba_spot_input"] = fallback_spot
+    spot_override = float(st.session_state.get("tba_spot_input") or 0.0)
+    if spot_override > 0:
+        if st.session_state.get("tba_spot_recomputed_for") != spot_override:
+            positions = _recompute_positions_with_spot(positions, spot_override)
+            st.session_state["enriched_positions"] = positions
+            st.session_state["current_spot"] = spot_override
+            st.session_state["tba_spot_recomputed_for"] = spot_override
+
     controls = st.sidebar
     with controls.expander("Portfolio Controls", expanded=False):
         total_capital = st.number_input(
@@ -1406,6 +1783,14 @@ def render_risk_buckets_tab() -> None:
             format="%.2f",
             value=st.session_state["tba_total_capital"],
             key="tba_total_capital",
+        )
+        st.number_input(
+            "Spot price (override)",
+            min_value=0.0,
+            step=10.0,
+            value=st.session_state.get("tba_spot_input", 0.0),
+            key="tba_spot_input",
+            help="Overrides spot used in ES99/scenario calculations for this tab.",
         )
         alloc_low = st.number_input("Low bucket allocation %", min_value=0.0, max_value=100.0, step=1.0, value=st.session_state["tba_alloc_low"], key="tba_alloc_low")
         alloc_med = st.number_input("Med bucket allocation %", min_value=0.0, max_value=100.0, step=1.0, value=st.session_state["tba_alloc_med"], key="tba_alloc_med")
@@ -1422,7 +1807,11 @@ def render_risk_buckets_tab() -> None:
         st.number_input("IV shock (vol points)", min_value=0.0, step=0.5, value=st.session_state["tba_iv_shock"], key="tba_iv_shock")
         st.caption("Note: Scenario analysis (±2%, ±3.5% shocks) is always included")
 
+    saved_groups = st.session_state.get("tba_saved_trades", [])
+    use_saved = st.session_state.get("tba_use_saved_groups", False)
     trades = build_trades_using_existing_grouping(positions)
+    if use_saved and saved_groups:
+        trades += build_trades_from_saved_groups(positions, saved_groups)
     trades_df, legs_by_trade = compute_trade_risk(trades, float(total_capital), lookback_days=504)
 
     thresholds = {
@@ -1484,7 +1873,7 @@ def render_risk_buckets_tab() -> None:
         # Trade week table below
         st.markdown("### Top ES99 Contributors (Trade Week)")
         top_trades = (
-            trades_df.groupby(["underlying", "week_id"])["trade_es99_inr"]
+            trades_df.groupby(["underlying", "week_id", "option_side"])["trade_es99_inr"]
             .sum()
             .sort_values(ascending=False)
             .head(5)
@@ -1664,21 +2053,467 @@ def render_risk_buckets_tab() -> None:
 
     with subtab3:
         st.markdown("### Trade Level")
-        filter_cols = st.columns(4)
+        st.caption(
+            "Expected PnL is the mean simulated PnL at the end of the current horizon "
+            f"({int(st.session_state.get('tba_sim_days', 10))} days), includes theta carry, "
+            "and adds pro-rated premium received."
+        )
+        with st.expander("Zone rules (per 1L capital)"):
+            options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
+            iv_percentile = 35
+            if (
+                isinstance(options_df_cache, pd.DataFrame)
+                and not options_df_cache.empty
+                and "iv" in options_df_cache.columns
+            ):
+                iv_percentile = 35
+            iv_regime, _ = get_iv_regime(iv_percentile)
+            st.caption(f"IV regime: {iv_regime}")
+            st.dataframe(_zone_rules_table(iv_regime), use_container_width=True, hide_index=True)
+        with st.expander("Trade Grouping (Manual)", expanded=False):
+            saved_groups = st.session_state.get("tba_saved_trades", [])
+            grouped_leg_ids = {leg_id for group in saved_groups for leg_id in group.get("legs", [])}
+            if st.session_state.get("tba_clear_trade_group"):
+                for idx in range(len(positions)):
+                    key = f"tba_leg_select_{idx}"
+                    if str(idx) not in grouped_leg_ids:
+                        st.session_state[key] = False
+                st.session_state["tba_trade_group_name"] = ""
+                st.session_state["tba_clear_trade_group"] = False
+            st.caption("Select legs to group (grouped legs are locked).")
+            selected_legs = []
+            for idx, pos in enumerate(positions):
+                pos_id = str(idx)
+                label = _position_label(pos, idx)
+                is_grouped = pos_id in grouped_leg_ids
+                checkbox_key = f"tba_leg_select_{idx}"
+                checked = st.checkbox(
+                    f"{label}{' (grouped)' if is_grouped else ''}",
+                    value=is_grouped or bool(st.session_state.get(checkbox_key, False)),
+                    key=checkbox_key,
+                    disabled=is_grouped,
+                )
+                if checked and not is_grouped:
+                    selected_legs.append(pos_id)
+            group_name = st.text_input("Trade name", key="tba_trade_group_name")
+            if st.button("Save trade group", type="secondary"):
+                if not selected_legs:
+                    st.warning("Select at least one leg to save a trade group.")
+                else:
+                    saved_groups.append({"name": group_name or "Manual Trade", "legs": selected_legs})
+                    st.session_state["tba_saved_trades"] = saved_groups
+                    _save_saved_groups(saved_groups)
+                    st.session_state["tba_clear_trade_group"] = True
+                    st.success("Trade group saved.")
+            apply_cols = st.columns([0.5, 0.5])
+            if apply_cols[0].button("Apply groupings", type="primary"):
+                st.session_state["tba_use_saved_groups"] = True
+            if apply_cols[1].button("Use auto grouping"):
+                st.session_state["tba_use_saved_groups"] = False
+            if saved_groups:
+                st.caption("Saved groups (only these trades will be shown):")
+                for idx, group in enumerate(saved_groups):
+                    label = group.get("name") or f"Group {idx + 1}"
+                    cols = st.columns([0.8, 0.2])
+                    cols[0].write(label)
+                    leg_labels = []
+                    for leg_id in group.get("legs", []):
+                        try:
+                            leg_idx = int(leg_id)
+                        except Exception:
+                            continue
+                        if 0 <= leg_idx < len(positions):
+                            leg_labels.append(_position_label(positions[leg_idx], leg_idx))
+                    if leg_labels:
+                        cols[0].caption(" | ".join(leg_labels))
+                    if cols[1].button("Remove", key=f"tba_remove_group_{idx}"):
+                        st.session_state["tba_saved_trades"] = [
+                            g for g_i, g in enumerate(saved_groups) if g_i != idx
+                        ]
+                        _save_saved_groups(st.session_state["tba_saved_trades"])
+                        if not st.session_state.get("tba_saved_trades"):
+                            st.session_state["tba_use_saved_groups"] = False
+        chart_controls = st.columns(3)
+        with chart_controls[0]:
+            norm_mode = st.selectbox(
+                "Normalize",
+                ["Absolute INR", "Per 1L capital", "Per bucket cap %"],
+                key="tba_trade_chart_norm",
+            )
+        with chart_controls[1]:
+            log_loss_axis = st.toggle("Log scale (loss axis)", value=False, key="tba_trade_chart_log")
+        with chart_controls[2]:
+            tail_cap_label = "Tail cap (INR)"
+            if norm_mode == "Per 1L capital":
+                tail_cap_label = "Tail cap (per 1L)"
+            elif norm_mode == "Per bucket cap %":
+                tail_cap_label = "Tail cap (%)"
+            tail_cap_inr = st.number_input(
+                tail_cap_label,
+                min_value=0.0,
+                step=1_000.0 if norm_mode == "Absolute INR" else 1.0,
+                value=float(st.session_state.get("tba_trade_tail_cap_inr", 200_000.0)),
+                key="tba_trade_tail_cap_inr",
+            )
+        toggle_cols = st.columns(2)
+        with toggle_cols[0]:
+            show_individual_trades = st.toggle(
+                "Show individual trades",
+                value=True,
+                key="tba_show_individual_trades",
+            )
+        with toggle_cols[1]:
+            show_group_trades = st.toggle(
+                "Show group trades",
+                value=True,
+                key="tba_show_group_trades",
+            )
+
+        charts_container = st.container()
+        chart_df = trades_df.copy()
+        group_names = {g.get("name") for g in saved_groups if g.get("name")}
+        if saved_groups and st.session_state.get("tba_use_saved_groups", False):
+            if not show_individual_trades:
+                chart_df = chart_df[chart_df["option_side"].isin(group_names)]
+            if not show_group_trades and group_names:
+                chart_df = chart_df[~chart_df["option_side"].isin(group_names)]
+        chart_df["theta_per_lakh_label"] = chart_df.apply(
+            lambda row: f"{row['theta_per_lakh']:.1f} ({row['theta_label']})"
+            if row["theta_per_lakh"] is not None
+            else "—",
+            axis=1,
+        )
+        chart_df["gamma_per_lakh_label"] = chart_df.apply(
+            lambda row: f"{row['gamma_per_lakh']:.4f} ({row['gamma_label']})"
+            if row["gamma_per_lakh"] is not None
+            else "—",
+            axis=1,
+        )
+        chart_df["vega_per_lakh_label"] = chart_df.apply(
+            lambda row: f"{row['vega_per_lakh']:.1f} ({row['vega_label']})"
+            if row["vega_per_lakh"] is not None
+            else "—",
+            axis=1,
+        )
+        chart_df["label_expiry"] = chart_df["earliest_expiry"].fillna("—")
+        chart_df.loc[chart_df["label_expiry"].isin(["—", "UNKNOWN"]), "label_expiry"] = chart_df["week_id"]
+        chart_df["trade_label"] = (
+            chart_df["underlying"].astype(str)
+            + " | "
+            + chart_df["label_expiry"].astype(str)
+            + " | "
+            + chart_df["option_side"].astype(str)
+        )
+        chart_df["capital_inr"] = chart_df["margin"].fillna(0.0)
+        chart_df.loc[chart_df["capital_inr"] <= 0, "capital_inr"] = chart_df["premium_received_inr"].abs()
+        chart_df["tail_loss_inr"] = chart_df["tail_loss_inr"].fillna(0.0)
+        chart_df["risk_reward"] = chart_df.apply(
+            lambda row: (row["expected_pnl_inr"] / row["tail_loss_inr"])
+            if row["tail_loss_inr"]
+            else 0.0,
+            axis=1,
+        )
+        if norm_mode == "Per 1L capital":
+            norm_factor = chart_df["capital_inr"].replace(0, np.nan) / 100000.0
+            chart_df["x_value"] = chart_df["expected_pnl_inr"] / norm_factor
+            chart_df["mean_loss_value"] = chart_df["mean_loss_inr"] / norm_factor
+            chart_df["tail_loss_value"] = chart_df["tail_loss_inr"] / norm_factor
+            x_title = "Mean PnL (per 1L)"
+            y_mean_title = "Mean Loss (per 1L)"
+            y_tail_title = "Tail Loss (per 1L)"
+        elif norm_mode == "Per bucket cap %":
+            bucket_cap_inr = chart_df.apply(
+                lambda row: (row["trade_es99_inr"] / (row["trade_es99_pct_of_bucket_cap"] / 100.0))
+                if row["trade_es99_pct_of_bucket_cap"]
+                else np.nan,
+                axis=1,
+            )
+            chart_df["x_value"] = chart_df.get("expected_pnl_pct")
+            chart_df["mean_loss_value"] = (chart_df["mean_loss_inr"] / bucket_cap_inr) * 100.0
+            chart_df["tail_loss_value"] = chart_df.get("trade_es99_pct_of_bucket_cap")
+            x_title = "Mean PnL (% bucket cap)"
+            y_mean_title = "Mean Loss (% bucket cap)"
+            y_tail_title = "Tail Loss (% bucket cap)"
+        else:
+            chart_df["x_value"] = chart_df["expected_pnl_inr"]
+            chart_df["mean_loss_value"] = chart_df["mean_loss_inr"]
+            chart_df["tail_loss_value"] = chart_df["tail_loss_inr"]
+            x_title = "Mean PnL (INR)"
+            y_mean_title = "Mean Loss (INR)"
+            y_tail_title = "Tail Loss (INR)"
+
+        tooltip_cols = [
+            alt.Tooltip("trade_id:N", title="Trade"),
+            alt.Tooltip("week_id:N", title="Week"),
+            alt.Tooltip("option_side:N", title="Side"),
+            alt.Tooltip("bucket:N", title="Bucket"),
+            alt.Tooltip("zone_label:N", title="Zone"),
+            alt.Tooltip("legs:Q", title="Legs"),
+            alt.Tooltip("expected_pnl_inr:Q", title="Mean PnL", format=",.0f"),
+            alt.Tooltip("tail_loss_inr:Q", title="Tail Loss", format=",.0f"),
+            alt.Tooltip("mean_loss_inr:Q", title="Mean Loss", format=",.0f"),
+            alt.Tooltip("premium_received_inr:Q", title="Premium", format=",.0f"),
+            alt.Tooltip("capital_inr:Q", title="Capital", format=",.0f"),
+            alt.Tooltip("risk_reward:Q", title="Reward/Risk", format=".3f"),
+            alt.Tooltip("mean_tail_ratio:Q", title="Mean/Tail", format=".3f"),
+            alt.Tooltip("theta_per_lakh:Q", title="Theta/1L", format=",.1f"),
+            alt.Tooltip("gamma_per_lakh:Q", title="Gamma/1L", format=",.4f"),
+            alt.Tooltip("vega_per_lakh:Q", title="Vega/1L", format=",.1f"),
+        ]
+
+        def _build_overlays(x_min: float, x_max: float, y_max: float, loss_axis_title: str) -> List[alt.Chart]:
+            overlays: List[alt.Chart] = []
+            if x_min < 0:
+                overlays.append(
+                    alt.Chart(pd.DataFrame({"x1": [x_min], "x2": [0], "y1": [0], "y2": [y_max]}))
+                    .mark_rect(opacity=0.08, color="#FF6B6B")
+                    .encode(x="x1:Q", x2="x2:Q", y="y1:Q", y2="y2:Q")
+                )
+            if tail_cap_inr > 0 and tail_cap_inr < y_max:
+                overlays.append(
+                    alt.Chart(pd.DataFrame({"x1": [x_min], "x2": [x_max], "y1": [tail_cap_inr], "y2": [y_max]}))
+                    .mark_rect(opacity=0.08, color="#FF6B6B")
+                    .encode(x="x1:Q", x2="x2:Q", y="y1:Q", y2="y2:Q")
+                )
+                overlays.append(
+                    alt.Chart(pd.DataFrame({"y": [tail_cap_inr]}))
+                    .mark_rule(stroke="#FF6B6B", strokeWidth=1)
+                    .encode(y="y:Q")
+                )
+            overlays.append(
+                alt.Chart(pd.DataFrame({"x": [0]}))
+                .mark_rule(stroke="#8A8A8A", strokeWidth=1, strokeDash=[4, 4])
+                .encode(x="x:Q")
+            )
+            if not log_loss_axis:
+                overlays.append(
+                    alt.Chart(pd.DataFrame({"y": [0]}))
+                    .mark_rule(stroke="#8A8A8A", strokeWidth=1, strokeDash=[4, 4])
+                    .encode(y="y:Q")
+                )
+            return overlays
+
+        def _build_rr_overlays(x_min: float, x_max: float, y_max: float) -> List[alt.Chart]:
+            rr_levels = [0.15, 0.30, 0.40]
+            overlays: List[alt.Chart] = []
+            if y_max <= 0:
+                return overlays
+            x_left = max(0.0, x_min)
+            x_right = 10000
+            if x_right <= x_left:
+                return overlays
+            x_vals = np.linspace(x_left, x_right, 80)
+            line_rows = []
+            for rr in rr_levels:
+                for x_val in x_vals:
+                    y_val = x_val / rr if rr else 0.0
+                    if 0 <= y_val <= y_max:
+                        line_rows.append({"x": x_val, "y": y_val, "rr": f"{rr:.2f}"})
+            if line_rows:
+                overlays.append(
+                    alt.Chart(pd.DataFrame(line_rows))
+                    .mark_line(strokeDash=[4, 4])
+                    .encode(
+                        x="x:Q",
+                        y="y:Q",
+                        detail="rr:N",
+                        color=alt.Color(
+                            "rr:N",
+                            scale=alt.Scale(range=["#B38E5D", "#5BAE6B", "#6F8EDC"]),
+                            legend=None,
+                        ),
+                    )
+                )
+                label_rows = []
+                for rr, color in zip(rr_levels, ["#B38E5D", "#5BAE6B", "#6F8EDC"]):
+                    y_val = min(y_max, x_right / rr) if rr else y_max
+                    label_rows.append({"x": x_right, "y": y_val, "label": f"RR {rr:.2f}", "color": color})
+                overlays.append(
+                    alt.Chart(pd.DataFrame(label_rows))
+                    .mark_text(align="right", dx=-6, dy=-6, fontSize=10, fontWeight="bold")
+                    .encode(
+                        x="x:Q",
+                        y="y:Q",
+                        text="label:N",
+                        color=alt.Color("color:N", scale=None, legend=None),
+                    )
+                )
+
+            zone_defs = [
+                (
+                    0.0,
+                    0.15,
+                    "Zone A: Very cheap premium. Mean PnL small relative to tail risk. "
+                    "Small spot or vol moves quickly flip EV negative; slow bleed with rare large losses. "
+                    "Requires very tight risk caps.",
+                    "#3A1F24",
+                ),
+                (
+                    0.15,
+                    0.30,
+                    "Zone B: Preferred short-vol regime. Balanced credit vs tail risk. "
+                    "Trades remain bottom-right under moderate spot moves; manageable gamma. "
+                    "Best persistence of positive EV.",
+                    "#243622",
+                ),
+                (
+                    0.30,
+                    0.40,
+                    "Zone C: High credit but fragile. Positive EV only near entry. "
+                    "One-sided spot moves or IV expansion rapidly increase tail loss; "
+                    "needs fast exits and active management.",
+                    "#3B2F1A",
+                ),
+                (
+                    0.40,
+                    None,
+                    "Zone D: Gamma-dominant. Near-spot exposure. EV highly unstable; "
+                    "small moves cause sharp jumps in tail loss. Treat as directional, not probability trade.",
+                    "#2C2F3D",
+                ),
+            ]
+            shade_rows = []
+            label_rows = []
+            for low_rr, high_rr, label, color in zone_defs:
+                y_top = y_max if high_rr is None else max(0.0, x_right / high_rr)
+                y_bottom = max(0.0, x_right / low_rr) if low_rr > 0 else 0.0
+                y_top = min(y_top, y_max)
+                y_bottom = min(y_bottom, y_max)
+                if y_bottom >= y_top:
+                    continue
+                shade_rows.append(
+                    {
+                        "x1": x_left,
+                        "x2": x_right,
+                        "y1": y_bottom,
+                        "y2": y_top,
+                        "label": label,
+                        "color": color,
+                    }
+                )
+                label_rows.append(
+                    {
+                        "x": x_left + (x_right - x_left) * 0.05,
+                        "y": (y_bottom + y_top) / 2.0,
+                        "label": label,
+                    }
+                )
+            if shade_rows:
+                overlays.append(
+                    alt.Chart(pd.DataFrame(shade_rows))
+                    .mark_rect(opacity=0.10)
+                    .encode(
+                        x="x1:Q",
+                        x2="x2:Q",
+                        y="y1:Q",
+                        y2="y2:Q",
+                        color=alt.Color("color:N", scale=None, legend=None),
+                    )
+                )
+            return overlays
+
+        for chart_key, y_field, y_title in [
+            ("tail_loss", "tail_loss_value", y_tail_title),
+        ]:
+            plot_df = chart_df.copy()
+            if log_loss_axis:
+                plot_df = plot_df[plot_df[y_field] > 0]
+            x_min = float(plot_df["x_value"].min()) if not plot_df.empty else 0.0
+            x_max = float(plot_df["x_value"].max()) if not plot_df.empty else 1.0
+            y_max = float(plot_df[y_field].max()) if not plot_df.empty else 1.0
+            positive_df = plot_df[plot_df["expected_pnl_inr"] >= 0]
+            negative_df = plot_df[plot_df["expected_pnl_inr"] < 0]
+            base_positive = (
+                alt.Chart(positive_df)
+                .mark_circle(opacity=0.85, strokeWidth=1.2)
+                .encode(
+                    x=alt.X("x_value:Q", title=x_title, scale=alt.Scale(domain=[-10000, 10000])),
+                    y=alt.Y(
+                        f"{y_field}:Q",
+                        title=y_title,
+                        scale=alt.Scale(type="log") if log_loss_axis else alt.Scale(zero=True),
+                    ),
+                    color=alt.Color(
+                        "risk_reward:Q",
+                        legend=alt.Legend(title="Reward/Risk"),
+                        scale=alt.Scale(scheme="redyellowgreen", clamp=True),
+                    ),
+                    shape=alt.Shape("option_side:N", legend=alt.Legend(title="Side")),
+                    tooltip=tooltip_cols,
+                )
+                .properties(height=300, width="container")
+            )
+            base_negative = (
+                alt.Chart(negative_df)
+                .mark_circle(opacity=0.85, strokeWidth=1.2, color="#d9534f")
+                .encode(
+                    x=alt.X("x_value:Q", title=x_title, scale=alt.Scale(domain=[-10000, 10000])),
+                    y=alt.Y(
+                        f"{y_field}:Q",
+                        title=y_title,
+                        scale=alt.Scale(type="log") if log_loss_axis else alt.Scale(zero=True),
+                    ),
+                    shape=alt.Shape("option_side:N", legend=alt.Legend(title="Side")),
+                    tooltip=tooltip_cols,
+                )
+                .properties(height=300, width="container")
+            )
+            labels = (
+                alt.Chart(plot_df)
+                .mark_text(align="left", dx=6, dy=-6, color="#BFC7D5", fontSize=10)
+                .encode(
+                    x=alt.X("x_value:Q"),
+                    y=alt.Y(f"{y_field}:Q"),
+                    text=alt.Text("trade_label:N"),
+                )
+            )
+            overlays = _build_overlays(x_min, x_max, y_max, y_title)
+            rr_overlays = _build_rr_overlays(x_min, x_max, y_max) if chart_key == "tail_loss" else []
+            layers = overlays + rr_overlays + [base_positive, base_negative, labels]
+            chart = alt.layer(*layers)
+            with charts_container:
+                title_cols = st.columns([0.9, 0.1])
+                with title_cols[0]:
+                    st.markdown("#### Tail Loss vs Mean PnL")
+                with title_cols[1]:
+                    with st.popover("ℹ️ Zones", use_container_width=False):
+                        st.markdown("""
+                        **Zone A (RR < 0.15)**: Very cheap premium. Mean PnL small relative to tail risk. 
+                        Small spot or vol moves quickly flip EV negative; slow bleed with rare large losses. 
+                        Requires very tight risk caps.
+                        
+                        **Zone B (0.15–0.30)**: Preferred short-vol regime. Balanced credit vs tail risk. 
+                        Trades remain bottom-right under moderate spot moves; manageable gamma. 
+                        Best persistence of positive EV.
+                        
+                        **Zone C (0.30–0.40)**: High credit but fragile. Positive EV only near entry. 
+                        One-sided spot moves or IV expansion rapidly increase tail loss; 
+                        needs fast exits and active management.
+                        
+                        **Zone D (RR > 0.40)**: Gamma-dominant. Near-spot exposure. EV highly unstable; 
+                        small moves cause sharp jumps in tail loss. Treat as directional, not probability trade.
+                        """)
+                chart = chart.properties(height=420)
+                st.altair_chart(chart, use_container_width=True)
+        filter_cols = st.columns(5)
         underlyings = ["All"] + sorted(trades_df["underlying"].dropna().unique().tolist())
         weeks = ["All"] + sorted(trades_df["week_id"].dropna().unique().tolist())
+        sides = ["All"] + sorted(trades_df["option_side"].dropna().unique().tolist())
         buckets = ["All"] + sorted(trades_df["bucket"].dropna().unique().tolist())
         zones = ["All"] + sorted(trades_df["zone_label"].dropna().unique().tolist())
         filter_underlying = filter_cols[0].selectbox("Underlying", underlyings, key="tba_trade_filter_underlying")
         filter_week = filter_cols[1].selectbox("Week", weeks, key="tba_trade_filter_week")
-        filter_bucket = filter_cols[2].selectbox("Bucket", buckets, key="tba_trade_filter_bucket")
-        filter_zone = filter_cols[3].selectbox("Zone", zones, key="tba_trade_filter_zone")
+        filter_side = filter_cols[2].selectbox("Side", sides, key="tba_trade_filter_side")
+        filter_bucket = filter_cols[3].selectbox("Bucket", buckets, key="tba_trade_filter_bucket")
+        filter_zone = filter_cols[4].selectbox("Zone", zones, key="tba_trade_filter_zone")
 
         df = trades_df.copy()
         if filter_underlying != "All":
             df = df[df["underlying"] == filter_underlying]
         if filter_week != "All":
             df = df[df["week_id"] == filter_week]
+        if filter_side != "All":
+            df = df[df["option_side"] == filter_side]
         if filter_bucket != "All":
             df = df[df["bucket"] == filter_bucket]
         if filter_zone != "All":
@@ -1686,21 +2521,67 @@ def render_risk_buckets_tab() -> None:
 
         sort_choice = st.selectbox(
             "Sort by",
-            ["trade_es99_inr", "trade_es99_pct_of_bucket_cap", "week_id"],
+            [
+                "trade_es99_inr",
+                "trade_es99_pct_of_bucket_cap",
+                "expected_pnl_inr",
+                "risk_reward",
+                "theta_carry_inr",
+                "mean_loss_inr",
+                "mean_tail_ratio",
+                "premium_received_inr",
+                "premium_prorated_inr",
+                "theta_per_lakh",
+                "gamma_per_lakh",
+                "vega_per_lakh",
+                "margin",
+                "week_id",
+            ],
             key="tba_trade_sort",
         )
         df = df.sort_values(sort_choice, ascending=False)
+        df["theta_per_lakh_label"] = df.apply(
+            lambda row: f"{row['theta_per_lakh']:.1f} ({row['theta_label']})"
+            if row.get("theta_per_lakh") is not None
+            else "—",
+            axis=1,
+        )
+        df["gamma_per_lakh_label"] = df.apply(
+            lambda row: f"{row['gamma_per_lakh']:.4f} ({row['gamma_label']})"
+            if row.get("gamma_per_lakh") is not None
+            else "—",
+            axis=1,
+        )
+        df["vega_per_lakh_label"] = df.apply(
+            lambda row: f"{row['vega_per_lakh']:.1f} ({row['vega_label']})"
+            if row.get("vega_per_lakh") is not None
+            else "—",
+            axis=1,
+        )
         st.dataframe(
             df[
                 [
                     "underlying",
                     "week_id",
+                    "option_side",
                     "earliest_expiry",
                     "latest_expiry",
                     "legs",
                     "bucket",
                     "trade_es99_inr",
                     "trade_es99_pct_of_bucket_cap",
+                    "expected_pnl_inr",
+                    "expected_pnl_pct",
+                    "risk_reward",
+                    "theta_carry_inr",
+                    "mean_loss_inr",
+                    "mean_tail_ratio",
+                    "premium_received_inr",
+                    "premium_prorated_inr",
+                    "theta_per_lakh_label",
+                    "gamma_per_lakh_label",
+                    "vega_per_lakh_label",
+                    "margin",
                     "zone_label",
                     "mtd_pnl",
                 ]
@@ -1715,7 +2596,9 @@ def render_risk_buckets_tab() -> None:
         )
 
         for _, row in df.iterrows():
-            with st.expander(f"{row['underlying']} | {row['week_id']} | {row['bucket']}"):
+            with st.expander(
+                f"{row['underlying']} | {row['week_id']} | {row['option_side']} | {row['bucket']}"
+            ):
                 legs_df = pd.DataFrame(
                     [
                         {
@@ -1726,6 +2609,14 @@ def render_risk_buckets_tab() -> None:
                             "avg_price": leg.get("average_price"),
                             "ltp": leg.get("last_price"),
                             "pnl": leg.get("pnl", leg.get("m2m")),
+                            "delta": leg.get("delta"),
+                            "gamma": leg.get("gamma"),
+                            "vega": leg.get("vega"),
+                            "theta": leg.get("theta"),
+                            "pos_delta": leg.get("position_delta"),
+                            "pos_gamma": leg.get("position_gamma"),
+                            "pos_vega": leg.get("position_vega"),
+                            "pos_theta": leg.get("position_theta"),
                         }
                         for leg in row["legs_detail"]
                     ]
@@ -1740,6 +2631,33 @@ def render_risk_buckets_tab() -> None:
             "- Start at **Portfolio Level**: check total capital, overall ES99, and forward-sim KPIs.\n"
             "- Then go to **Bucket Level**: verify capital allocations and ES99 vs bucket limits.\n"
             "- Finally, review **Trade Level** to see which weekly trades drive risk and their zone labels."
+        )
+
+        st.markdown("### How to Think About a Trade (Core)")
+        st.markdown(
+            "- Ask one brutal question: **If I had no position right now, would I enter this trade at this price?**\n"
+            "- If yes: keep it (even add).\n"
+            "- If no: exit immediately.\n"
+            "- Your PnL history is irrelevant."
+        )
+        st.markdown("### A Cleaner Decision Framework")
+        st.markdown(
+            "- **Step 1: Freeze the past**\n"
+            "  - Ignore entry price, max profit, and unrealized loss.\n"
+            "  - They are gone.\n"
+            "- **Step 2: Compare distributions**\n"
+            "  - Trade A (current): future EV, tail loss, drawdown.\n"
+            "  - Trade B (new): future EV, tail loss, drawdown.\n"
+            "  - Pick the higher EV per unit tail risk. Always.\n"
+            "- **Step 3: Direction != structure**\n"
+            "  - If you still believe bullish, express it with fresh risk.\n"
+            "  - Do not cling to a broken structure."
+        )
+        st.markdown("### Hard Truth (But Freeing)")
+        st.markdown(
+            "- Booking a loss is not being wrong.\n"
+            "- Holding a bad trade is being undisciplined.\n"
+            "- The market already took the money. You are just deciding whether to risk more."
         )
 
         st.markdown("### ES99 (Stress-Scenario Based)")

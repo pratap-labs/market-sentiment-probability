@@ -79,6 +79,7 @@ from views.tabs.diagnostics_tab import render_diagnostics_tab
 from views.tabs.market_regime_tab import render_market_regime_tab
 from views.tabs.risk_analysis_tab import render_risk_analysis_tab
 from views.tabs.risk_buckets_tab import render_risk_buckets_tab
+from views.tabs.trade_selector_tab import render_trade_selector_tab
 from views.tabs.equities_tab import render_equities_tab
 from views.tabs.portfolio_buckets_tab import render_portfolio_buckets_tab
 from views.tabs.stress_testing_tab import render_stress_testing_tab
@@ -412,6 +413,7 @@ def render():
         {"key": "greeks_debug", "label": "🧪 Greeks Debug"},
         {"key": "product_overview", "label": "✨ Product Overview"},
         {"key": "derivatives_data", "label": "💾 Derivatives Data"},
+        {"key": "trade_selector", "label": "🎯 Trade Selector"},
     ]
     tab_map = {t["key"]: t["label"] for t in tabs}
     st.session_state.setdefault("active_tab_key", "login")
@@ -541,6 +543,8 @@ def render():
             render_product_overview_tab()
         elif active_key == "derivatives_data":
             render_derivatives_data_tab()
+        elif active_key == "trade_selector":
+            render_trade_selector_tab()
 
     # markers are hidden via CSS; no closing tags required
     st.markdown(

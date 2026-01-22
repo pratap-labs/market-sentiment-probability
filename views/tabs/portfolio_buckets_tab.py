@@ -129,6 +129,8 @@ def _group_positions_by_trade(
                 "expiry": key[1],
                 "legs": [],
             }
+            if len(key) > 2:
+                grouped[key]["option_side"] = key[2]
         grouped[key]["legs"].append(pos)
     return list(grouped.values())
 
@@ -139,7 +141,7 @@ def _compute_trade_es99(
     scenarios: List[object],
     iv_regime: str,
     lookback_days: int,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float, float]:
     trade_greeks = calculate_portfolio_greeks(legs)
     spot = next((leg.get("spot_price") for leg in legs if leg.get("spot_price")), 0.0)
     threshold_context = build_threshold_report(
@@ -167,7 +169,7 @@ def _compute_trade_es99(
     )
     derived_rows = threshold_context.get("rows", [])
     if not derived_rows:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
 
     bucket_probs, _, _ = compute_historical_bucket_probabilities(
         lookback=int(lookback_days),
@@ -190,7 +192,14 @@ def _compute_trade_es99(
         for row in derived_rows
     ]
     metrics = compute_var_es_metrics(loss_distribution, account_size)
-    return float(metrics.get("ES99", 0.0)), float(metrics.get("ES99Value", 0.0))
+    expected_pnl_inr = sum(row.get("pnl_total", 0.0) * row.get("probability", 0.0) for row in derived_rows)
+    expected_pnl_pct = (expected_pnl_inr / account_size * 100.0) if account_size else 0.0
+    return (
+        float(metrics.get("ES99", 0.0)),
+        float(metrics.get("ES99Value", 0.0)),
+        float(expected_pnl_pct),
+        float(expected_pnl_inr),
+    )
 
 
 def _classify_trade_zone(
@@ -314,7 +323,7 @@ def render_portfolio_buckets_tab() -> None:
         legs = trade["legs"]
         total_legs += len(legs)
         try:
-            es99_pct, es99_value = _compute_trade_es99(
+            es99_pct, es99_value, _, _ = _compute_trade_es99(
                 legs, total_capital, scenarios, iv_regime, int(lookback_days)
             )
         except Exception:
