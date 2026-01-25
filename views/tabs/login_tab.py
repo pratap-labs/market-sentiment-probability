@@ -100,14 +100,16 @@ def render_login_tab():
         st.session_state.setdefault(_account_session_key("kite_login_url", account), "")
     st.session_state.setdefault("kite_active_account", KITE_ACCOUNT_PRIMARY)
 
+    # Account selector
     active_account = st.sidebar.selectbox(
-        "Active account",
+        "Select Account",
         [KITE_ACCOUNT_PRIMARY, KITE_ACCOUNT_SECONDARY],
         format_func=lambda value: "Primary (KITE_API_KEY)" if value == KITE_ACCOUNT_PRIMARY else "Secondary (KITE_API_KEY_2)",
         key="kite_active_account",
     )
     _apply_active_account(active_account)
 
+    # Redirect settings
     host = st.sidebar.text_input(
         "Redirect host",
         value="127.0.0.1",
@@ -123,56 +125,61 @@ def render_login_tab():
         disabled=True,
     )
 
-    def render_account_controls(account: str):
-        label = "Primary" if account == KITE_ACCOUNT_PRIMARY else "Secondary"
-        default_api_key = st.session_state.get(_account_session_key("kite_api_key_stored", account), "") or os.getenv(
-            _account_env_key(account, "KITE_API_KEY"), ""
-        )
-        default_api_secret = st.session_state.get(
-            _account_session_key("kite_api_secret_stored", account), ""
-        ) or os.getenv(_account_env_key(account, "KITE_API_SECRET"), "")
-        st.sidebar.markdown(f"**{label} credentials**")
-        api_key = st.sidebar.text_input(
-            "API Key",
-            value=default_api_key,
-            key=_account_session_key("kite_api_key_input", account),
-            disabled=True,
-        )
-        api_secret = st.sidebar.text_input(
-            "API Secret",
-            value=default_api_secret,
-            type="password",
-            key=_account_session_key("kite_api_secret_input", account),
-            disabled=True,
-        )
-        if not api_key or not api_secret:
-            st.info(f"Enter Kite API key/secret for {label} (or set env vars).")
-        login_clicked = st.sidebar.button(
-            f"Login with Kite ({label})",
-            disabled=st.session_state.get(_account_session_key("kite_login_initiated", account), False),
-            key=_account_session_key("kite_login_button", account),
-        )
-        return login_clicked, api_key, api_secret
+    # Get credentials for active account
+    label = "Primary" if active_account == KITE_ACCOUNT_PRIMARY else "Secondary"
+    default_api_key = st.session_state.get(_account_session_key("kite_api_key_stored", active_account), "") or os.getenv(
+        _account_env_key(active_account, "KITE_API_KEY"), ""
+    )
+    default_api_secret = st.session_state.get(
+        _account_session_key("kite_api_secret_stored", active_account), ""
+    ) or os.getenv(_account_env_key(active_account, "KITE_API_SECRET"), "")
+    
+    st.sidebar.markdown(f"**{label} Account Credentials**")
+    api_key = st.sidebar.text_input(
+        "API Key",
+        value=default_api_key,
+        key=f"kite_api_key_input_{active_account}",
+    )
+    api_secret = st.sidebar.text_input(
+        "API Secret",
+        value=default_api_secret,
+        type="password",
+        key=f"kite_api_secret_input_{active_account}",
+    )
+    
+    if not api_key or not api_secret:
+        st.sidebar.info(f"Enter Kite API key/secret for {label} account (or set env vars).")
+    
+    # Single login button for active account
+    is_logged_in = bool(st.session_state.get(_account_session_key("kite_access_token", active_account)))
+    login_in_progress = st.session_state.get(_account_session_key("kite_login_initiated", active_account), False)
+    
+    login_clicked = st.sidebar.button(
+        f"Login with Kite" if not is_logged_in else f"Re-login",
+        disabled=login_in_progress,
+        key=f"kite_login_button_{active_account}",
+        type="primary" if not is_logged_in else "secondary",
+    )
 
-    login_clicked_primary, api_key_primary, api_secret_primary = render_account_controls(KITE_ACCOUNT_PRIMARY)
-    login_clicked_secondary, api_key_secondary, api_secret_secondary = render_account_controls(KITE_ACCOUNT_SECONDARY)
-
-    logout_clicked = st.sidebar.button("Logout (clear token)", disabled=True)
-    force_logout_clicked = st.sidebar.button("Force logout (clear all)", disabled=True)
+    # Logout buttons
+    col1, col2 = st.sidebar.columns(2)
+    logout_clicked = col1.button("Logout", disabled=False, use_container_width=True)
+    force_logout_clicked = col2.button("Clear All", disabled=False, use_container_width=True)
 
     if logout_clicked:
+        # Clear only active account
+        st.session_state.pop(_account_session_key("kite_access_token", active_account), None)
+        st.session_state.pop(_account_session_key("kite_api_key", active_account), None)
+        st.session_state.pop(_account_session_key("kite_token_timestamp", active_account), None)
+        st.session_state[_account_session_key("kite_login_initiated", active_account)] = False
+        # Update global state
         st.session_state.pop("kite_access_token", None)
         st.session_state.pop("kite_api_key", None)
         st.session_state.pop("kite_token_timestamp", None)
-        st.session_state[_account_session_key("kite_login_initiated", KITE_ACCOUNT_PRIMARY)] = False
-        st.session_state[_account_session_key("kite_login_initiated", KITE_ACCOUNT_SECONDARY)] = False
         st.session_state.kite_processing_token = False
         st.query_params.clear()
-        
-        # Clear persistent credentials file
-        clear_kite_credentials(KITE_ACCOUNT_PRIMARY)
-        
-        st.success("Logged out and cleared saved credentials")
+        clear_kite_credentials(active_account)
+        st.success(f"Logged out from {label} account")
         st.rerun()
 
     if force_logout_clicked:
@@ -200,11 +207,13 @@ def render_login_tab():
         st.query_params.clear()
         clear_kite_credentials(KITE_ACCOUNT_PRIMARY)
         clear_kite_credentials(KITE_ACCOUNT_SECONDARY)
-        st.success("Force logged out and cleared all Kite state")
+        st.success("Cleared all accounts")
         st.rerun()
 
+    # Handle login click
     def handle_login_click(account: str, api_key: str, api_secret: str) -> None:
         if not api_key or not api_secret:
+            st.error("Please enter both API key and secret")
             return
         st.session_state[_account_session_key("kite_api_key_stored", account)] = api_key
         st.session_state[_account_session_key("kite_api_secret_stored", account)] = api_secret
@@ -213,53 +222,63 @@ def render_login_tab():
         st.session_state["kite_login_account"] = account
 
         redirect_uri = f"http://{host}:{port}/"
-        login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}&redirect_params=status%3Dlogin&redirect_uri={redirect_uri}"
+        # Encode account in redirect_params so Kite sends it back to us
+        account_param = "secondary" if account == KITE_ACCOUNT_SECONDARY else "primary"
+        login_url = f"https://kite.zerodha.com/connect/login?v=3&api_key={api_key}&redirect_params=status%3Dlogin%26account%3D{account_param}&redirect_uri={redirect_uri}"
         st.session_state[_account_session_key("kite_login_url", account)] = login_url
 
-    if login_clicked_primary:
-        handle_login_click(KITE_ACCOUNT_PRIMARY, api_key_primary, api_secret_primary)
-    if login_clicked_secondary:
-        handle_login_click(KITE_ACCOUNT_SECONDARY, api_key_secondary, api_secret_secondary)
+    if login_clicked:
+        handle_login_click(active_account, api_key, api_secret)
         
-    for account in (KITE_ACCOUNT_PRIMARY, KITE_ACCOUNT_SECONDARY):
-        initiated_key = _account_session_key("kite_login_initiated", account)
-        access_token_key = _account_session_key("kite_access_token", account)
-        login_url_key = _account_session_key("kite_login_url", account)
-        redirect_pending_key = _account_session_key("kite_redirect_pending", account)
-        if st.session_state.get(initiated_key) and not st.session_state.get(access_token_key):
-            login_url = st.session_state.get(login_url_key)
-            if st.session_state.get(redirect_pending_key) and login_url:
-                st.info("🔗 Redirecting to Kite login in this tab. After login, you'll be sent back here.")
-                st.warning("⏳ Complete the login in the same browser tab. This page will update automatically after redirect.")
-                components.html(
-                    f"""
-                    <script>
-                    window.top.location.href = "{login_url}";
-                    </script>
-                    """,
-                    height=0,
-                )
-                st.session_state[redirect_pending_key] = False
-            if login_url:
-                st.markdown(
-                    f"""
-                    <div style="margin-top: 0.5rem;">
-                      <a href="{login_url}" target="_self"
-                         style="display:inline-block;padding:0.4rem 0.8rem;border:1px solid #999;border-radius:6px;text-decoration:none;">
-                         Open Kite login (same tab)
-                      </a>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+    # Show login redirect for active account
+    initiated_key = _account_session_key("kite_login_initiated", active_account)
+    access_token_key = _account_session_key("kite_access_token", active_account)
+    login_url_key = _account_session_key("kite_login_url", active_account)
+    redirect_pending_key = _account_session_key("kite_redirect_pending", active_account)
+    
+    if st.session_state.get(initiated_key) and not st.session_state.get(access_token_key):
+        login_url = st.session_state.get(login_url_key)
+        if st.session_state.get(redirect_pending_key) and login_url:
+            st.info("🔗 Redirecting to Kite login in this tab. After login, you'll be sent back here.")
+            st.warning("⏳ Complete the login in the same browser tab. This page will update automatically after redirect.")
+            components.html(
+                f"""
+                <script>
+                window.top.location.href = "{login_url}";
+                </script>
+                """,
+                height=0,
+            )
+            st.session_state[redirect_pending_key] = False
+        if login_url:
+            st.markdown(
+                f"""
+                <div style="margin-top: 0.5rem;">
+                  <a href="{login_url}" target="_self"
+                     style="display:inline-block;padding:0.4rem 0.8rem;border:1px solid #999;border-radius:6px;text-decoration:none;">
+                     Open Kite login (same tab)
+                  </a>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
+    # Show login status for both accounts
     primary_logged_in = bool(st.session_state.get(_account_session_key("kite_access_token", KITE_ACCOUNT_PRIMARY)))
     secondary_logged_in = bool(st.session_state.get(_account_session_key("kite_access_token", KITE_ACCOUNT_SECONDARY)))
-    if primary_logged_in:
-        st.success("✅ Primary account logged in.")
-    if secondary_logged_in:
-        st.success("✅ Secondary account logged in.")
-    if st.session_state.get(_account_session_key("kite_login_initiated", KITE_ACCOUNT_PRIMARY)) and not primary_logged_in:
-        st.info("⏳ Waiting for primary login completion. Complete the login in your browser.")
-    if st.session_state.get(_account_session_key("kite_login_initiated", KITE_ACCOUNT_SECONDARY)) and not secondary_logged_in:
-        st.info("⏳ Waiting for secondary login completion. Complete the login in your browser.")
+    
+    st.markdown("### Login Status")
+    col1, col2 = st.columns(2)
+    with col1:
+        if primary_logged_in:
+            st.success("✅ Primary account logged in")
+        else:
+            st.info("⚪ Primary account not logged in")
+    with col2:
+        if secondary_logged_in:
+            st.success("✅ Secondary account logged in")
+        else:
+            st.info("⚪ Secondary account not logged in")
+    
+    if st.session_state.get(_account_session_key("kite_login_initiated", active_account)) and not st.session_state.get(_account_session_key("kite_access_token", active_account)):
+        st.info(f"⏳ Waiting for {label} account login completion. Complete the login in your browser.")

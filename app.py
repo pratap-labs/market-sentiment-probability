@@ -334,7 +334,17 @@ def render():
     # Load credentials from file if not in session
     load_account_credentials(KITE_ACCOUNT_PRIMARY)
     load_account_credentials(KITE_ACCOUNT_SECONDARY)
-    apply_active_account(st.session_state.get("kite_active_account", KITE_ACCOUNT_PRIMARY))
+    
+    active_account = st.session_state.get("kite_active_account", KITE_ACCOUNT_PRIMARY)
+    apply_active_account(active_account)
+    
+    # Debug: Show current state
+    if st.sidebar.checkbox("Show debug info", value=False):
+        st.sidebar.write(f"Active account: {active_account}")
+        st.sidebar.write(f"Global token: {st.session_state.get('kite_access_token', 'None')[:10] if st.session_state.get('kite_access_token') else 'None'}...")
+        st.sidebar.write(f"Global API key: {st.session_state.get('kite_api_key', 'None')[:8] if st.session_state.get('kite_api_key') else 'None'}...")
+        st.sidebar.write(f"Primary token: {st.session_state.get('kite_access_token_primary', 'None')[:10] if st.session_state.get('kite_access_token_primary') else 'None'}...")
+        st.sidebar.write(f"Secondary token: {st.session_state.get('kite_access_token_secondary', 'None')[:10] if st.session_state.get('kite_access_token_secondary') else 'None'}...")
 
     # Ensure session tokens are still within TTL before rendering rest of the dashboard
     enforce_kite_token_ttl()
@@ -347,7 +357,10 @@ def render():
     if incoming_request_token and not st.session_state.kite_processing_token:
         st.session_state.kite_processing_token = True
 
-        account = st.session_state.get("kite_login_account", KITE_ACCOUNT_PRIMARY)
+        # Get account from redirect params that Kite sent back
+        account_param = query_params.get("account", "primary")
+        account = KITE_ACCOUNT_SECONDARY if account_param == "secondary" else KITE_ACCOUNT_PRIMARY
+        
         api_key = st.session_state.get(_account_session_key("kite_api_key_stored", account)) or os.getenv(
             _account_env_key(account, "KITE_API_KEY")
         )
@@ -357,6 +370,9 @@ def render():
             
         if api_key and api_secret:
             try:
+                # Debug: Show which account and credentials are being used
+                st.info(f"🔍 Attempting login for account: {account}")
+                st.info(f"🔑 Using API key: {api_key[:8]}...")
                 with st.spinner("Exchanging request token for access token..."):
                     kite = KiteConnect(api_key=api_key)
                     data = kite.generate_session(incoming_request_token, api_secret=api_secret)
@@ -367,10 +383,12 @@ def render():
                         st.session_state[_account_session_key("kite_access_token", account)] = access_token
                         st.session_state[_account_session_key("kite_api_key", account)] = api_key
                         st.session_state[_account_session_key("kite_token_timestamp", account)] = token_timestamp
-                        if st.session_state.get("kite_active_account", KITE_ACCOUNT_PRIMARY) == account:
-                            st.session_state["kite_access_token"] = access_token
-                            st.session_state["kite_api_key"] = api_key
-                            st.session_state["kite_token_timestamp"] = token_timestamp
+                        
+                        # Always update global state to the account that just logged in
+                        st.session_state["kite_access_token"] = access_token
+                        st.session_state["kite_api_key"] = api_key
+                        st.session_state["kite_token_timestamp"] = token_timestamp
+                        st.session_state["kite_active_account"] = account
                         
                         # Save credentials to persistent file
                         save_kite_credentials(access_token, api_key, token_timestamp, account=account)
