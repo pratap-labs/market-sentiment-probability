@@ -98,15 +98,23 @@ def render_login_tab():
         st.session_state.setdefault(_account_session_key("kite_login_initiated", account), False)
         st.session_state.setdefault(_account_session_key("kite_redirect_pending", account), False)
         st.session_state.setdefault(_account_session_key("kite_login_url", account), "")
-    st.session_state.setdefault("kite_active_account", KITE_ACCOUNT_PRIMARY)
+    
+    # Set default active account - but don't override if already set from successful login
+    if "kite_active_account" not in st.session_state:
+        st.session_state["kite_active_account"] = KITE_ACCOUNT_PRIMARY
 
-    # Account selector
     active_account = st.sidebar.selectbox(
         "Select Account",
         [KITE_ACCOUNT_PRIMARY, KITE_ACCOUNT_SECONDARY],
         format_func=lambda value: "Primary (KITE_API_KEY)" if value == KITE_ACCOUNT_PRIMARY else "Secondary (KITE_API_KEY_2)",
-        key="kite_active_account",
+        index=1 if st.session_state.get("kite_active_account") == KITE_ACCOUNT_SECONDARY else 0,
+        key="kite_active_account_selector",
     )
+    
+    # Update session state when selector changes
+    if st.session_state.get("kite_active_account") != active_account:
+        st.session_state["kite_active_account"] = active_account
+    
     _apply_active_account(active_account)
 
     # Redirect settings
