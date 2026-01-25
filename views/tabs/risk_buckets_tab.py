@@ -20,6 +20,7 @@ from scripts.utils import (
     compute_var_es_metrics,
     get_weighted_scenarios,
     enrich_position_with_greeks,
+    parse_tradingsymbol,
 )
 from scripts.utils.formatters import format_inr
 from views.tabs.portfolio_buckets_tab import (
@@ -365,9 +366,9 @@ def _compute_trade_sim_metrics(
     legs: List[Dict[str, object]],
     config: SimulationConfig,
     account_size: float,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[float, float, float, float, float, float, float]:
     if not legs or account_size <= 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     sigma, sigma_source = _get_sigma_source(legs)
     iv_shift = 0.0
@@ -380,7 +381,7 @@ def _compute_trade_sim_metrics(
 
     spot = _get_spot_from_positions(legs)
     if not spot:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     greeks = calculate_portfolio_greeks(legs)
     delta = greeks.get("net_delta", 0.0)
@@ -406,6 +407,9 @@ def _compute_trade_sim_metrics(
     expected_pnl_inr = float(np.mean(pnl_tn))
     expected_pnl_pct = (expected_pnl_inr / account_size * 100.0) if account_size else 0.0
     mean_loss_inr = float(-np.mean(pnl_tn[pnl_tn < 0])) if np.any(pnl_tn < 0) else 0.0
+    
+    # Calculate probability of profit
+    prob_profit = float(np.sum(pnl_tn > 0) / len(pnl_tn)) if len(pnl_tn) > 0 else 0.0
 
     worst_count = max(1, int(math.ceil(0.01 * len(pnl_tn))))
     worst_slice = np.sort(pnl_tn)[:worst_count]
@@ -413,7 +417,7 @@ def _compute_trade_sim_metrics(
     es99_inr = abs(es99_tail_mean)
     es99_pct = (es99_inr / account_size * 100.0) if account_size else 0.0
 
-    return expected_pnl_inr, expected_pnl_pct, es99_inr, es99_pct, es99_tail_mean, mean_loss_inr
+    return expected_pnl_inr, expected_pnl_pct, es99_inr, es99_pct, es99_tail_mean, mean_loss_inr, prob_profit
 
 
 def compute_trade_risk(
@@ -452,7 +456,7 @@ def compute_trade_risk(
             es99_pct, es99_value, _, _ = _compute_trade_es99(
                 legs, account_size, scenarios, iv_regime, int(lookback_days)
             )
-            exp_pnl_value, exp_pnl_pct, _, _, es99_tail_mean, mean_loss_inr = _compute_trade_sim_metrics(
+            exp_pnl_value, exp_pnl_pct, _, _, es99_tail_mean, mean_loss_inr, prob_profit = _compute_trade_sim_metrics(
                 legs, sim_cfg, account_size
             )
             trade_greeks = calculate_portfolio_greeks(legs)
@@ -471,6 +475,7 @@ def compute_trade_risk(
             exp_pnl_pct, exp_pnl_value = 0.0, 0.0
             es99_tail_mean = 0.0
             mean_loss_inr = 0.0
+            prob_profit = 0.0
             theta_carry = 0.0
             theta_per_lakh = 0.0
             gamma_per_lakh = 0.0
@@ -510,6 +515,7 @@ def compute_trade_risk(
                 "trade_id": trade_id,
                 "underlying": trade["underlying"],
                 "week_id": trade["expiry"],
+                "trade_name": trade_name,
                 "option_side": trade_name or option_side,
                 "earliest_expiry": trade.get("earliest_expiry", "—"),
                 "latest_expiry": trade.get("latest_expiry", "—"),
@@ -518,6 +524,7 @@ def compute_trade_risk(
                 "trade_es99_pct": es99_pct,
                 "expected_pnl_inr": exp_pnl_value,
                 "expected_pnl_pct": exp_pnl_pct,
+                "prob_profit": prob_profit,
                 "risk_reward": (exp_pnl_value / abs(es99_value)) if es99_value else 0.0,
                 "es99_tail_pnl_inr": es99_tail_mean,
                 "tail_loss_inr": abs(es99_tail_mean) if es99_tail_mean < 0 else 0.0,
@@ -768,6 +775,281 @@ def _recompute_positions_with_spot(
         except Exception:
             recomputed.append(pos)
     return recomputed
+
+
+def _normalize_options_cache(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    if "strike" not in df.columns and "strike_price" in df.columns:
+        df["strike"] = pd.to_numeric(df["strike_price"], errors="coerce")
+    df["strike_int"] = pd.to_numeric(df.get("strike"), errors="coerce").round().astype("Int64")
+    df["option_type"] = df.get("option_type", "").astype(str).str.upper().str.strip()
+    df["expiry"] = pd.to_datetime(df.get("expiry"), errors="coerce")
+    df["expiry_date"] = df["expiry"].dt.date
+    df["date"] = pd.to_datetime(df.get("date"), errors="coerce").dt.date
+    df["close"] = pd.to_numeric(df.get("close"), errors="coerce")
+    df["iv"] = pd.to_numeric(df.get("iv"), errors="coerce") if "iv" in df.columns else np.nan
+    df["spot"] = pd.to_numeric(df.get("underlying_value"), errors="coerce")
+    df = df.dropna(subset=["strike", "expiry", "option_type", "date", "close"])
+    return df
+
+
+def _leg_key_from_position(pos: Dict[str, object]) -> Tuple[Optional[float], Optional[str], Optional[datetime]]:
+    strike = pos.get("strike")
+    option_type = pos.get("option_type") or pos.get("instrument_type")
+    expiry = pos.get("expiry")
+    if strike is None or option_type is None or expiry is None:
+        parsed = parse_tradingsymbol(str(pos.get("tradingsymbol", "")))
+        if parsed:
+            strike = parsed.get("strike")
+            option_type = parsed.get("option_type")
+            expiry = parsed.get("expiry")
+    try:
+        strike_val = float(strike) if strike is not None else None
+    except Exception:
+        strike_val = None
+    strike_int = int(round(strike_val)) if strike_val is not None else None
+    option_val = str(option_type).upper().strip() if option_type else None
+    expiry_val = pd.to_datetime(expiry, errors="coerce") if expiry is not None else None
+    if pd.isna(expiry_val):
+        expiry_val = None
+    return strike_int, option_val, expiry_val
+
+
+def _trade_id_from_trade(trade: Dict[str, object]) -> str:
+    trade_name = trade.get("trade_name") or ""
+    underlying = trade.get("underlying", "UNKNOWN")
+    expiry = trade.get("expiry", "UNKNOWN")
+    option_side = trade.get("option_side", "OTHER")
+    if trade_name:
+        return f"{underlying}|{expiry}|{trade_name}"
+    return f"{underlying}|{expiry}|{option_side}"
+
+
+def _compute_trade_history_metrics(
+    trades: List[Dict[str, object]],
+    options_df: pd.DataFrame,
+    paths: int,
+    rf: float,
+    cvar_level: float,
+) -> pd.DataFrame:
+    if not trades or options_df.empty:
+        return pd.DataFrame()
+    options_df = _normalize_options_cache(options_df)
+    if options_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    rng = np.random.default_rng(42)
+    for trade in trades:
+        legs = trade.get("legs", [])
+        if not legs:
+            continue
+        trade_id = _trade_id_from_trade(trade)
+        leg_keys = []
+        entry_value = 0.0
+        expiries = []
+        for leg in legs:
+            strike, opt_type, expiry = _leg_key_from_position(leg)
+            if strike is None or opt_type is None or expiry is None:
+                continue
+            leg_keys.append((strike, opt_type, expiry))
+            expiries.append(expiry)
+            qty = float(leg.get("quantity") or 0.0)
+            avg_price = float(leg.get("average_price") or 0.0)
+            entry_value += qty * avg_price
+        if not leg_keys:
+            continue
+        min_expiry = min(expiries)
+        dates_sets = []
+        for strike, opt_type, expiry in leg_keys:
+            leg_df = options_df[
+                (options_df["strike_int"] == strike)
+                & (options_df["option_type"] == opt_type)
+                & (options_df["expiry_date"] == expiry.date())
+            ]
+            dates_sets.append(set(leg_df["date"].dropna().unique()))
+        if not dates_sets:
+            continue
+        common_dates = set.intersection(*dates_sets) if dates_sets else set()
+        if not common_dates:
+            continue
+        dates_sorted = sorted([d for d in common_dates if d <= min_expiry.date()])
+        if not dates_sorted:
+            continue
+        pnl_series = []
+        for dt in dates_sorted:
+            day_df = options_df[options_df["date"] == dt]
+            spot_val = float(day_df["spot"].dropna().median()) if not day_df.empty else 0.0
+            if spot_val <= 0:
+                continue
+            trade_value = 0.0
+            ivs = []
+            for strike, opt_type, expiry in leg_keys:
+                leg_day = day_df[
+                    (day_df["strike_int"] == strike)
+                    & (day_df["option_type"] == opt_type)
+                    & (day_df["expiry_date"] == expiry.date())
+                ]
+                if leg_day.empty:
+                    trade_value = None
+                    break
+                price = float(leg_day["close"].iloc[0])
+                iv_val = float(leg_day["iv"].iloc[0]) if not pd.isna(leg_day["iv"].iloc[0]) else np.nan
+                ivs.append(iv_val)
+                qty = float(legs[leg_keys.index((strike, opt_type, expiry))].get("quantity") or 0.0)
+                trade_value += qty * price
+            if trade_value is None:
+                continue
+            pnl = trade_value - entry_value
+            pnl_series.append((dt, pnl))
+            days_to_expiry = max((min_expiry.date() - dt).days, 1)
+            sigma = float(np.nanmedian(ivs)) if ivs else 0.2
+            t = days_to_expiry / 365.0
+            z = rng.standard_normal(paths)
+            spot_t = spot_val * np.exp((rf - 0.5 * sigma * sigma) * t + sigma * np.sqrt(t) * z)
+            payoff = np.zeros_like(spot_t)
+            for strike, opt_type, expiry in leg_keys:
+                qty = float(legs[leg_keys.index((strike, opt_type, expiry))].get("quantity") or 0.0)
+                if opt_type == "CE":
+                    payoff += qty * np.maximum(spot_t - strike, 0.0)
+                else:
+                    payoff += qty * np.maximum(strike - spot_t, 0.0)
+            sim_pnl = payoff - entry_value
+            expected_pnl = float(np.mean(sim_pnl))
+            pop = float(np.mean(sim_pnl > 0))
+            losses = -sim_pnl
+            var = float(np.quantile(losses, cvar_level))
+            tail = losses[losses >= var]
+            cvar = -float(np.mean(tail)) if tail.size else 0.0
+            tail_loss = abs(cvar)
+            rr = expected_pnl / tail_loss if tail_loss else 0.0
+            rows.append(
+                {
+                    "trade_id": trade_id,
+                    "date": dt,
+                    "expected_pnl": expected_pnl,
+                    "pop": pop,
+                    "cvar": cvar,
+                    "tail_loss": tail_loss,
+                    "rr": rr,
+                    "pnl": pnl,
+                }
+            )
+        if pnl_series:
+            pnl_df = pd.DataFrame(pnl_series, columns=["date", "pnl"])
+            pnl_df["cum_max"] = pnl_df["pnl"].cummax()
+            pnl_df["drawdown"] = pnl_df["pnl"] - pnl_df["cum_max"]
+            for _, row in pnl_df.iterrows():
+                for item in rows:
+                    if item["trade_id"] == trade_id and item["date"] == row["date"]:
+                        item["drawdown"] = float(row["drawdown"])
+                        break
+    return pd.DataFrame(rows)
+
+
+def _compute_trade_drawdown_series(
+    trades: List[Dict[str, object]],
+    options_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if not trades or options_df.empty:
+        return pd.DataFrame()
+    options_df = _normalize_options_cache(options_df)
+    if options_df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    for trade in trades:
+        legs = trade.get("legs", [])
+        if not legs:
+            continue
+        trade_id = _trade_id_from_trade(trade)
+        leg_keys = []
+        entry_value = 0.0
+        expiries = []
+        for leg in legs:
+            strike, opt_type, expiry = _leg_key_from_position(leg)
+            if strike is None or opt_type is None or expiry is None:
+                continue
+            leg_keys.append((strike, opt_type, expiry))
+            expiries.append(expiry)
+            qty = float(leg.get("quantity") or 0.0)
+            avg_price = float(leg.get("average_price") or 0.0)
+            entry_value += qty * avg_price
+        if not leg_keys:
+            continue
+        min_expiry = min(expiries)
+        dates_sets = []
+        for strike, opt_type, expiry in leg_keys:
+            leg_df = options_df[
+                (options_df["strike_int"] == strike)
+                & (options_df["option_type"] == opt_type)
+                & (options_df["expiry_date"] == expiry.date())
+            ]
+            dates_sets.append(set(leg_df["date"].dropna().unique()))
+        if not dates_sets:
+            continue
+        common_dates = set.intersection(*dates_sets) if dates_sets else set()
+        if not common_dates:
+            continue
+        dates_sorted = sorted([d for d in common_dates if d <= min_expiry.date()])
+        if not dates_sorted:
+            continue
+        pnl_series = []
+        for dt in dates_sorted:
+            day_df = options_df[options_df["date"] == dt]
+            trade_value = 0.0
+            for strike, opt_type, expiry in leg_keys:
+                leg_day = day_df[
+                    (day_df["strike_int"] == strike)
+                    & (day_df["option_type"] == opt_type)
+                    & (day_df["expiry_date"] == expiry.date())
+                ]
+                if leg_day.empty:
+                    trade_value = None
+                    break
+                price = float(leg_day["close"].iloc[0])
+                qty = float(legs[leg_keys.index((strike, opt_type, expiry))].get("quantity") or 0.0)
+                trade_value += qty * price
+            if trade_value is None:
+                continue
+            pnl = trade_value - entry_value
+            pnl_series.append((dt, pnl))
+        if pnl_series:
+            pnl_df = pd.DataFrame(pnl_series, columns=["date", "pnl"])
+            pnl_df["cum_max"] = pnl_df["pnl"].cummax()
+            pnl_df["drawdown"] = pnl_df["pnl"] - pnl_df["cum_max"]
+            for _, row in pnl_df.iterrows():
+                rows.append(
+                    {
+                        "trade_id": trade_id,
+                        "date": row["date"],
+                        "drawdown": float(row["drawdown"]),
+                        "pnl": float(row["pnl"]),
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def _aggregate_drawdown_by_group(
+    drawdown_df: pd.DataFrame,
+    trades: List[Dict[str, object]],
+) -> pd.DataFrame:
+    if drawdown_df.empty:
+        return pd.DataFrame()
+    trade_group = {}
+    for trade in trades:
+        trade_id = _trade_id_from_trade(trade)
+        group = trade.get("trade_name") or trade_id
+        trade_group[trade_id] = group
+    df = drawdown_df.copy()
+    df["group_id"] = df["trade_id"].map(trade_group).fillna(df["trade_id"])
+    grouped = df.groupby(["group_id", "date"], as_index=False)["pnl"].sum()
+    grouped = grouped.sort_values(["group_id", "date"])
+    grouped["cum_max"] = grouped.groupby("group_id")["pnl"].cummax()
+    grouped["drawdown"] = grouped["pnl"] - grouped["cum_max"]
+    return grouped
 
 
 def _render_scenario_table(
@@ -1809,8 +2091,14 @@ def render_risk_buckets_tab() -> None:
 
     saved_groups = st.session_state.get("tba_saved_trades", [])
     use_saved = st.session_state.get("tba_use_saved_groups", False)
+    
+    # Check if user wants to show group trades in chart settings
+    chart_settings = st.session_state.get("tba_trade_chart_settings", {})
+    show_group_trades_requested = chart_settings.get("show_group_trades", True)
+    
+    # Build trades - include saved groups if either use_saved flag is True OR if user wants to show group trades
     trades = build_trades_using_existing_grouping(positions)
-    if use_saved and saved_groups:
+    if (use_saved or show_group_trades_requested) and saved_groups:
         trades += build_trades_from_saved_groups(positions, saved_groups)
     trades_df, legs_by_trade = compute_trade_risk(trades, float(total_capital), lookback_days=504)
 
@@ -2133,50 +2421,107 @@ def render_risk_buckets_tab() -> None:
                         _save_saved_groups(st.session_state["tba_saved_trades"])
                         if not st.session_state.get("tba_saved_trades"):
                             st.session_state["tba_use_saved_groups"] = False
-        chart_controls = st.columns(3)
-        with chart_controls[0]:
-            norm_mode = st.selectbox(
-                "Normalize",
-                ["Absolute INR", "Per 1L capital", "Per bucket cap %"],
-                key="tba_trade_chart_norm",
-            )
-        with chart_controls[1]:
-            log_loss_axis = st.toggle("Log scale (loss axis)", value=False, key="tba_trade_chart_log")
-        with chart_controls[2]:
-            tail_cap_label = "Tail cap (INR)"
-            if norm_mode == "Per 1L capital":
-                tail_cap_label = "Tail cap (per 1L)"
-            elif norm_mode == "Per bucket cap %":
-                tail_cap_label = "Tail cap (%)"
-            tail_cap_inr = st.number_input(
-                tail_cap_label,
-                min_value=0.0,
-                step=1_000.0 if norm_mode == "Absolute INR" else 1.0,
-                value=float(st.session_state.get("tba_trade_tail_cap_inr", 200_000.0)),
-                key="tba_trade_tail_cap_inr",
-            )
-        toggle_cols = st.columns(2)
-        with toggle_cols[0]:
-            show_individual_trades = st.toggle(
-                "Show individual trades",
-                value=True,
-                key="tba_show_individual_trades",
-            )
-        with toggle_cols[1]:
-            show_group_trades = st.toggle(
-                "Show group trades",
-                value=True,
-                key="tba_show_group_trades",
-            )
+        default_chart_settings = {
+            "norm_mode": "Absolute INR",
+            "log_loss_axis": False,
+            "tail_cap_inr": float(st.session_state.get("tba_trade_tail_cap_inr", 200_000.0)),
+            "show_individual_trades": True,
+            "show_group_trades": True,
+        }
+        chart_settings = st.session_state.get("tba_trade_chart_settings", default_chart_settings).copy()
+        if "tba_trade_chart_settings" not in st.session_state:
+            st.session_state["tba_trade_chart_settings"] = chart_settings
+        with st.form("tba_trade_chart_form"):
+            chart_controls = st.columns(3)
+            with chart_controls[0]:
+                norm_mode_input = st.selectbox(
+                    "Normalize",
+                    ["Absolute INR", "Per 1L capital", "Per bucket cap %"],
+                    index=["Absolute INR", "Per 1L capital", "Per bucket cap %"].index(
+                        chart_settings["norm_mode"]
+                    ),
+                    key="tba_trade_chart_norm_input",
+                )
+            with chart_controls[1]:
+                log_loss_axis_input = st.toggle(
+                    "Log scale (loss axis)",
+                    value=chart_settings["log_loss_axis"],
+                    key="tba_trade_chart_log_input",
+                )
+            with chart_controls[2]:
+                tail_cap_label = "Tail cap (INR)"
+                if norm_mode_input == "Per 1L capital":
+                    tail_cap_label = "Tail cap (per 1L)"
+                elif norm_mode_input == "Per bucket cap %":
+                    tail_cap_label = "Tail cap (%)"
+                tail_cap_inr_input = st.number_input(
+                    tail_cap_label,
+                    min_value=0.0,
+                    step=1_000.0 if norm_mode_input == "Absolute INR" else 1.0,
+                    value=float(chart_settings["tail_cap_inr"]),
+                    key="tba_trade_tail_cap_inr_input",
+                )
+            toggle_cols = st.columns(2)
+            with toggle_cols[0]:
+                show_individual_trades_input = st.toggle(
+                    "Show individual trades",
+                    value=chart_settings["show_individual_trades"],
+                    key="tba_show_individual_trades_input",
+                )
+            with toggle_cols[1]:
+                show_group_trades_input = st.toggle(
+                    "Show group trades",
+                    value=chart_settings["show_group_trades"],
+                    key="tba_show_group_trades_input",
+                )
+            apply_chart = st.form_submit_button("Render charts")
+        if apply_chart:
+            chart_settings = {
+                "norm_mode": norm_mode_input,
+                "log_loss_axis": log_loss_axis_input,
+                "tail_cap_inr": tail_cap_inr_input,
+                "show_individual_trades": show_individual_trades_input,
+                "show_group_trades": show_group_trades_input,
+            }
+            st.session_state["tba_trade_chart_settings"] = chart_settings
+        norm_mode = chart_settings["norm_mode"]
+        log_loss_axis = chart_settings["log_loss_axis"]
+        tail_cap_inr = chart_settings["tail_cap_inr"]
+        show_individual_trades = chart_settings["show_individual_trades"]
+        show_group_trades = chart_settings["show_group_trades"]
 
         charts_container = st.container()
-        chart_df = trades_df.copy()
-        group_names = {g.get("name") for g in saved_groups if g.get("name")}
-        if saved_groups and st.session_state.get("tba_use_saved_groups", False):
-            if not show_individual_trades:
-                chart_df = chart_df[chart_df["option_side"].isin(group_names)]
-            if not show_group_trades and group_names:
-                chart_df = chart_df[~chart_df["option_side"].isin(group_names)]
+        with st.spinner("Rendering charts..."):
+            chart_df_base = trades_df.copy()
+            chart_df_base["trade_name"] = chart_df_base["trade_name"].fillna("")
+            chart_df_base["is_group_trade"] = chart_df_base["trade_name"].ne("")
+            chart_df_individual = chart_df_base[~chart_df_base["is_group_trade"]].copy()
+            chart_df_groups = chart_df_base[chart_df_base["is_group_trade"]].copy()
+            if chart_df_groups.empty and saved_groups:
+                group_trades = build_trades_from_saved_groups(positions, saved_groups)
+                if group_trades:
+                    group_trades_df, _ = compute_trade_risk(
+                        group_trades, float(total_capital), lookback_days=504
+                    )
+                    group_trades_df = assign_buckets(
+                        group_trades_df, float(total_capital), allocations, thresholds, zone_map
+                    )
+                    group_trades_df["trade_name"] = group_trades_df["trade_name"].fillna("")
+                    group_trades_df["is_group_trade"] = group_trades_df["trade_name"].ne("")
+                    chart_df_groups = group_trades_df.copy()
+            chart_frames = []
+            if show_individual_trades:
+                chart_frames.append(chart_df_individual)
+            if show_group_trades:
+                chart_frames.append(chart_df_groups)
+            chart_df = (
+                pd.concat(chart_frames, ignore_index=True)
+                if chart_frames
+                else chart_df_base.iloc[0:0].copy()
+            )
+            if chart_df.empty:
+                st.info("No trades to display for the selected chart toggles.")
+                return
         chart_df["theta_per_lakh_label"] = chart_df.apply(
             lambda row: f"{row['theta_per_lakh']:.1f} ({row['theta_label']})"
             if row["theta_per_lakh"] is not None
@@ -2197,12 +2542,14 @@ def render_risk_buckets_tab() -> None:
         )
         chart_df["label_expiry"] = chart_df["earliest_expiry"].fillna("—")
         chart_df.loc[chart_df["label_expiry"].isin(["—", "UNKNOWN"]), "label_expiry"] = chart_df["week_id"]
-        chart_df["trade_label"] = (
+        chart_df["trade_label"] = np.where(
+            chart_df["trade_name"].astype(str).str.strip() != "",
+            chart_df["trade_name"].astype(str),
             chart_df["underlying"].astype(str)
             + " | "
             + chart_df["label_expiry"].astype(str)
             + " | "
-            + chart_df["option_side"].astype(str)
+            + chart_df["option_side"].astype(str),
         )
         chart_df["capital_inr"] = chart_df["margin"].fillna(0.0)
         chart_df.loc[chart_df["capital_inr"] <= 0, "capital_inr"] = chart_df["premium_received_inr"].abs()
@@ -2249,6 +2596,7 @@ def render_risk_buckets_tab() -> None:
             alt.Tooltip("bucket:N", title="Bucket"),
             alt.Tooltip("zone_label:N", title="Zone"),
             alt.Tooltip("legs:Q", title="Legs"),
+            alt.Tooltip("prob_profit:Q", title="PoP", format=".1%"),
             alt.Tooltip("expected_pnl_inr:Q", title="Mean PnL", format=",.0f"),
             alt.Tooltip("tail_loss_inr:Q", title="Tail Loss", format=",.0f"),
             alt.Tooltip("mean_loss_inr:Q", title="Mean Loss", format=",.0f"),
@@ -2433,6 +2781,11 @@ def render_risk_buckets_tab() -> None:
                         title=y_title,
                         scale=alt.Scale(type="log") if log_loss_axis else alt.Scale(zero=True),
                     ),
+                    size=alt.Size(
+                        "prob_profit:Q",
+                        legend=alt.Legend(title="PoP", format=".0%"),
+                        scale=alt.Scale(range=[50, 500]),
+                    ),
                     color=alt.Color(
                         "risk_reward:Q",
                         legend=alt.Legend(title="Reward/Risk"),
@@ -2452,6 +2805,11 @@ def render_risk_buckets_tab() -> None:
                         f"{y_field}:Q",
                         title=y_title,
                         scale=alt.Scale(type="log") if log_loss_axis else alt.Scale(zero=True),
+                    ),
+                    size=alt.Size(
+                        "prob_profit:Q",
+                        legend=alt.Legend(title="PoP", format=".0%"),
+                        scale=alt.Scale(range=[50, 500]),
                     ),
                     shape=alt.Shape("option_side:N", legend=alt.Legend(title="Side")),
                     tooltip=tooltip_cols,
@@ -2624,6 +2982,151 @@ def render_risk_buckets_tab() -> None:
                 st.dataframe(legs_df, use_container_width=True, hide_index=True)
 
         st.info("Forward simulation is available at Portfolio and Bucket levels only.")
+
+        st.markdown("### Trade Historical Analysis")
+        options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
+        if options_df_cache is None or options_df_cache.empty:
+            st.warning("Options cache missing. Load from Derivatives Data tab.")
+        else:
+            expiry_choices = sorted(
+                {t.get("earliest_expiry") for t in trades if t.get("earliest_expiry")}
+            )
+            selected_expiry = st.selectbox("Trade expiry", expiry_choices, key="tba_hist_expiry")
+            options_norm = _normalize_options_cache(options_df_cache)
+            st.session_state["tba_hist_options_rows"] = len(options_norm)
+            pos_hist = options_norm[
+                ["date", "expiry", "option_type", "strike_int", "close", "spot"]
+            ].copy()
+            pos_hist = pos_hist.rename(
+                columns={
+                    "strike_int": "strike",
+                }
+            )
+            pos_hist["expiry"] = pd.to_datetime(pos_hist["expiry"], errors="coerce").dt.date
+            if pos_hist.empty:
+                st.info("No historical metrics computed yet.")
+                st.caption(f"Options rows loaded: {st.session_state.get('tba_hist_options_rows', 0)}")
+            else:
+                st.dataframe(pos_hist, use_container_width=True, hide_index=True)
+                if st.button("Compute drawdown", type="primary"):
+                    drawdown_df = _compute_trade_drawdown_series(trades, options_norm)
+                    st.session_state["tba_trade_drawdown_df"] = drawdown_df
+                    st.session_state["tba_trade_group_drawdown_df"] = _aggregate_drawdown_by_group(
+                        drawdown_df, trades
+                    )
+                drawdown_df = st.session_state.get("tba_trade_drawdown_df", pd.DataFrame())
+                group_drawdown_df = st.session_state.get("tba_trade_group_drawdown_df", pd.DataFrame())
+                if drawdown_df.empty:
+                    st.info("No drawdown data computed yet.")
+                else:
+                    trade_group = {}
+                    trade_qty = {}
+                    for trade in trades:
+                        trade_id = _trade_id_from_trade(trade)
+                        group = trade.get("trade_name") or trade_id
+                        trade_group[trade_id] = group
+                        qty_sum = 0.0
+                        for leg in trade.get("legs_detail", []):
+                            try:
+                                qty_sum += float(leg.get("quantity") or 0.0)
+                            except (TypeError, ValueError):
+                                continue
+                        trade_qty[trade_id] = qty_sum
+                    group_qty = {}
+                    for trade_id, group_id in trade_group.items():
+                        group_qty[group_id] = group_qty.get(group_id, 0.0) + trade_qty.get(trade_id, 0.0)
+                    drawdown_df = drawdown_df.copy()
+                    drawdown_df["group_id"] = drawdown_df["trade_id"].map(trade_group).fillna(
+                        drawdown_df["trade_id"]
+                    )
+                    drawdown_df["net_qty"] = drawdown_df["trade_id"].map(trade_qty).fillna(0.0)
+                    group_ids = sorted(drawdown_df["group_id"].dropna().unique().tolist())
+                    selected_group = st.selectbox(
+                        "Group filter (drawdown charts)",
+                        ["All"] + group_ids,
+                        key="tba_drawdown_group_filter",
+                    )
+                    if selected_group != "All":
+                        drawdown_df = drawdown_df[drawdown_df["group_id"] == selected_group]
+                    with st.expander("Drawdown by Trade (raw)"):
+                        st.caption(
+                            "Quantity shown is current net qty per trade. Adjustments over time are not tracked."
+                        )
+                        st.dataframe(drawdown_df, use_container_width=True, hide_index=True)
+                        dd_base = alt.Chart(drawdown_df)
+                        dd_chart = (
+                            dd_base.mark_line()
+                            .encode(
+                                x=alt.X("date:T", title="Date"),
+                                y=alt.Y("drawdown:Q", title="Drawdown"),
+                                color=alt.Color("trade_id:N", title="Trade"),
+                                tooltip=[
+                                    alt.Tooltip("trade_id:N", title="Trade"),
+                                    alt.Tooltip("date:T", title="Date"),
+                                    alt.Tooltip("drawdown:Q", title="Drawdown", format=",.2f"),
+                                    alt.Tooltip("pnl:Q", title="PnL", format=",.2f"),
+                                    alt.Tooltip("net_qty:Q", title="Net Qty", format=",.0f"),
+                                ],
+                            )
+                        )
+                        pnl_chart = (
+                            dd_base.mark_line(strokeDash=[6, 3], opacity=0.6)
+                            .encode(
+                                x=alt.X("date:T", title="Date"),
+                                y=alt.Y("pnl:Q", title="PnL"),
+                                color=alt.Color("trade_id:N", title="Trade"),
+                                tooltip=[
+                                    alt.Tooltip("trade_id:N", title="Trade"),
+                                    alt.Tooltip("date:T", title="Date"),
+                                    alt.Tooltip("pnl:Q", title="PnL", format=",.2f"),
+                                    alt.Tooltip("drawdown:Q", title="Drawdown", format=",.2f"),
+                                    alt.Tooltip("net_qty:Q", title="Net Qty", format=",.0f"),
+                                ],
+                            )
+                        )
+                        st.altair_chart((dd_chart + pnl_chart).properties(height=300), use_container_width=True)
+                if not group_drawdown_df.empty:
+                    st.markdown("#### Drawdown by Group")
+                    filtered_group_df = (
+                        group_drawdown_df
+                        if "selected_group" not in locals() or selected_group == "All"
+                        else group_drawdown_df[group_drawdown_df["group_id"] == selected_group]
+                    )
+                    filtered_group_df = filtered_group_df.copy()
+                    filtered_group_df["net_qty"] = filtered_group_df["group_id"].map(group_qty).fillna(0.0)
+                    st.dataframe(filtered_group_df, use_container_width=True, hide_index=True)
+                    group_base = alt.Chart(filtered_group_df)
+                    group_chart = (
+                        group_base.mark_line()
+                        .encode(
+                            x=alt.X("date:T", title="Date"),
+                            y=alt.Y("drawdown:Q", title="Drawdown"),
+                            color=alt.Color("group_id:N", title="Group"),
+                            tooltip=[
+                                alt.Tooltip("group_id:N", title="Group"),
+                                alt.Tooltip("date:T", title="Date"),
+                                alt.Tooltip("drawdown:Q", title="Drawdown", format=",.2f"),
+                                alt.Tooltip("pnl:Q", title="PnL", format=",.2f"),
+                                alt.Tooltip("net_qty:Q", title="Net Qty", format=",.0f"),
+                            ],
+                        )
+                    )
+                    group_pnl_chart = (
+                        group_base.mark_line(strokeDash=[6, 3], opacity=0.6)
+                        .encode(
+                            x=alt.X("date:T", title="Date"),
+                            y=alt.Y("pnl:Q", title="PnL"),
+                            color=alt.Color("group_id:N", title="Group"),
+                            tooltip=[
+                                alt.Tooltip("group_id:N", title="Group"),
+                                alt.Tooltip("date:T", title="Date"),
+                                alt.Tooltip("pnl:Q", title="PnL", format=",.2f"),
+                                alt.Tooltip("drawdown:Q", title="Drawdown", format=",.2f"),
+                                alt.Tooltip("net_qty:Q", title="Net Qty", format=",.0f"),
+                            ],
+                        )
+                    )
+                    st.altair_chart((group_chart + group_pnl_chart).properties(height=300), use_container_width=True)
 
     with subtab4:
         st.markdown("### How to Read This Tab (Process)")
