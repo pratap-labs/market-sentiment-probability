@@ -43,10 +43,7 @@ try:
         os.environ["KITE_API_KEY"] = st.secrets["KITE_API_KEY"]
     if "KITE_API_SECRET" in st.secrets and not os.getenv("KITE_API_SECRET"):
         os.environ["KITE_API_SECRET"] = st.secrets["KITE_API_SECRET"]
-    if "KITE_API_KEY_2" in st.secrets and not os.getenv("KITE_API_KEY_2"):
-        os.environ["KITE_API_KEY_2"] = st.secrets["KITE_API_KEY_2"]
-    if "KITE_API_SECRET_2" in st.secrets and not os.getenv("KITE_API_SECRET_2"):
-        os.environ["KITE_API_SECRET_2"] = st.secrets["KITE_API_SECRET_2"]
+    # Secondary account is no longer supported.
 except Exception:
     pass
 
@@ -54,7 +51,6 @@ except Exception:
 CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 KITE_CREDS_FILE = CACHE_DIR / "kite_credentials.json"
-KITE_CREDS_FILE_2 = CACHE_DIR / "kite_credentials_2.json"
 KITE_TOKEN_TTL = timedelta(hours=12)
 
 try:
@@ -90,33 +86,10 @@ from views.tabs.product_overview_tab import render_product_overview_tab
 from views.tabs.derivatives_data_tab import render_derivatives_data_tab, load_cached_derivatives_data_for_session
 
 
-KITE_ACCOUNT_PRIMARY = "primary"
-KITE_ACCOUNT_SECONDARY = "secondary"
-
-
-def _account_suffix(account: str) -> str:
-    return "primary" if account == KITE_ACCOUNT_PRIMARY else "secondary"
-
-
-def _account_session_key(base: str, account: str) -> str:
-    return f"{base}_{_account_suffix(account)}"
-
-
-def _account_env_key(account: str, base: str) -> str:
-    if account == KITE_ACCOUNT_PRIMARY:
-        return base
-    return f"{base}_2"
-
-
-def _account_creds_file(account: str) -> Path:
-    return KITE_CREDS_FILE if account == KITE_ACCOUNT_PRIMARY else KITE_CREDS_FILE_2
-
-
 def save_kite_credentials(
     access_token: str,
     api_key: str,
     saved_at: Optional[str] = None,
-    account: str = KITE_ACCOUNT_PRIMARY,
 ):
     """Save Kite credentials to persistent file."""
     try:
@@ -126,7 +99,7 @@ def save_kite_credentials(
             "api_key": api_key,
             "saved_at": saved_at
         }
-        with open(_account_creds_file(account), 'w') as f:
+        with open(KITE_CREDS_FILE, 'w') as f:
             json.dump(creds, f)
         return saved_at
     except Exception as e:
@@ -134,12 +107,11 @@ def save_kite_credentials(
         return None
 
 
-def load_kite_credentials(account: str = KITE_ACCOUNT_PRIMARY):
+def load_kite_credentials():
     """Load Kite credentials from persistent file."""
     try:
-        creds_file = _account_creds_file(account)
-        if creds_file.exists():
-            with open(creds_file, 'r') as f:
+        if KITE_CREDS_FILE.exists():
+            with open(KITE_CREDS_FILE, 'r') as f:
                 creds = json.load(f)
                 return (
                     creds.get("access_token"),
@@ -151,12 +123,11 @@ def load_kite_credentials(account: str = KITE_ACCOUNT_PRIMARY):
     return None, None, None
 
 
-def clear_kite_credentials(account: str = KITE_ACCOUNT_PRIMARY):
+def clear_kite_credentials():
     """Clear saved Kite credentials file."""
     try:
-        creds_file = _account_creds_file(account)
-        if creds_file.exists():
-            creds_file.unlink()
+        if KITE_CREDS_FILE.exists():
+            KITE_CREDS_FILE.unlink()
     except Exception as e:
         st.error(f"Failed to clear credentials: {e}")
 
@@ -166,12 +137,6 @@ def clear_kite_session_state():
     st.session_state.pop("kite_access_token", None)
     st.session_state.pop("kite_api_key", None)
     st.session_state.pop("kite_token_timestamp", None)
-
-
-def clear_kite_account_state(account: str) -> None:
-    st.session_state.pop(_account_session_key("kite_access_token", account), None)
-    st.session_state.pop(_account_session_key("kite_api_key", account), None)
-    st.session_state.pop(_account_session_key("kite_token_timestamp", account), None)
 
 
 def is_token_expired(saved_at: Optional[str]) -> bool:
@@ -194,10 +159,8 @@ def enforce_kite_token_ttl():
     if not token_present:
         return
     if is_token_expired(token_ts):
-        active_account = st.session_state.get("kite_active_account", KITE_ACCOUNT_PRIMARY)
         clear_kite_session_state()
-        clear_kite_account_state(active_account)
-        clear_kite_credentials(active_account)
+        clear_kite_credentials()
         st.warning("Kite login expired. Please login again to continue.")
 
 
@@ -275,66 +238,42 @@ def render():
         st.error("Missing dependency `py_vollib`. Install with `pip install py_vollib`.")
         return
 
-    # Initialize session state
-    st.session_state.setdefault(_account_session_key("kite_login_initiated", KITE_ACCOUNT_PRIMARY), False)
-    st.session_state.setdefault(_account_session_key("kite_login_initiated", KITE_ACCOUNT_SECONDARY), False)
+    # Initialize session state (single account)
+    st.session_state.setdefault("kite_login_initiated", False)
+    st.session_state.setdefault("kite_redirect_pending", False)
+    st.session_state.setdefault("kite_login_url", "")
     if "kite_processing_token" not in st.session_state:
         st.session_state.kite_processing_token = False
-    st.session_state.setdefault("kite_active_account", KITE_ACCOUNT_PRIMARY)
 
     if st.session_state.get("kite_force_logout"):
         clear_kite_session_state()
-        clear_kite_credentials(KITE_ACCOUNT_PRIMARY)
-        clear_kite_credentials(KITE_ACCOUNT_SECONDARY)
-        clear_kite_account_state(KITE_ACCOUNT_PRIMARY)
-        clear_kite_account_state(KITE_ACCOUNT_SECONDARY)
+        clear_kite_credentials()
         for key in (
-            _account_session_key("kite_login_initiated", KITE_ACCOUNT_PRIMARY),
-            _account_session_key("kite_login_initiated", KITE_ACCOUNT_SECONDARY),
+            "kite_login_initiated",
+            "kite_redirect_pending",
+            "kite_login_url",
             "kite_processing_token",
-            _account_session_key("kite_api_key_stored", KITE_ACCOUNT_PRIMARY),
-            _account_session_key("kite_api_secret_stored", KITE_ACCOUNT_PRIMARY),
-            _account_session_key("kite_api_key_stored", KITE_ACCOUNT_SECONDARY),
-            _account_session_key("kite_api_secret_stored", KITE_ACCOUNT_SECONDARY),
-            "kite_login_account",
-            "kite_active_account",
+            "kite_api_key_stored",
+            "kite_api_secret_stored",
         ):
             st.session_state.pop(key, None)
         st.session_state.pop("kite_force_logout", None)
 
-    def load_account_credentials(account: str) -> None:
-        token_key = _account_session_key("kite_access_token", account)
-        api_key_key = _account_session_key("kite_api_key", account)
-        ts_key = _account_session_key("kite_token_timestamp", account)
-        if token_key in st.session_state and api_key_key in st.session_state:
+    def load_saved_credentials() -> None:
+        if st.session_state.get("kite_access_token") and st.session_state.get("kite_api_key"):
             return
-        saved_token, saved_key, saved_at = load_kite_credentials(account)
+        saved_token, saved_key, saved_at = load_kite_credentials()
         if saved_token and saved_key:
             if is_token_expired(saved_at):
-                clear_kite_credentials(account)
-                st.info(f"Saved Kite credentials ({account}) have expired. Please login again.")
+                clear_kite_credentials()
+                st.info("Saved Kite credentials have expired. Please login again.")
             else:
-                st.session_state[token_key] = saved_token
-                st.session_state[api_key_key] = saved_key
-                st.session_state[ts_key] = saved_at
-
-    def apply_active_account(account: str) -> None:
-        token_key = _account_session_key("kite_access_token", account)
-        api_key_key = _account_session_key("kite_api_key", account)
-        ts_key = _account_session_key("kite_token_timestamp", account)
-        access_token = st.session_state.get(token_key)
-        api_key = st.session_state.get(api_key_key)
-        if access_token and api_key:
-            st.session_state["kite_access_token"] = access_token
-            st.session_state["kite_api_key"] = api_key
-            st.session_state["kite_token_timestamp"] = st.session_state.get(ts_key)
-        else:
-            clear_kite_session_state()
+                st.session_state["kite_access_token"] = saved_token
+                st.session_state["kite_api_key"] = saved_key
+                st.session_state["kite_token_timestamp"] = saved_at
 
     # Load credentials from file if not in session
-    load_account_credentials(KITE_ACCOUNT_PRIMARY)
-    load_account_credentials(KITE_ACCOUNT_SECONDARY)
-    apply_active_account(st.session_state.get("kite_active_account", KITE_ACCOUNT_PRIMARY))
+    load_saved_credentials()
 
     # Ensure session tokens are still within TTL before rendering rest of the dashboard
     enforce_kite_token_ttl()
@@ -347,13 +286,8 @@ def render():
     if incoming_request_token and not st.session_state.kite_processing_token:
         st.session_state.kite_processing_token = True
 
-        account = st.session_state.get("kite_login_account", KITE_ACCOUNT_PRIMARY)
-        api_key = st.session_state.get(_account_session_key("kite_api_key_stored", account)) or os.getenv(
-            _account_env_key(account, "KITE_API_KEY")
-        )
-        api_secret = st.session_state.get(_account_session_key("kite_api_secret_stored", account)) or os.getenv(
-            _account_env_key(account, "KITE_API_SECRET")
-        )
+        api_key = st.session_state.get("kite_api_key_stored") or os.getenv("KITE_API_KEY")
+        api_secret = st.session_state.get("kite_api_secret_stored") or os.getenv("KITE_API_SECRET")
             
         if api_key and api_secret:
             try:
@@ -364,21 +298,17 @@ def render():
                     
                     if access_token:
                         token_timestamp = datetime.now(timezone.utc).isoformat()
-                        st.session_state[_account_session_key("kite_access_token", account)] = access_token
-                        st.session_state[_account_session_key("kite_api_key", account)] = api_key
-                        st.session_state[_account_session_key("kite_token_timestamp", account)] = token_timestamp
-                        if st.session_state.get("kite_active_account", KITE_ACCOUNT_PRIMARY) == account:
-                            st.session_state["kite_access_token"] = access_token
-                            st.session_state["kite_api_key"] = api_key
-                            st.session_state["kite_token_timestamp"] = token_timestamp
+                        st.session_state["kite_access_token"] = access_token
+                        st.session_state["kite_api_key"] = api_key
+                        st.session_state["kite_token_timestamp"] = token_timestamp
                         
                         # Save credentials to persistent file
-                        save_kite_credentials(access_token, api_key, token_timestamp, account=account)
+                        save_kite_credentials(access_token, api_key, token_timestamp)
                         
                         st.success("✅ Successfully logged in and saved credentials!")
                         
                         st.query_params.clear()
-                        st.session_state[_account_session_key("kite_login_initiated", account)] = False
+                        st.session_state["kite_login_initiated"] = False
                         st.session_state.kite_processing_token = False
                         st.rerun()
                     else:
@@ -442,26 +372,12 @@ def render():
             color: white !important;
             font-weight: 700 !important;
         }
-        .controls-marker, .content-marker { display: none; }
-        .controls-col {
-            background: #182131;
-            border: 1px solid #2a3548;
-            border-radius: 12px;
-            padding: 12px 16px;
-        }
-        .content-col {
-            background: #0e141f;
-            border: 1px solid #1e2836;
-            border-radius: 12px;
-            padding: 12px 16px;
-        }
         [data-testid="stSidebar"] {
             background: #14171f;
         }
         [data-testid="stSidebar"] > div:first-child {
-            padding-top: 58px;
+            padding-top: 12px;
         }
-        [data-testid="stSidebar"] { display: none; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -493,58 +409,52 @@ def render():
                     st.session_state["active_tab_key"] = selected_key
     active_key = st.session_state["active_tab_key"]
 
-    # Two-column layout: left controls, right content
-    controls_col, content_col = st.columns([1, 4], gap="large")
-    st.sidebar = controls_col
+    if active_key == "login":
+        render_login_tab()
+        return
 
-    with controls_col:
-        st.markdown("<div class='controls-marker'></div>", unsafe_allow_html=True)
-    with content_col:
-        st.markdown("<div class='content-marker'></div>", unsafe_allow_html=True)
+    kite_logged_in = bool(st.session_state.get("kite_access_token") and st.session_state.get("kite_api_key"))
+    if not kite_logged_in:
+        st.warning("Kite authentication required. Use the Login tab to connect before accessing the dashboard.")
+        st.info("🔒 Login with Kite to unlock this tab.")
+        return
 
-        if active_key == "login":
-            render_login_tab()
-            return
+    missing_derivative_cache = load_cached_derivatives_data_for_session()
+    if missing_derivative_cache:
+        missing_str = ", ".join(missing_derivative_cache)
+        st.info(
+            f"⚠️ Derivatives cache missing or expired for: {missing_str}. "
+            "Please load fresh data from the Derivatives Data tab."
+        )
 
-        kite_logged_in = bool(st.session_state.get("kite_access_token") and st.session_state.get("kite_api_key"))
-        if not kite_logged_in:
-            st.warning("Kite authentication required. Use the Login tab to connect before accessing the dashboard.")
-            st.info("🔒 Login with Kite to unlock this tab.")
-            return
-
-        missing_derivative_cache = load_cached_derivatives_data_for_session()
-        if missing_derivative_cache:
-            missing_str = ", ".join(missing_derivative_cache)
-            st.info(f"⚠️ Derivatives cache missing or expired for: {missing_str}. Please load fresh data from the Derivatives Data tab.")
-
-        if active_key == "portfolio":
-            render_portfolio_dashboard_tab()
-        elif active_key == "risk_analysis":
-            render_risk_analysis_tab()
-        elif active_key == "equities":
-            render_equities_tab()
-        elif active_key == "risk_buckets":
-            render_risk_buckets_tab()
-        elif active_key == "portfolio_buckets":
-            render_portfolio_buckets_tab()
-        elif active_key == "market_regime":
-            render_market_regime_tab()
-        elif active_key == "stress_testing":
-            render_stress_testing_tab()
-        elif active_key == "diagnostics":
-            render_diagnostics_tab()
-        elif active_key == "hedge_lab":
-            render_hedge_lab_tab()
-        elif active_key == "historical":
-            render_historical_performance_tab()
-        elif active_key == "greeks_debug":
-            render_greeks_debug_tab()
-        elif active_key == "product_overview":
-            render_product_overview_tab()
-        elif active_key == "derivatives_data":
-            render_derivatives_data_tab()
-        elif active_key == "trade_selector":
-            render_trade_selector_tab()
+    if active_key == "portfolio":
+        render_portfolio_dashboard_tab()
+    elif active_key == "risk_analysis":
+        render_risk_analysis_tab()
+    elif active_key == "equities":
+        render_equities_tab()
+    elif active_key == "risk_buckets":
+        render_risk_buckets_tab()
+    elif active_key == "portfolio_buckets":
+        render_portfolio_buckets_tab()
+    elif active_key == "market_regime":
+        render_market_regime_tab()
+    elif active_key == "stress_testing":
+        render_stress_testing_tab()
+    elif active_key == "diagnostics":
+        render_diagnostics_tab()
+    elif active_key == "hedge_lab":
+        render_hedge_lab_tab()
+    elif active_key == "historical":
+        render_historical_performance_tab()
+    elif active_key == "greeks_debug":
+        render_greeks_debug_tab()
+    elif active_key == "product_overview":
+        render_product_overview_tab()
+    elif active_key == "derivatives_data":
+        render_derivatives_data_tab()
+    elif active_key == "trade_selector":
+        render_trade_selector_tab()
 
     # markers are hidden via CSS; no closing tags required
     st.markdown(
