@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -47,8 +48,17 @@ def _get_kite_client() -> Optional["KiteConnect"]:
         return None
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=259200)
 def _fetch_holdings(api_key: str, access_token: str) -> List[Dict[str, object]]:
+    if KiteConnect is None:
+        return []
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+    data = kite.holdings()
+    return data or []
+
+
+def _fetch_holdings_fresh(api_key: str, access_token: str) -> List[Dict[str, object]]:
     if KiteConnect is None:
         return []
     kite = KiteConnect(api_key=api_key)
@@ -90,20 +100,22 @@ def _compute_drawdown_from_peak(
         return None, "N/A (Kite history unavailable)"
 
     entry_date = pos.get("entry_date")
-    to_date = datetime.now()
+    # Use date-level boundaries so cache keys stay stable within a day.
+    today = datetime.now().date()
     if entry_date:
         try:
-            from_date = pd.to_datetime(entry_date)
+            from_date = pd.to_datetime(entry_date).date()
         except Exception:
-            from_date = to_date - timedelta(days=int(lookback_days))
+            from_date = today - timedelta(days=int(lookback_days))
     else:
-        from_date = to_date - timedelta(days=int(lookback_days))
+        from_date = today - timedelta(days=int(lookback_days))
+    to_date = today
 
     try:
         df = _fetch_history(
             int(instrument_token),
-            from_date,
-            to_date,
+            datetime.combine(from_date, datetime.min.time()),
+            datetime.combine(to_date, datetime.min.time()),
             st.session_state.get("kite_api_key", ""),
             st.session_state.get("kite_access_token", ""),
         )
@@ -136,14 +148,15 @@ def _compute_time_under_water_days(
     if kite is None:
         return None, False, "N/A (Kite history unavailable)"
 
-    to_date = datetime.now()
-    from_date = to_date - timedelta(days=int(lookback_days))
+    today = datetime.now().date()
+    to_date = today
+    from_date = today - timedelta(days=int(lookback_days))
 
     try:
         df = _fetch_history(
             int(instrument_token),
-            from_date,
-            to_date,
+            datetime.combine(from_date, datetime.min.time()),
+            datetime.combine(to_date, datetime.min.time()),
             st.session_state.get("kite_api_key", ""),
             st.session_state.get("kite_access_token", ""),
         )
@@ -164,6 +177,33 @@ def _compute_time_under_water_days(
         return f">{lookback_days}d", True, None
     last_breakeven = breakeven["date"].max()
     return (last_date - last_breakeven).days, False, None
+
+
+def _render_bar_chart(data: pd.Series, height: int = 300, y_title: Optional[str] = None) -> None:
+    if data is None or data.empty:
+        st.info("No data available.")
+        return
+    df = data.reset_index()
+    df.columns = ["name", "value"]
+    chart = (
+        alt.Chart(df)
+        .mark_bar(color="#4FBFD6", opacity=0.85)
+        .encode(
+            x=alt.X("name:N", title=None),
+            y=alt.Y("value:Q", title=y_title),
+            tooltip=[alt.Tooltip("name:N", title="Name"), alt.Tooltip("value:Q", title="Value", format=",.2f")],
+        )
+        .properties(height=height)
+        .configure_axis(
+            labelColor="#B0B0B0",
+            titleColor="#DDD",
+            gridColor="#2A2A2A",
+            tickColor="#444",
+            domainColor="#444",
+        )
+        .configure_view(strokeOpacity=0)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 
 def _scenario_probabilities(lookback_days: int) -> Dict[str, float]:
@@ -226,18 +266,42 @@ def _compute_equity_es99_per_symbol(
 
 
 def render_equities_tab() -> None:
-    st.markdown("## Equities")
+
+    st.session_state.setdefault("equities_loaded", False)
+    st.session_state.setdefault("equities_holdings", None)
 
     api_key = st.session_state.get("kite_api_key")
     access_token = st.session_state.get("kite_access_token")
+    
+    # Sidebar buttons to load holdings
+    col_a, col_b = st.sidebar.columns(2)
+    load_cached = col_a.button("📦 Load Cache", key="equities_load_cached", type="secondary", use_container_width=True)
+    load_fresh = col_b.button("🔄 Load Fresh", key="equities_load_fresh", type="primary", use_container_width=True)
+    if load_cached or load_fresh:
+        if not api_key or not access_token or KiteConnect is None:
+            st.error("Kite not connected. Please login first.")
+        else:
+            try:
+                if load_fresh:
+                    _fetch_holdings.clear()
+                    holdings = _fetch_holdings_fresh(api_key, access_token)
+                    _fetch_holdings(api_key, access_token)
+                else:
+                    holdings = _fetch_holdings(api_key, access_token)
+                st.session_state["equities_holdings"] = holdings
+                st.session_state["equities_loaded"] = True
+            except Exception as e:
+                st.error(f"Failed to fetch holdings: {e}")
+    
     if not api_key or not access_token or KiteConnect is None:
-        st.info("Kite not connected. Login to load equity holdings.")
+        st.info("Kite not connected. Use the sidebar button to load equity holdings.")
         return
 
-    try:
-        holdings = _fetch_holdings(api_key, access_token)
-    except Exception:
-        holdings = []
+    if not st.session_state.get("equities_loaded"):
+        st.info('Click "📊 Fetch Latest Positions" in the sidebar to load equity holdings.')
+        return
+
+    holdings = st.session_state.get("equities_holdings") or []
     equities = [p for p in holdings if _is_equity_cash(p)] if holdings else []
     if not equities:
         st.info("No equity holdings found.")
@@ -494,6 +558,7 @@ def render_equities_tab() -> None:
         use_container_width=True,
         hide_index=True,
         column_config={
+            "symbol": st.column_config.TextColumn("Symbol", pinned=True),
             "return_vs_cost_pct": st.column_config.TextColumn("Return vs Cost (%)"),
             "drawdown_pct": st.column_config.TextColumn(
                 "Drawdown from Peak (%)",
@@ -501,19 +566,18 @@ def render_equities_tab() -> None:
             ),
         },
         column_order=display_cols,
-        column_config_overrides={"symbol": st.column_config.TextColumn("Symbol", pinned=True)},
     )
 
     st.markdown("### Scenario Comparison (Sleeve Stress Loss)")
-    st.bar_chart(shock_losses)
+    _render_bar_chart(shock_losses)
 
     st.markdown("### Allocation by Holding")
     alloc_series = df.set_index("symbol")["market_value"].sort_values(ascending=False).head(10)
-    st.bar_chart(alloc_series)
+    _render_bar_chart(alloc_series)
 
     st.markdown("### Top Stress Contributors (Current Shock)")
     top_stress = df.set_index("symbol")["stress_loss"].sort_values().head(10)
-    st.bar_chart(top_stress)
+    _render_bar_chart(top_stress)
 
     st.markdown("### Risk Concentration KPIs")
     top1_pct = (alloc_series.iloc[0] / equity_value * 100.0) if not alloc_series.empty and equity_value else 0.0
@@ -532,4 +596,4 @@ def render_equities_tab() -> None:
         st.markdown("### ES99 Contribution by Holding")
         es99_series = df.set_index("symbol")["es99_inr"].dropna().sort_values(ascending=False).head(10)
         if not es99_series.empty:
-            st.bar_chart(es99_series)
+            _render_bar_chart(es99_series)

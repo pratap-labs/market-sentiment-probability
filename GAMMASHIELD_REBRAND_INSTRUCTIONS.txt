@@ -1,0 +1,84 @@
+TASK: Transform Streamlit Dashboard to GammaShield Brand
+
+OBJECTIVE:
+Rebrand existing options risk management dashboard as "GammaShield - Advanced Options Risk Engine" with institutional fintech design.
+
+WHAT'S ALREADY DONE:
+- Created /assets/gammashield.css with complete institutional theme
+- Dark navy background (#070A12)
+- Steel/silver borders (#1F2A3D)
+- Gamma blue accent (#2D7DFF)
+- Styled navigation buttons, metric cards, tables, forms, alerts, typography, scrollbars
+- All CSS variables defined and ready
+
+WHAT NEEDS TO BE DONE:
+
+STEP 1: Inject CSS Loading in app.py
+
+File: app.py
+Location: Inside render() function, after line 164 (st.set_page_config)
+Insert this code between st.set_page_config(layout="wide") and the existing st.markdown with <style> tag:
+
+    # Load GammaShield institutional theme
+    try:
+        with open("assets/gammashield.css") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+    except FileNotFoundError:
+        pass  # Fallback to default styling
+    
+    # GammaShield branding header
+    st.markdown(
+        """
+        <div style="text-align: center; padding: 1.5rem 0 1rem 0; border-bottom: 1px solid var(--gs-border, #1F2A3D); margin-bottom: 1.5rem;">
+            <h1 style="font-size: 2.5rem; font-weight: 800; margin: 0; background: linear-gradient(135deg, #2D7DFF 0%, #1B4FD8 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; letter-spacing: -0.03em;">
+                🛡️ GammaShield
+            </h1>
+            <p style="font-size: 0.95rem; color: var(--gs-muted, #A9B7D0); margin: 0.5rem 0 0 0; font-weight: 500; letter-spacing: 0.05em;">
+                Advanced Options Risk Engine
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+STEP 2: Update Risk Buckets tab label (optional)
+
+File: app.py
+Location: Around line 328 in the tabs array
+Change: {"key": "risk_buckets", "label": "Risk Buckets (50/30/20)"}
+To: {"key": "risk_buckets", "label": "🛡️ Risk Buckets (50/30/20)"}
+
+CRITICAL CONSTRAINTS:
+- Do NOT change app structure
+- Do NOT modify tab routing logic or render functions
+- Do NOT change business logic, Kite auth, or calculations
+- Do NOT move navigation to sidebar
+- Keep existing top navigation bar
+- ONLY apply visual styling and branding
+
+EXPECTED RESULT:
+1. Dark institutional navy background
+2. GammaShield branded header at top
+3. Gamma blue gradient on active nav buttons
+4. Styled metric cards with borders
+5. Professional tables with sticky headers
+6. Consistent steel/silver color scheme
+7. Bloomberg-grade visual polish
+
+VERIFICATION:
+Run: streamlit run app.py --server.port 5174
+
+Check:
+- Dark navy background loads
+- GammaShield header appears at top
+- Navigation buttons have institutional styling
+- Active tab shows blue gradient
+- Metric cards have dark backgrounds with borders
+- Tables have sticky headers and hover effects
+- All text is readable with proper contrast
+
+ROLLBACK (if needed):
+If issues occur:
+1. Remove the injected code from app.py (lines added after st.set_page_config)
+2. Or delete/rename assets/gammashield.css
+3. Restart Streamlit

@@ -41,7 +41,6 @@ def clear_kite_credentials():
 
 def render_login_tab():
     """Render the login tab."""
-    st.subheader("Login")
 
     load_env_file(Path(ROOT) / ".env")
     if not st.session_state.get("kite_api_key_stored") and os.getenv("KITE_API_KEY"):

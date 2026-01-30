@@ -1,4 +1,4 @@
-"""Manual stress testing tab for evaluating positions before execution."""
+"""Pre-Trade Analysis tab combining stress testing and trade selection."""
 
 from __future__ import annotations
 
@@ -479,9 +479,10 @@ def _repriced_position_audit(
     return pd.DataFrame(rows)
 
 
-def render_stress_testing_tab():
-    """Render manual stress testing UI."""
-    st.header("📊 Stress Testing - Analyze Positions Before Entry")
+def render_pre_trade_analysis_tab():
+    """Render pre-trade stress testing analysis."""
+    st.header("🔬 Pre-Trade Analysis")
+    st.markdown("### Analyze Positions Before Entry")
 
     if st.sidebar.button("🧹 Reset Derivatives Cache", key="stress_reset_cache"):
         st.session_state.pop("options_df_cache", None)

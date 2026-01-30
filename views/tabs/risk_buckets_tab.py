@@ -34,11 +34,20 @@ from views.tabs.risk_analysis_tab import (
     DEFAULT_ES99_LIMIT,
     DEFAULT_THRESHOLD_NORMAL_SHARE,
     DEFAULT_THRESHOLD_STRESS_SHARE,
+    BUCKET_DEFINITIONS,
     compute_historical_bucket_probabilities,
     get_iv_regime,
+    classify_zone,
+    _build_bucket_history,
+    _load_cache_silent,
 )
 from views.tabs import risk_analysis_tab as ra_tab
 from scripts.utils.stress_testing import Scenario
+from scripts.utils import classify_history_bucket
+from collections import Counter
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 
 BUCKET_ORDER = ["Low", "Med", "High"]
@@ -85,7 +94,7 @@ def _init_tba_state() -> None:
     st.session_state.setdefault("tba_trade_group_name", "")
     st.session_state.setdefault("tba_trade_group_selection", [])
     st.session_state.setdefault("tba_clear_trade_group", False)
-    st.session_state.setdefault("tba_use_saved_groups", False)
+    st.session_state.setdefault("tba_use_saved_groups", bool(st.session_state.get("tba_saved_trades")))
 
 
 def _saved_groups_path() -> Path:
@@ -1750,8 +1759,6 @@ def _render_simulation(
 def render_risk_buckets_tab() -> None:
     _init_tba_state()
     _sync_total_capital_from_account()
-
-    st.markdown("## TBA — Institutional Risk View")
     
     # Sync positions button
     if st.sidebar.button("🔄 Sync Positions", key="risk_buckets_sync_positions", help="Fetch latest positions from Kite", use_container_width=True, type="primary"):
@@ -1808,9 +1815,10 @@ def render_risk_buckets_tab() -> None:
         st.caption("Note: Scenario analysis (±2%, ±3.5% shocks) is always included")
 
     saved_groups = st.session_state.get("tba_saved_trades", [])
-    use_saved = st.session_state.get("tba_use_saved_groups", False)
+    use_saved = bool(saved_groups)
+    st.session_state["tba_use_saved_groups"] = use_saved
     trades = build_trades_using_existing_grouping(positions)
-    if use_saved and saved_groups:
+    if use_saved:
         trades += build_trades_from_saved_groups(positions, saved_groups)
     trades_df, legs_by_trade = compute_trade_risk(trades, float(total_capital), lookback_days=504)
 
@@ -1826,62 +1834,17 @@ def render_risk_buckets_tab() -> None:
     )
 
     with subtab1:
-        st.markdown("### Portfolio ES99")
+        st.markdown("## 📊 Portfolio-Level Risk Analysis")
+        st.markdown("---")
+        
+        # ========== LAYER 1: FORWARD SIMULATION ==========
+        st.markdown("### 🎲 Forward 10-Day Risk/Return Simulation")
+        
         portfolio_es_pct, portfolio_es_inr = _compute_portfolio_es99(positions, float(total_capital), 504)
         if portfolio_es_inr == 0:
             portfolio_es_inr = aggregate_portfolio(trades_df)["portfolio_es99_inr"]
         portfolio_es_pct = (portfolio_es_inr / total_capital * 100.0) if total_capital else 0.0
         
-        # Display portfolio metrics
-        col1, col2 = st.columns(2)
-        with col1:
-            st.metric("Portfolio ES99", f"{portfolio_es_pct:.2f}%", format_inr(portfolio_es_inr))
-        with col2:
-            margin_used = st.session_state.get("margin_used")
-            if margin_used is not None:
-                margin_pct = (float(margin_used) / total_capital * 100.0) if total_capital else 0.0
-                st.metric("Margin Used", f"{margin_pct:.1f}%", format_inr(margin_used))
-        
-        if portfolio_es_pct > portfolio_es_limit:
-            st.error("Portfolio kill switch: RED")
-        else:
-            st.success("Portfolio kill switch: OK")
-
-        agg = aggregate_portfolio(trades_df)
-        
-        # ES99 charts in 2 columns
-        chart_col1, chart_col2 = st.columns(2)
-        with chart_col1:
-            st.markdown("### Top ES99 Contributors (Underlying)")
-            data = agg["by_underlying"].head(10).reset_index()
-            data.columns = ['name', 'value']
-            chart = alt.Chart(data).mark_bar(size=50).encode(
-                x=alt.X('name:N', title=None),
-                y=alt.Y('value:Q', title=None)
-            ).properties(height=300)
-            st.altair_chart(chart, use_container_width=True)
-        with chart_col2:
-            st.markdown("### ES99 by Bucket")
-            data = agg["by_bucket"].reset_index()
-            data.columns = ['name', 'value']
-            chart = alt.Chart(data).mark_bar(size=50).encode(
-                x=alt.X('name:N', title=None),
-                y=alt.Y('value:Q', title=None)
-            ).properties(height=300)
-            st.altair_chart(chart, use_container_width=True)
-        
-        # Trade week table below
-        st.markdown("### Top ES99 Contributors (Trade Week)")
-        top_trades = (
-            trades_df.groupby(["underlying", "week_id", "option_side"])["trade_es99_inr"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(5)
-            .reset_index()
-        )
-        st.dataframe(top_trades, use_container_width=True, hide_index=True)
-
-        st.markdown("### Forward 10-Day Risk/Return")
         gate_config = _render_gate_settings("portfolio_gates")
         sim_cfg = SimulationConfig(
             horizon_days=int(st.session_state.get("tba_sim_days")),
@@ -1914,6 +1877,342 @@ def render_risk_buckets_tab() -> None:
             es_limit_pct=float(portfolio_es_limit),
             title="Scenario Table (with calibrated probabilities)",
         )
+        
+        st.markdown("---")
+        
+        # ========== LAYER 2: ES99 AT PORTFOLIO LEVEL ==========
+        st.markdown("### 📉 Portfolio ES99 Metrics")
+        
+        # Display portfolio metrics
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Portfolio ES99", f"{portfolio_es_pct:.2f}%", format_inr(portfolio_es_inr))
+        with col2:
+            margin_used = st.session_state.get("margin_used")
+            if margin_used is not None:
+                margin_pct = (float(margin_used) / total_capital * 100.0) if total_capital else 0.0
+                st.metric("Margin Used", f"{margin_pct:.1f}%", format_inr(margin_used))
+        
+        if portfolio_es_pct > portfolio_es_limit:
+            st.error("Portfolio kill switch: RED")
+        else:
+            st.success("Portfolio kill switch: OK")
+
+        agg = aggregate_portfolio(trades_df)
+        
+        # ES99 charts in 2 columns
+        chart_col1, chart_col2 = st.columns(2)
+        with chart_col1:
+            st.markdown("#### Top ES99 Contributors (Underlying)")
+            data = agg["by_underlying"].head(10).reset_index()
+            data.columns = ['name', 'value']
+            chart = alt.Chart(data).mark_bar(size=50, color="#4FBFD6", opacity=0.85).encode(
+                x=alt.X('name:N', title=None),
+                y=alt.Y('value:Q', title=None)
+            ).properties(height=300).configure_axis(
+                labelColor="#B0B0B0",
+                titleColor="#DDD",
+                gridColor="#2A2A2A",
+                tickColor="#444",
+                domainColor="#444",
+            ).configure_view(strokeOpacity=0)
+            st.altair_chart(chart, use_container_width=True)
+        with chart_col2:
+            st.markdown("#### ES99 by Bucket")
+            data = agg["by_bucket"].reset_index()
+            data.columns = ['name', 'value']
+            chart = alt.Chart(data).mark_bar(size=50, color="#4FBFD6", opacity=0.85).encode(
+                x=alt.X('name:N', title=None),
+                y=alt.Y('value:Q', title=None)
+            ).properties(height=300).configure_axis(
+                labelColor="#B0B0B0",
+                titleColor="#DDD",
+                gridColor="#2A2A2A",
+                tickColor="#444",
+                domainColor="#444",
+            ).configure_view(strokeOpacity=0)
+            st.altair_chart(chart, use_container_width=True)
+        
+        # Trade week table below
+        st.markdown("#### Top ES99 Contributors (Trade Week)")
+        top_trades = (
+            trades_df.groupby(["underlying", "week_id", "option_side"])["trade_es99_inr"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(5)
+            .reset_index()
+        )
+        st.dataframe(top_trades, use_container_width=True, hide_index=True)
+        
+        st.markdown("---")
+        
+        # ========== LAYER 3: GREEK-BASED ZONE ANALYSIS ==========
+        st.markdown("### 🧭 Greek-Based Zone Analysis")
+        
+        # Calculate IV percentile and regime
+        iv_percentile = 30  # Default
+        options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
+        if not options_df_cache.empty and "iv" in options_df_cache.columns:
+            current_iv = options_df_cache["iv"].median()
+            iv_percentile = 35
+        
+        iv_regime, iv_color = get_iv_regime(iv_percentile)
+        st.markdown(f"**Current Volatility Regime:** {iv_color} **{iv_regime}** (IV Percentile: {iv_percentile:.0f})")
+        
+        # Get portfolio greeks
+        portfolio_greeks = calculate_portfolio_greeks(positions)
+        current_spot = st.session_state.get("current_spot", 25000)
+        
+        total_theta = portfolio_greeks["net_theta"]
+        total_delta = portfolio_greeks["net_delta"]
+        total_gamma = portfolio_greeks["net_gamma"]
+        total_vega = portfolio_greeks["net_vega"]
+        
+        # Normalize greeks per ₹1L
+        capital_in_lakhs = total_capital / 100000
+        theta_norm = abs(total_theta) / capital_in_lakhs if capital_in_lakhs > 0 else 0
+        gamma_norm = total_gamma / capital_in_lakhs if capital_in_lakhs > 0 else 0
+        vega_norm = total_vega / capital_in_lakhs if capital_in_lakhs > 0 else 0
+        
+        # Classify zone
+        zone_num, zone_name, zone_color_emoji, zone_message = classify_zone(
+            theta_norm, gamma_norm, vega_norm, iv_regime
+        )
+        
+        st.metric("Account Size", f"₹{capital_in_lakhs:.2f}L")
+        
+        # Define zone ranges
+        zone1_ranges = {
+            "Theta": (120, 180),
+            "Gamma": (0, -0.020),
+            "Vega (Low IV)": (0, -200),
+            "Vega (Mid IV)": (-200, -450),
+            "Vega (High IV)": (-450, -700)
+        }
+        zone2_ranges = {
+            "Theta": (180, 220),
+            "Gamma": (-0.020, -0.035),
+            "Vega (Low IV)": (0, -350),
+            "Vega (Mid IV)": (-350, -650),
+            "Vega (High IV)": (-650, -900)
+        }
+        zone3_ranges = {
+            "Theta": (220, 300),
+            "Gamma": (-0.035, -0.055),
+            "Vega (Low IV)": (None, None),
+            "Vega (Mid IV)": (-650, -1000),
+            "Vega (High IV)": (-1000, -1300)
+        }
+        
+        vega_key = f"Vega ({iv_regime})"
+        
+        # Helper function to get color
+        def get_greek_color(value, greek_name):
+            if greek_name == "Theta":
+                z1, z2, z3 = zone1_ranges["Theta"], zone2_ranges["Theta"], zone3_ranges["Theta"]
+                if z1[0] <= value <= z1[1]:
+                    return "🟢", "Zone 1"
+                elif z2[0] <= value <= z2[1]:
+                    return "🟡", "Zone 2"
+                elif z3[0] <= value <= z3[1]:
+                    return "🔴", "Zone 3"
+                else:
+                    return "⚠️", "Out of Bounds"
+            elif greek_name == "Gamma":
+                z1, z2, z3 = zone1_ranges["Gamma"], zone2_ranges["Gamma"], zone3_ranges["Gamma"]
+                if z1[1] <= value <= z1[0]:
+                    return "🟢", "Zone 1"
+                elif z2[1] <= value <= z2[0]:
+                    return "🟡", "Zone 2"
+                elif z3[1] <= value <= z3[0]:
+                    return "🔴", "Zone 3"
+                else:
+                    return "⚠️", "Out of Bounds"
+            elif greek_name == "Vega":
+                z1 = zone1_ranges[vega_key]
+                z2 = zone2_ranges[vega_key]
+                z3 = zone3_ranges[vega_key]
+                if z1[1] <= value <= z1[0]:
+                    return "🟢", "Zone 1"
+                elif z2[1] <= value <= z2[0]:
+                    return "🟡", "Zone 2"
+                elif z3[0] is not None and z3[1] <= value <= z3[0]:
+                    return "🔴", "Zone 3"
+                else:
+                    return "⚠️", "Out of Bounds"
+            return "⚪", "Unknown"
+        
+        theta_color, theta_zone = get_greek_color(theta_norm, "Theta")
+        gamma_color, gamma_zone = get_greek_color(gamma_norm, "Gamma")
+        vega_color, vega_zone = get_greek_color(vega_norm, "Vega")
+        
+        theta_pct = theta_norm / 1000 if capital_in_lakhs > 0 else 0
+        vega_pct = abs(vega_norm) / 1000 if capital_in_lakhs > 0 else 0
+        
+        greeks_comparison_df = pd.DataFrame({
+            "Greek": ["Theta/Day", "Gamma", f"Vega ({iv_regime})"],
+            "Zone 1 Range": [
+                f"₹{zone1_ranges['Theta'][0]} – ₹{zone1_ranges['Theta'][1]}",
+                f"{zone1_ranges['Gamma'][1]:.3f} to {zone1_ranges['Gamma'][0]:.3f}",
+                f"₹{zone1_ranges[vega_key][1]} to ₹{zone1_ranges[vega_key][0]}"
+            ],
+            "Zone 2 Range": [
+                f"₹{zone2_ranges['Theta'][0]} – ₹{zone2_ranges['Theta'][1]}",
+                f"{zone2_ranges['Gamma'][1]:.3f} to {zone2_ranges['Gamma'][0]:.3f}",
+                f"₹{zone2_ranges[vega_key][1]} to ₹{zone2_ranges[vega_key][0]}"
+            ],
+            "Zone 3 Range": [
+                f"₹{zone3_ranges['Theta'][0]} – ₹{zone3_ranges['Theta'][1]}",
+                f"{zone3_ranges['Gamma'][1]:.3f} to {zone3_ranges['Gamma'][0]:.3f}",
+                "❌ AVOID" if zone3_ranges[vega_key][0] is None else f"₹{zone3_ranges[vega_key][1]} to ₹{zone3_ranges[vega_key][0]}"
+            ],
+            "Current Value (per ₹1L)": [
+                f"₹{theta_norm:.0f} ({theta_pct:.2f}%/day)",
+                f"{gamma_norm:.4f}",
+                f"₹{vega_norm:.0f} ({vega_pct:.2f}% per IV pt)"
+            ],
+            "Status": [
+                f"{theta_color} {theta_zone}",
+                f"{gamma_color} {gamma_zone}",
+                f"{vega_color} {vega_zone}"
+            ]
+        })
+        
+        st.dataframe(
+            greeks_comparison_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Greek": st.column_config.TextColumn("Greek", width="medium"),
+                "Zone 1 Range": st.column_config.TextColumn("🟢 Zone 1", width="medium"),
+                "Zone 2 Range": st.column_config.TextColumn("🟡 Zone 2", width="medium"),
+                "Zone 3 Range": st.column_config.TextColumn("🔴 Zone 3", width="medium"),
+                "Current Value (per ₹1L)": st.column_config.TextColumn("Current", width="medium"),
+                "Status": st.column_config.TextColumn("Status", width="medium")
+            }
+        )
+        
+        # Display zone classification
+        st.markdown(f"#### {zone_color_emoji} ZONE {zone_num} — {zone_name}")
+        if zone_num == 0:
+            st.error(zone_message)
+        elif zone_num == 1:
+            st.success(zone_message)
+        elif zone_num == 2:
+            st.warning(zone_message)
+        elif zone_num == 3:
+            st.error(zone_message)
+        
+        st.markdown("---")
+        
+        # ========== BUCKET DEFINITIONS ==========
+        st.markdown("### 📋 Bucket Definitions")
+        st.dataframe(pd.DataFrame(BUCKET_DEFINITIONS), use_container_width=True, hide_index=True)
+        
+        # ========== BUCKET PROBABILITIES & NIFTY HISTORY ==========
+        st.markdown("### 📊 Historical Bucket Analysis")
+        
+        lookback_days = 504
+        bucket_probs, history_count, used_fallback = compute_historical_bucket_probabilities(
+            lookback_days, False, 126
+        )
+        
+        prob_cols = st.columns(6)
+        prob_cols[0].metric("Lookback", f"{history_count}d")
+        prob_cols[1].metric("Bucket A", f"{bucket_probs['A']*100:.1f}%")
+        prob_cols[2].metric("Bucket B", f"{bucket_probs['B']*100:.1f}%")
+        prob_cols[3].metric("Bucket C", f"{bucket_probs['C']*100:.1f}%")
+        prob_cols[4].metric("Bucket D", f"{bucket_probs['D']*100:.1f}%")
+        prob_cols[5].metric("Bucket E", f"{bucket_probs['E']*100:.1f}%")
+        
+        bucket_colors = {
+            "A": "#2ca02c",
+            "B": "#98df8a",
+            "C": "#ffbf00",
+            "D": "#ff7f0e",
+            "E": "#d62728",
+        }
+        
+        history_df = _build_bucket_history(lookback_days)
+        if not history_df.empty:
+            st.markdown("#### NIFTY Lookback Bucket Map")
+            drift_pct = history_df["returnPct"] * 100
+            bins = [-10, -9, -8, -7, -6, -5, -4, -3, -2, -1, -0.5, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+            labels = [
+                "-10 to -9", "-9 to -8", "-8 to -7", "-7 to -6", "-6 to -5",
+                "-5 to -4", "-4 to -3", "-3 to -2", "-2 to -1", "-1 to -0.5",
+                "-0.5 to 0.5",
+                "0.5 to 1", "1 to 2", "2 to 3", "3 to 4", "4 to 5",
+                "5 to 6", "6 to 7", "7 to 8", "8 to 9", "9 to 10",
+            ]
+            drift_bins = pd.cut(drift_pct, bins=bins, labels=labels, include_lowest=True)
+            drift_counts = drift_bins.value_counts().reindex(labels, fill_value=0)
+            drift_df = drift_counts.rename_axis("Drift (%)").reset_index(name="Count")
+            bin_midpoints = []
+            for label in drift_df["Drift (%)"]:
+                parts = str(label).replace("to", "").split()
+                try:
+                    low = float(parts[0])
+                    high = float(parts[1])
+                    bin_midpoints.append((low + high) / 2.0)
+                except Exception:
+                    bin_midpoints.append(0.0)
+            drift_df["bucket"] = [
+                classify_history_bucket(mid / 100.0, 0.0) for mid in bin_midpoints
+            ]
+            count_chart = px.bar(
+                drift_df,
+                x="Drift (%)",
+                y="Count",
+                title="Raw Drift Counts (Lookback)",
+                labels={"Count": "Days"},
+                text="Count",
+                color="bucket",
+                color_discrete_map=bucket_colors,
+            )
+            count_chart.update_traces(textposition="outside")
+            count_chart.update_layout(
+                xaxis_tickangle=-45,
+                xaxis=dict(categoryorder="array", categoryarray=labels),
+            )
+            st.plotly_chart(
+                count_chart,
+                use_container_width=True,
+                key="portfolio_bucket_drift_chart",
+            )
+            
+            st.markdown("#### NIFTY OHLC with Bucket Classification")
+            ohlc_fig = make_subplots(rows=1, cols=1)
+            for bucket, color in bucket_colors.items():
+                subset = history_df[history_df["bucket"] == bucket]
+                if subset.empty:
+                    continue
+                ohlc_fig.add_trace(
+                    go.Candlestick(
+                        x=subset["date"],
+                        open=subset["open"],
+                        high=subset["high"],
+                        low=subset["low"],
+                        close=subset["close"],
+                        name=f"Bucket {bucket}",
+                        increasing_line_color=color,
+                        decreasing_line_color=color,
+                    )
+                )
+            ohlc_fig.update_layout(
+                title="NIFTY OHLC with Bucket Classification",
+                showlegend=True,
+                xaxis_rangeslider_visible=True,
+                dragmode="pan",
+                height=500,
+            )
+            st.plotly_chart(
+                ohlc_fig,
+                use_container_width=True,
+                key="portfolio_bucket_ohlc_chart",
+            )
+        else:
+            st.info("No NIFTY history available to render bucket distribution.")
 
     with subtab2:
         with controls.expander("Bucket Controls", expanded=False):
@@ -1946,6 +2245,67 @@ def render_risk_buckets_tab() -> None:
             > st.session_state.get(f"tba_bucket_es_limit_{b.lower()}", 0.0)
             else "OK"
         )
+        
+        # ========== BUCKET STATUS CARDS ==========
+        st.markdown("### 📊 Bucket Status Overview")
+        status_cols = st.columns(3)
+        
+        for idx, bucket_name in enumerate(["Low", "Med", "High"]):
+            bucket_key = bucket_name.lower()
+            bucket_row = bucket_df[bucket_df["bucket"] == bucket_name.capitalize()]
+            
+            if bucket_row.empty:
+                continue
+                
+            bucket_data = bucket_row.iloc[0]
+            bucket_target_pct = allocations[bucket_key]
+            bucket_target_capital = total_capital * (bucket_target_pct / 100.0)
+            bucket_actual_capital = bucket_data["actual_allocated_capital"]
+            bucket_es99_inr = bucket_data["bucket_es99_inr"]
+            bucket_es99_pct = bucket_data["bucket_es99_pct_of_bucket_capital"]
+            bucket_es99_limit = bucket_limits[bucket_key]
+            bucket_kill_switch = bucket_data["kill_switch"]
+            
+            with status_cols[idx]:
+                st.subheader(f"🔹 {bucket_name} Bucket")
+                
+                # Capital usage metric
+                capital_delta = bucket_actual_capital - bucket_target_capital
+                st.metric(
+                    "Capital Usage",
+                    format_inr(bucket_actual_capital),
+                    delta=format_inr(capital_delta) if capital_delta != 0 else None,
+                    delta_color="inverse"
+                )
+                st.caption(f"Target: {bucket_target_pct:.0f}% | {format_inr(bucket_target_capital)}")
+                
+                # ES99 metric
+                es99_delta_pct = bucket_es99_pct - bucket_es99_limit
+                st.metric(
+                    "ES99",
+                    f"{bucket_es99_pct:.1f}% | {format_inr(bucket_es99_inr)}",
+                    delta=f"{es99_delta_pct:+.1f}%" if abs(es99_delta_pct) > 0.1 else None,
+                    delta_color="inverse"
+                )
+                st.caption(f"Limit: {bucket_es99_limit:.1f}%")
+                
+                # Kill switch status
+                if bucket_kill_switch == "RED":
+                    st.error("🔴 Kill Switch: RED")
+                else:
+                    st.success("🟢 Kill Switch: OK")
+                
+                # Over allocation warning
+                if bucket_actual_capital > bucket_target_capital * 1.1:
+                    st.warning("⚠️ Over target by >10%")
+        
+        # Unallocated capital
+        total_actual_capital = bucket_df["actual_allocated_capital"].sum()
+        unallocated_capital = max(total_capital - total_actual_capital, 0.0)
+        unallocated_pct = (unallocated_capital / total_capital * 100.0) if total_capital else 0.0
+        st.caption(f"💰 Unallocated Capital: {format_inr(unallocated_capital)} ({unallocated_pct:.1f}%)")
+        
+        st.markdown("---")
         
         # Table 1: Bucket Sizing (Capital Allocation)
         st.markdown("### Bucket Sizing - Capital Allocation")
@@ -1981,19 +2341,31 @@ def render_risk_buckets_tab() -> None:
             st.markdown("### Bucket ES99")
             data = bucket_df.set_index("bucket")["bucket_es99_inr"].reset_index()
             data.columns = ['name', 'value']
-            chart = alt.Chart(data).mark_bar(size=50).encode(
+            chart = alt.Chart(data).mark_bar(size=50, color="#4FBFD6", opacity=0.85).encode(
                 x=alt.X('name:N', title=None),
                 y=alt.Y('value:Q', title=None)
-            ).properties(height=300)
+            ).properties(height=300).configure_axis(
+                labelColor="#B0B0B0",
+                titleColor="#DDD",
+                gridColor="#2A2A2A",
+                tickColor="#444",
+                domainColor="#444",
+            ).configure_view(strokeOpacity=0)
             st.altair_chart(chart, use_container_width=True)
         with bucket_chart_col2:
             st.markdown("### Bucket Trades")
             data = bucket_df.set_index("bucket")["trades"].reset_index()
             data.columns = ['name', 'value']
-            chart = alt.Chart(data).mark_bar(size=50).encode(
+            chart = alt.Chart(data).mark_bar(size=50, color="#4FBFD6", opacity=0.85).encode(
                 x=alt.X('name:N', title=None),
                 y=alt.Y('value:Q', title=None)
-            ).properties(height=300)
+            ).properties(height=300).configure_axis(
+                labelColor="#B0B0B0",
+                titleColor="#DDD",
+                gridColor="#2A2A2A",
+                tickColor="#444",
+                domainColor="#444",
+            ).configure_view(strokeOpacity=0)
             st.altair_chart(chart, use_container_width=True)
 
         st.markdown("### Forward Simulation & Scenario Table by Bucket")
@@ -2133,16 +2505,152 @@ def render_risk_buckets_tab() -> None:
                         _save_saved_groups(st.session_state["tba_saved_trades"])
                         if not st.session_state.get("tba_saved_trades"):
                             st.session_state["tba_use_saved_groups"] = False
-        chart_controls = st.columns(3)
-        with chart_controls[0]:
+        filter_cols = st.columns(5)
+        underlyings = ["All"] + sorted(trades_df["underlying"].dropna().unique().tolist())
+        weeks = ["All"] + sorted(trades_df["week_id"].dropna().unique().tolist())
+        sides = ["All"] + sorted(trades_df["option_side"].dropna().unique().tolist())
+        buckets = ["All"] + sorted(trades_df["bucket"].dropna().unique().tolist())
+        zones = ["All"] + sorted(trades_df["zone_label"].dropna().unique().tolist())
+        filter_underlying = filter_cols[0].selectbox("Underlying", underlyings, key="tba_trade_filter_underlying")
+        filter_week = filter_cols[1].selectbox("Week", weeks, key="tba_trade_filter_week")
+        filter_side = filter_cols[2].selectbox("Side", sides, key="tba_trade_filter_side")
+        filter_bucket = filter_cols[3].selectbox("Bucket", buckets, key="tba_trade_filter_bucket")
+        filter_zone = filter_cols[4].selectbox("Zone", zones, key="tba_trade_filter_zone")
+
+        df = trades_df.copy()
+        if filter_underlying != "All":
+            df = df[df["underlying"] == filter_underlying]
+        if filter_week != "All":
+            df = df[df["week_id"] == filter_week]
+        if filter_side != "All":
+            df = df[df["option_side"] == filter_side]
+        if filter_bucket != "All":
+            df = df[df["bucket"] == filter_bucket]
+        if filter_zone != "All":
+            df = df[df["zone_label"] == filter_zone]
+
+        sort_choice = st.selectbox(
+            "Sort by",
+            [
+                "trade_es99_inr",
+                "trade_es99_pct_of_bucket_cap",
+                "expected_pnl_inr",
+                "risk_reward",
+                "theta_carry_inr",
+                "mean_loss_inr",
+                "mean_tail_ratio",
+                "premium_received_inr",
+                "premium_prorated_inr",
+                "theta_per_lakh",
+                "gamma_per_lakh",
+                "vega_per_lakh",
+                "margin",
+                "week_id",
+            ],
+            key="tba_trade_sort",
+        )
+        df = df.sort_values(sort_choice, ascending=False)
+        df["theta_per_lakh_label"] = df.apply(
+            lambda row: f"{row['theta_per_lakh']:.1f} ({row['theta_label']})"
+            if row.get("theta_per_lakh") is not None
+            else "—",
+            axis=1,
+        )
+        df["gamma_per_lakh_label"] = df.apply(
+            lambda row: f"{row['gamma_per_lakh']:.4f} ({row['gamma_label']})"
+            if row.get("gamma_per_lakh") is not None
+            else "—",
+            axis=1,
+        )
+        df["vega_per_lakh_label"] = df.apply(
+            lambda row: f"{row['vega_per_lakh']:.1f} ({row['vega_label']})"
+            if row.get("vega_per_lakh") is not None
+            else "—",
+            axis=1,
+        )
+        st.dataframe(
+            df[
+                [
+                    "underlying",
+                    "week_id",
+                    "option_side",
+                    "earliest_expiry",
+                    "latest_expiry",
+                    "legs",
+                    "bucket",
+                    "trade_es99_inr",
+                    "trade_es99_pct_of_bucket_cap",
+                    "expected_pnl_inr",
+                    "expected_pnl_pct",
+                    "risk_reward",
+                    "theta_carry_inr",
+                    "mean_loss_inr",
+                    "mean_tail_ratio",
+                    "premium_received_inr",
+                    "premium_prorated_inr",
+                    "theta_per_lakh_label",
+                    "gamma_per_lakh_label",
+                    "vega_per_lakh_label",
+                    "margin",
+                    "zone_label",
+                    "mtd_pnl",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "Download trades CSV",
+            df.to_csv(index=False),
+            file_name="tba_trades.csv",
+        )
+
+        for _, row in df.iterrows():
+            with st.expander(
+                f"{row['underlying']} | {row['week_id']} | {row['option_side']} | {row['bucket']}"
+            ):
+                legs_df = pd.DataFrame(
+                    [
+                        {
+                            "symbol": leg.get("tradingsymbol"),
+                            "strike": leg.get("strike"),
+                            "type": leg.get("option_type") or leg.get("instrument_type"),
+                            "qty": leg.get("quantity"),
+                            "avg_price": leg.get("average_price"),
+                            "ltp": leg.get("last_price"),
+                            "pnl": leg.get("pnl", leg.get("m2m")),
+                            "delta": leg.get("delta"),
+                            "gamma": leg.get("gamma"),
+                            "vega": leg.get("vega"),
+                            "theta": leg.get("theta"),
+                            "pos_delta": leg.get("position_delta"),
+                            "pos_gamma": leg.get("position_gamma"),
+                            "pos_vega": leg.get("position_vega"),
+                            "pos_theta": leg.get("position_theta"),
+                        }
+                        for leg in row["legs_detail"]
+                    ]
+                )
+                st.dataframe(legs_df, use_container_width=True, hide_index=True)
+
+        st.info("Forward simulation is available at Portfolio and Bucket levels only.")
+
+        st.markdown("---")
+        st.markdown("### 📊 Tail Loss vs Mean PnL Chart")
+        
+        # Load saved groups for filtering
+        saved_groups = st.session_state.get("tba_saved_trades", [])
+        
+        control_cols = st.columns(5)
+        with control_cols[0]:
             norm_mode = st.selectbox(
                 "Normalize",
                 ["Absolute INR", "Per 1L capital", "Per bucket cap %"],
                 key="tba_trade_chart_norm",
             )
-        with chart_controls[1]:
+        with control_cols[1]:
             log_loss_axis = st.toggle("Log scale (loss axis)", value=False, key="tba_trade_chart_log")
-        with chart_controls[2]:
+        with control_cols[2]:
             tail_cap_label = "Tail cap (INR)"
             if norm_mode == "Per 1L capital":
                 tail_cap_label = "Tail cap (per 1L)"
@@ -2155,28 +2663,46 @@ def render_risk_buckets_tab() -> None:
                 value=float(st.session_state.get("tba_trade_tail_cap_inr", 200_000.0)),
                 key="tba_trade_tail_cap_inr",
             )
-        toggle_cols = st.columns(2)
-        with toggle_cols[0]:
+        with control_cols[3]:
             show_individual_trades = st.toggle(
                 "Show individual trades",
                 value=True,
                 key="tba_show_individual_trades",
             )
-        with toggle_cols[1]:
+        with control_cols[4]:
             show_group_trades = st.toggle(
                 "Show group trades",
                 value=True,
                 key="tba_show_group_trades",
             )
-
-        charts_container = st.container()
+        
+        use_saved = bool(saved_groups)
+        
         chart_df = trades_df.copy()
         group_names = {g.get("name") for g in saved_groups if g.get("name")}
-        if saved_groups and st.session_state.get("tba_use_saved_groups", False):
-            if not show_individual_trades:
-                chart_df = chart_df[chart_df["option_side"].isin(group_names)]
-            if not show_group_trades and group_names:
+        
+        # Debug info
+        with st.expander("🔍 Debug Info", expanded=False):
+            st.write(f"Total trades: {len(chart_df)}")
+            st.write(f"Saved groups: {len(saved_groups)}")
+            st.write(f"Group names: {group_names}")
+            st.write(f"Use saved groups: {use_saved}")
+            st.write("Option side values in trades_df:")
+            st.write(chart_df["option_side"].value_counts())
+        
+        # Apply filtering based on toggle states
+        if group_names:
+            # Both toggles off: show nothing
+            if not show_individual_trades and not show_group_trades:
+                chart_df = chart_df[chart_df["option_side"].isna()]  # Empty dataframe
+            # Only individual trades
+            elif show_individual_trades and not show_group_trades:
                 chart_df = chart_df[~chart_df["option_side"].isin(group_names)]
+            # Only group trades
+            elif not show_individual_trades and show_group_trades:
+                chart_df = chart_df[chart_df["option_side"].isin(group_names)]
+            # Both toggles on: show everything (no filtering needed)
+        
         chart_df["theta_per_lakh_label"] = chart_df.apply(
             lambda row: f"{row['theta_per_lakh']:.1f} ({row['theta_label']})"
             if row["theta_per_lakh"] is not None
@@ -2441,7 +2967,7 @@ def render_risk_buckets_tab() -> None:
                     shape=alt.Shape("option_side:N", legend=alt.Legend(title="Side")),
                     tooltip=tooltip_cols,
                 )
-                .properties(height=300, width="container")
+                .properties(height=600)
             )
             base_negative = (
                 alt.Chart(negative_df)
@@ -2456,7 +2982,7 @@ def render_risk_buckets_tab() -> None:
                     shape=alt.Shape("option_side:N", legend=alt.Legend(title="Side")),
                     tooltip=tooltip_cols,
                 )
-                .properties(height=300, width="container")
+                .properties(height=600)
             )
             labels = (
                 alt.Chart(plot_df)
@@ -2471,159 +2997,7 @@ def render_risk_buckets_tab() -> None:
             rr_overlays = _build_rr_overlays(x_min, x_max, y_max) if chart_key == "tail_loss" else []
             layers = overlays + rr_overlays + [base_positive, base_negative, labels]
             chart = alt.layer(*layers)
-            with charts_container:
-                title_cols = st.columns([0.9, 0.1])
-                with title_cols[0]:
-                    st.markdown("#### Tail Loss vs Mean PnL")
-                with title_cols[1]:
-                    with st.popover("ℹ️ Zones", use_container_width=False):
-                        st.markdown("""
-                        **Zone A (RR < 0.15)**: Very cheap premium. Mean PnL small relative to tail risk. 
-                        Small spot or vol moves quickly flip EV negative; slow bleed with rare large losses. 
-                        Requires very tight risk caps.
-                        
-                        **Zone B (0.15–0.30)**: Preferred short-vol regime. Balanced credit vs tail risk. 
-                        Trades remain bottom-right under moderate spot moves; manageable gamma. 
-                        Best persistence of positive EV.
-                        
-                        **Zone C (0.30–0.40)**: High credit but fragile. Positive EV only near entry. 
-                        One-sided spot moves or IV expansion rapidly increase tail loss; 
-                        needs fast exits and active management.
-                        
-                        **Zone D (RR > 0.40)**: Gamma-dominant. Near-spot exposure. EV highly unstable; 
-                        small moves cause sharp jumps in tail loss. Treat as directional, not probability trade.
-                        """)
-                chart = chart.properties(height=420)
-                st.altair_chart(chart, use_container_width=True)
-        filter_cols = st.columns(5)
-        underlyings = ["All"] + sorted(trades_df["underlying"].dropna().unique().tolist())
-        weeks = ["All"] + sorted(trades_df["week_id"].dropna().unique().tolist())
-        sides = ["All"] + sorted(trades_df["option_side"].dropna().unique().tolist())
-        buckets = ["All"] + sorted(trades_df["bucket"].dropna().unique().tolist())
-        zones = ["All"] + sorted(trades_df["zone_label"].dropna().unique().tolist())
-        filter_underlying = filter_cols[0].selectbox("Underlying", underlyings, key="tba_trade_filter_underlying")
-        filter_week = filter_cols[1].selectbox("Week", weeks, key="tba_trade_filter_week")
-        filter_side = filter_cols[2].selectbox("Side", sides, key="tba_trade_filter_side")
-        filter_bucket = filter_cols[3].selectbox("Bucket", buckets, key="tba_trade_filter_bucket")
-        filter_zone = filter_cols[4].selectbox("Zone", zones, key="tba_trade_filter_zone")
-
-        df = trades_df.copy()
-        if filter_underlying != "All":
-            df = df[df["underlying"] == filter_underlying]
-        if filter_week != "All":
-            df = df[df["week_id"] == filter_week]
-        if filter_side != "All":
-            df = df[df["option_side"] == filter_side]
-        if filter_bucket != "All":
-            df = df[df["bucket"] == filter_bucket]
-        if filter_zone != "All":
-            df = df[df["zone_label"] == filter_zone]
-
-        sort_choice = st.selectbox(
-            "Sort by",
-            [
-                "trade_es99_inr",
-                "trade_es99_pct_of_bucket_cap",
-                "expected_pnl_inr",
-                "risk_reward",
-                "theta_carry_inr",
-                "mean_loss_inr",
-                "mean_tail_ratio",
-                "premium_received_inr",
-                "premium_prorated_inr",
-                "theta_per_lakh",
-                "gamma_per_lakh",
-                "vega_per_lakh",
-                "margin",
-                "week_id",
-            ],
-            key="tba_trade_sort",
-        )
-        df = df.sort_values(sort_choice, ascending=False)
-        df["theta_per_lakh_label"] = df.apply(
-            lambda row: f"{row['theta_per_lakh']:.1f} ({row['theta_label']})"
-            if row.get("theta_per_lakh") is not None
-            else "—",
-            axis=1,
-        )
-        df["gamma_per_lakh_label"] = df.apply(
-            lambda row: f"{row['gamma_per_lakh']:.4f} ({row['gamma_label']})"
-            if row.get("gamma_per_lakh") is not None
-            else "—",
-            axis=1,
-        )
-        df["vega_per_lakh_label"] = df.apply(
-            lambda row: f"{row['vega_per_lakh']:.1f} ({row['vega_label']})"
-            if row.get("vega_per_lakh") is not None
-            else "—",
-            axis=1,
-        )
-        st.dataframe(
-            df[
-                [
-                    "underlying",
-                    "week_id",
-                    "option_side",
-                    "earliest_expiry",
-                    "latest_expiry",
-                    "legs",
-                    "bucket",
-                    "trade_es99_inr",
-                    "trade_es99_pct_of_bucket_cap",
-                    "expected_pnl_inr",
-                    "expected_pnl_pct",
-                    "risk_reward",
-                    "theta_carry_inr",
-                    "mean_loss_inr",
-                    "mean_tail_ratio",
-                    "premium_received_inr",
-                    "premium_prorated_inr",
-                    "theta_per_lakh_label",
-                    "gamma_per_lakh_label",
-                    "vega_per_lakh_label",
-                    "margin",
-                    "zone_label",
-                    "mtd_pnl",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.download_button(
-            "Download trades CSV",
-            df.to_csv(index=False),
-            file_name="tba_trades.csv",
-        )
-
-        for _, row in df.iterrows():
-            with st.expander(
-                f"{row['underlying']} | {row['week_id']} | {row['option_side']} | {row['bucket']}"
-            ):
-                legs_df = pd.DataFrame(
-                    [
-                        {
-                            "symbol": leg.get("tradingsymbol"),
-                            "strike": leg.get("strike"),
-                            "type": leg.get("option_type") or leg.get("instrument_type"),
-                            "qty": leg.get("quantity"),
-                            "avg_price": leg.get("average_price"),
-                            "ltp": leg.get("last_price"),
-                            "pnl": leg.get("pnl", leg.get("m2m")),
-                            "delta": leg.get("delta"),
-                            "gamma": leg.get("gamma"),
-                            "vega": leg.get("vega"),
-                            "theta": leg.get("theta"),
-                            "pos_delta": leg.get("position_delta"),
-                            "pos_gamma": leg.get("position_gamma"),
-                            "pos_vega": leg.get("position_vega"),
-                            "pos_theta": leg.get("position_theta"),
-                        }
-                        for leg in row["legs_detail"]
-                    ]
-                )
-                st.dataframe(legs_df, use_container_width=True, hide_index=True)
-
-        st.info("Forward simulation is available at Portfolio and Bucket levels only.")
+            st.altair_chart(chart, use_container_width=True)
 
     with subtab4:
         st.markdown("### How to Read This Tab (Process)")

@@ -1,0 +1,607 @@
+/* ============================================
+   🛡️ GammaShield - Institutional Options Risk Engine
+   Advanced Options Risk Management Platform
+   ============================================ */
+
+:root {
+  /* Background layers */
+  --gs-bg: #070A12;
+  --gs-surface: #0B1220;
+  --gs-card: #0F1B2D;
+  --gs-border: #1F2A3D;
+  
+  /* Text colors */
+  --gs-text: #E7EEF9;
+  --gs-muted: #A9B7D0;
+  
+  /* Accent colors */
+  --gs-accent: #2D7DFF;
+  --gs-accent2: #1B4FD8;
+  --gs-silver: #B9C4D6;
+  
+  /* Semantic colors */
+  --gs-success: #2ECC71;
+  --gs-danger: #FF4D4D;
+  --gs-warning: #FFB020;
+}
+
+/* ============================================
+   GLOBAL STYLING
+   ============================================ */
+
+html, body, .stApp {
+  background: var(--gs-bg) !important;
+  color: var(--gs-text) !important;
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+/* Remove Streamlit default padding */
+.block-container {
+  padding-top: 0 !important;
+  padding-bottom: 2rem !important;
+}
+
+/* Hide Streamlit header */
+header[data-testid="stHeader"] {
+  height: 0 !important;
+  display: none !important;
+}
+
+/* Main content area */
+.main .block-container {
+  max-width: 100% !important;
+  padding-left: 2rem !important;
+  padding-right: 2rem !important;
+  border-top: 1px solid var(--gs-border) !important;
+  margin-top: 0 !important;
+}
+
+/* ============================================
+   NAVIGATION BUTTONS
+   ============================================ */
+
+.gs-btn-nav {
+    display: block;
+    text-decoration: none;
+    text-align: center;
+    background: var(--gs-border) !important;
+    border: 1px solid var(--gs-border) !important;
+    color: var(--gs-muted) !important;
+    font-weight: 600 !important;
+    border-radius: 10px !important;
+    padding: 0.5rem 1rem !important;
+    transition: all 0.2s ease !important;
+    font-size: 0.8rem;
+    width: 13rem;
+    height: 3rem !important;
+
+}
+
+.gs-btn-nav:hover {
+  border-color: var(--gs-accent) !important;
+  color: var(--gs-text) !important;
+  background: rgba(45, 125, 255, 0.08) !important;
+}
+
+.gs-btn-nav.is-active {
+  background: linear-gradient(135deg, var(--gs-accent), var(--gs-accent2)) !important;
+  border: 1px solid var(--gs-accent) !important;
+  color: #fff !important;
+  box-shadow: 0 2px 8px rgba(45, 125, 255, 0.25) !important;
+}
+
+.gs-btn-nav.is-active:hover {
+  box-shadow: 0 4px 12px rgba(45, 125, 255, 0.35) !important;
+  transform: translateY(-1px) !important;
+}
+
+/* Primary buttons (active tab) */
+button[kind="primary"] {
+  background: linear-gradient(135deg, var(--gs-accent), var(--gs-accent2)) !important;
+  border: 1px solid var(--gs-accent) !important;
+  color: white !important;
+  font-weight: 600 !important;
+  border-radius: 12px !important;
+  padding: 0.5rem 1rem !important;
+  transition: all 0.2s ease !important;
+  box-shadow: 0 2px 8px rgba(45, 125, 255, 0.25) !important;
+}
+
+button[kind="primary"]:hover {
+  box-shadow: 0 4px 12px rgba(45, 125, 255, 0.35) !important;
+  transform: translateY(-1px) !important;
+}
+
+/* Secondary buttons (inactive tabs) */
+button[kind="secondary"] {
+  background: var(--gs-surface) !important;
+  border: 1px solid var(--gs-border) !important;
+  color: var(--gs-muted) !important;
+  font-weight: 500 !important;
+  border-radius: 12px !important;
+  padding: 0.5rem 1rem !important;
+  transition: all 0.2s ease !important;
+}
+
+button[kind="secondary"]:hover {
+  border-color: var(--gs-accent) !important;
+  color: var(--gs-text) !important;
+  background: rgba(45, 125, 255, 0.08) !important;
+}
+
+/* All buttons base styling */
+button {
+  font-family: "Inter", sans-serif !important;
+  letter-spacing: 0.01em !important;
+}
+
+/* ============================================
+   SELECTBOX (Overflow Menu)
+   ============================================ */
+
+div[data-baseweb="select"] {
+  background: var(--gs-surface) !important;
+  border: 1px solid var(--gs-border) !important;
+  border-radius: 12px !important;
+}
+
+div[data-baseweb="select"]:hover {
+  border-color: var(--gs-accent) !important;
+}
+
+/* Selectbox dropdown */
+ul[role="listbox"] {
+  background: var(--gs-card) !important;
+  border: 1px solid var(--gs-border) !important;
+  border-radius: 12px !important;
+}
+
+li[role="option"] {
+  color: var(--gs-text) !important;
+  transition: background 0.15s ease !important;
+}
+
+li[role="option"]:hover {
+  background: rgba(45, 125, 255, 0.12) !important;
+}
+
+/* ============================================
+   METRIC CARDS
+   ============================================ */
+
+div[data-testid="stMetric"] {
+  background: var(--gs-card) !important;
+  border: 1px solid var(--gs-border) !important;
+  border-radius: 14px !important;
+  padding: 1rem !important;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15) !important;
+  transition: all 0.2s ease !important;
+}
+
+div[data-testid="stMetric"]:hover {
+  border-color: var(--gs-accent) !important;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25) !important;
+}
+
+div[data-testid="stMetricLabel"] {
+  color: var(--gs-silver) !important;
+  font-size: 0.75rem !important;
+  font-weight: 600 !important;
+  text-transform: uppercase !important;
+  letter-spacing: 0.05em !important;
+}
+
+div[data-testid="stMetricValue"] {
+  color: var(--gs-text) !important;
+  font-size: 1.5rem !important;
+  font-weight: 700 !important;
+  font-variant-numeric: tabular-nums !important;
+}
+
+div[data-testid="stMetricDelta"] {
+  font-size: 0.875rem !important;
+  font-weight: 500 !important;
+}
+
+/* ============================================
+   TABLES & DATAFRAMES
+   ============================================ */
+
+/* Table container */
+div[data-testid="stDataFrame"], 
+.stDataFrame {
+  background: var(--gs-card) !important;
+  border: 1px solid var(--gs-border) !important;
+  border-radius: 12px !important;
+  overflow: hidden !important;
+}
+
+/* Table itself */
+table {
+  background: transparent !important;
+  color: var(--gs-text) !important;
+  font-size: 0.875rem !important;
+}
+
+/* Table headers */
+thead th {
+  background: var(--gs-surface) !important;
+  color: var(--gs-silver) !important;
+  font-weight: 600 !important;
+  text-transform: uppercase !important;
+  font-size: 0.75rem !important;
+  letter-spacing: 0.05em !important;
+  padding: 0.75rem !important;
+  border-bottom: 2px solid var(--gs-border) !important;
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 10 !important;
+}
+
+/* Table cells */
+tbody td {
+  padding: 0.75rem !important;
+  border-bottom: 1px solid var(--gs-border) !important;
+  font-variant-numeric: tabular-nums !important;
+}
+
+/* Numeric columns right-align */
+tbody td:has(> div:matches([data-numeric])),
+tbody td[data-numeric] {
+  text-align: right !important;
+}
+
+/* Row hover effect */
+tbody tr:hover {
+  background: rgba(45, 125, 255, 0.08) !important;
+  transition: background 0.15s ease !important;
+}
+
+/* Alternating row colors */
+tbody tr:nth-child(even) {
+  background: rgba(255, 255, 255, 0.02) !important;
+}
+
+tbody tr:nth-child(even):hover {
+  background: rgba(45, 125, 255, 0.08) !important;
+}
+
+/* ============================================
+   CHARTS & PLOTLY
+   ============================================ */
+
+.js-plotly-plot {
+  background: var(--gs-card) !important;
+  border: 1px solid var(--gs-border) !important;
+  border-radius: 12px !important;
+  padding: 0.5rem !important;
+}
+
+/* ============================================
+   EXPANDERS
+   ============================================ */
+
+details[data-testid="stExpander"] {
+  background: var(--gs-card) !important;
+  border: 1px solid var(--gs-border) !important;
+  border-radius: 12px !important;
+  margin-bottom: 1rem !important;
+}
+
+summary {
+  color: var(--gs-text) !important;
+  font-weight: 600 !important;
+  padding: 0.75rem 1rem !important;
+}
+
+summary:hover {
+  background: rgba(45, 125, 255, 0.05) !important;
+}
+
+/* ============================================
+   INPUTS & FORMS
+   ============================================ */
+
+input[type="text"],
+input[type="number"],
+textarea,
+.stTextInput input,
+.stNumberInput input {
+  background: var(--gs-surface) !important;
+  border: 1px solid var(--gs-border) !important;
+  border-radius: 8px !important;
+  color: var(--gs-text) !important;
+  padding: 0.5rem 0.75rem !important;
+}
+
+input:focus,
+textarea:focus {
+  border-color: var(--gs-accent) !important;
+  outline: none !important;
+  box-shadow: 0 0 0 2px rgba(45, 125, 255, 0.2) !important;
+}
+
+/* ============================================
+   SIDEBAR
+   ============================================ */
+
+section[data-testid="stSidebar"] {
+  background: var(--gs-surface) !important;
+  border-right: 1px solid var(--gs-border) !important;
+}
+
+/* Sidebar branding */
+section[data-testid="stSidebar"] h1 {
+  color: var(--gs-accent) !important;
+  font-size: 1.5rem !important;
+}
+
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] .stMarkdown {
+  color: var(--gs-silver) !important;
+}
+
+/* Remove padding from sidebar top */
+section[data-testid="stSidebar"] > div:first-child {
+  padding-top: 0 !important;
+}
+
+/* Login controls - no top padding */
+section[data-testid="stSidebar"] .stMarkdown:first-of-type {
+  margin-top: 0 !important;
+  padding-top: 0 !important;
+}
+
+/* ============================================
+   ALERTS & MESSAGES
+   ============================================ */
+
+.stAlert {
+  border-radius: 12px !important;
+  border: 1px solid var(--gs-border) !important;
+}
+
+.stSuccess {
+  background: rgba(46, 204, 113, 0.1) !important;
+  border-color: var(--gs-success) !important;
+  color: var(--gs-success) !important;
+}
+
+.stWarning {
+  background: rgba(255, 176, 32, 0.1) !important;
+  border-color: var(--gs-warning) !important;
+  color: var(--gs-warning) !important;
+}
+
+.stError {
+  background: rgba(255, 77, 77, 0.1) !important;
+  border-color: var(--gs-danger) !important;
+  color: var(--gs-danger) !important;
+}
+
+.stInfo {
+  background: rgba(45, 125, 255, 0.1) !important;
+  border-color: var(--gs-accent) !important;
+  color: var(--gs-accent) !important;
+}
+
+/* ============================================
+   TYPOGRAPHY
+   ============================================ */
+
+h1, h2, h3, h4, h5, h6 {
+  color: var(--gs-text) !important;
+  font-weight: 700 !important;
+  letter-spacing: -0.02em !important;
+}
+
+h1 {
+  font-size: 2rem !important;
+  margin-bottom: 1rem !important;
+}
+
+h2 {
+  font-size: 1.5rem !important;
+  margin-bottom: 0.875rem !important;
+}
+
+h3 {
+  font-size: 1.25rem !important;
+  margin-bottom: 0.75rem !important;
+}
+
+p, span, div {
+  color: var(--gs-text) !important;
+}
+
+.stMarkdown {
+  color: var(--gs-text) !important;
+}
+
+/* Captions */
+.stCaption {
+  color: var(--gs-muted) !important;
+  font-size: 0.875rem !important;
+}
+
+/* Code blocks */
+code {
+  background: var(--gs-surface) !important;
+  color: var(--gs-accent) !important;
+  padding: 0.2rem 0.4rem !important;
+  border-radius: 4px !important;
+  font-family: "SF Mono", Monaco, "Cascadia Code", monospace !important;
+}
+
+pre {
+  background: var(--gs-surface) !important;
+  border: 1px solid var(--gs-border) !important;
+  border-radius: 8px !important;
+  padding: 1rem !important;
+}
+
+/* ============================================
+   SCROLLBARS
+   ============================================ */
+
+::-webkit-scrollbar {
+  width: 10px !important;
+  height: 10px !important;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--gs-surface) !important;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--gs-border) !important;
+  border-radius: 5px !important;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--gs-accent) !important;
+}
+
+/* ============================================
+   TABS (Streamlit native tabs)
+   ============================================ */
+
+button[data-baseweb="tab"] {
+  background: transparent !important;
+  border-bottom: 2px solid transparent !important;
+  color: var(--gs-muted) !important;
+  font-weight: 600 !important;
+  transition: all 0.2s ease !important;
+}
+
+button[data-baseweb="tab"]:hover {
+  color: var(--gs-text) !important;
+  border-bottom-color: var(--gs-accent) !important;
+}
+
+button[data-baseweb="tab"][aria-selected="true"] {
+  color: var(--gs-accent) !important;
+  border-bottom-color: var(--gs-accent) !important;
+}
+
+/* ============================================
+   SPINNER & LOADING
+   ============================================ */
+
+.stSpinner > div {
+  border-color: var(--gs-accent) transparent transparent transparent !important;
+}
+
+/* ============================================
+   DIVIDERS
+   ============================================ */
+
+hr {
+  border-color: var(--gs-border) !important;
+  margin: 1.5rem 0 !important;
+}
+
+/* ============================================
+   DOWNLOAD BUTTON
+   ============================================ */
+
+.stDownloadButton button {
+  background: var(--gs-surface) !important;
+  border: 1px solid var(--gs-border) !important;
+  color: var(--gs-text) !important;
+  border-radius: 8px !important;
+}
+
+.stDownloadButton button:hover {
+  border-color: var(--gs-accent) !important;
+  background: rgba(45, 125, 255, 0.08) !important;
+}
+
+/* ============================================
+   SIDEBAR IMPROVEMENTS
+   ============================================ */
+
+/* Sidebar container */
+section[data-testid="stSidebar"] > div:first-child {
+  padding-top: 5px !important;
+}
+
+/* Sidebar branding text */
+section[data-testid="stSidebar"] h1 {
+  color: var(--gs-accent) !important;
+  font-weight: 800 !important;
+}
+
+section[data-testid="stSidebar"] p {
+  color: var(--gs-silver) !important;
+}
+
+/* All sidebar text */
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] .stMarkdown,
+section[data-testid="stSidebar"] span {
+  color: var(--gs-text) !important;
+}
+
+/* Sidebar input fields */
+section[data-testid="stSidebar"] input,
+section[data-testid="stSidebar"] textarea {
+  background: var(--gs-bg) !important;
+  color: var(--gs-text) !important;
+  border-color: var(--gs-border) !important;
+}
+
+/* Sidebar buttons */
+section[data-testid="stSidebar"] button {
+  color: var(--gs-text) !important;
+}
+
+/* Move sidebar collapse button to bottom */
+section[data-testid="stSidebar"] button[kind="header"] {
+  position: absolute !important;
+  bottom: 1rem !important;
+  top: auto !important;
+  left: 50% !important;
+  transform: translateX(-50%) !important;
+}
+
+/* Style the collapse button */
+section[data-testid="stSidebar"] button[kind="header"] svg {
+  color: var(--gs-accent) !important;
+}
+
+/* Hide the default collapse button at top */
+section[data-testid="stSidebar"] > div > div > button[kind="header"] {
+  display: none !important;
+}
+
+/* Show only the bottom one */
+section[data-testid="stSidebar"] button[kind="header"]:last-of-type {
+  display: block !important;
+}
+
+
+.st-emotion-cache-10p9htt {
+    display: none
+}
+
+.stMarkdownad {
+    padding-top: 50px;
+}
+
+.stSidebarContent {
+    padding-top: 50px;
+}
+
+.st-emotion-cache-zh2fnc {
+    width: 100%;
+}
+
+.stElementContainer {
+    /* display: none !important */
+}
+
+
+.stLayoutWrapper {
+    height: 50px !important;
+}

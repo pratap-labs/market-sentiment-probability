@@ -22,6 +22,25 @@ from scripts.utils import (
 from .overview_tab import get_market_signal, get_alignment_status, get_portfolio_health_status
 
 
+@st.cache_data(ttl=259200)
+def _fetch_positions(api_key: str, access_token: str) -> List[Dict[str, object]]:
+    if KiteConnect is None:
+        return []
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+    positions = kite.positions()
+    return positions.get("net", []) or []
+
+
+def _fetch_positions_fresh(api_key: str, access_token: str) -> List[Dict[str, object]]:
+    if KiteConnect is None:
+        return []
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+    positions = kite.positions()
+    return positions.get("net", []) or []
+
+
 def _get_margin_snapshot() -> Tuple[float, float]:
     access_token = st.session_state.get("kite_access_token")
     api_key = st.session_state.get("kite_api_key")
@@ -328,7 +347,9 @@ def render_portfolio_dashboard_tab():
     access_token = st.session_state.get("kite_access_token")
     kite_api_key = st.session_state.get("kite_api_key")
 
-    fetch_positions = st.sidebar.button("🔄 Fetch Latest Positions", type="primary")
+    col_a, col_b = st.sidebar.columns(2)
+    fetch_positions_cached = col_a.button("📦 Load Cache", type="secondary", use_container_width=True)
+    fetch_positions_fresh = col_b.button("🔄 Load Fresh", type="primary", use_container_width=True)
     if st.sidebar.button("🔄 Refresh", key="portfolio_dashboard_refresh"):
         st.rerun()
     # if st.sidebar.button("🧹 Clear Positions", key="portfolio_dashboard_clear_positions"):
@@ -336,8 +357,7 @@ def render_portfolio_dashboard_tab():
     #     st.session_state.pop("current_spot", None)
     #     st.rerun()
 
-    if fetch_positions:
-        st.session_state["active_tab_key"] = "portfolio"
+    if fetch_positions_cached or fetch_positions_fresh:
         if not access_token or not kite_api_key:
             st.warning("Not logged in. Please go to the Login tab and sign in first.")
         elif options_df is None or options_df.empty:
@@ -345,10 +365,12 @@ def render_portfolio_dashboard_tab():
         else:
             try:
                 with st.spinner("Fetching positions..."):
-                    kite = KiteConnect(api_key=kite_api_key)
-                    kite.set_access_token(access_token)
-                    positions = kite.positions()
-                    net_positions = positions.get("net", [])
+                    if fetch_positions_fresh:
+                        _fetch_positions.clear()
+                        net_positions = _fetch_positions_fresh(kite_api_key, access_token)
+                        _fetch_positions(kite_api_key, access_token)
+                    else:
+                        net_positions = _fetch_positions(kite_api_key, access_token)
 
                     if not net_positions:
                         st.info("No positions returned.")
@@ -420,3 +442,85 @@ def render_portfolio_dashboard_tab():
 
     st.markdown("---")
     _render_positions(enriched)
+
+    # Greeks Debug Section
+    st.markdown("---")
+    with st.expander("🧪 Greeks Debug (Manual Recalculation)", expanded=False):
+        st.caption("Recompute greeks using manual spot and last_price only. No auto-enrichment.")
+        
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            debug_spot = st.number_input(
+                "Spot (NIFTY)",
+                value=float(current_spot),
+                step=10.0,
+                format="%.2f",
+                key="greeks_debug_spot",
+            )
+        with col2:
+            if st.button("Recompute Greeks", type="primary", key="greeks_debug_recompute"):
+                st.session_state["greeks_spot_override"] = debug_spot
+                refreshed = []
+                for pos in enriched:
+                    refreshed.append(enrich_position_with_greeks(pos, pd.DataFrame(), debug_spot))
+                st.session_state["debug_enriched_positions"] = refreshed
+                st.success("Greeks recomputed using spot override.")
+        
+        debug_positions = st.session_state.get("debug_enriched_positions", [])
+        if debug_positions:
+            # IV Debug Payload for selected symbol
+            symbols = sorted({pos.get("tradingsymbol") for pos in debug_positions if pos.get("tradingsymbol")})
+            if symbols:
+                selected_symbol = st.selectbox("Symbol for IV Debug", symbols, key="greeks_debug_symbol")
+                match = next((p for p in debug_positions if p.get("tradingsymbol") == selected_symbol), None)
+                if match:
+                    debug = match.get("iv_debug", {})
+                    debug_payload = {
+                        "spot_used": debug.get("spot_used"),
+                        "option_price_used": debug.get("option_price_used"),
+                        "time_to_expiry_years": debug.get("time_to_expiry"),
+                        "time_to_expiry_days": (
+                            float(debug.get("time_to_expiry", 0.0)) * 365.0
+                            if debug.get("time_to_expiry") is not None
+                            else None
+                        ),
+                        "expiry_date": debug.get("expiry_date"),
+                        "implied_vol_pct": (
+                            float(match.get("implied_vol")) * 100.0
+                            if match.get("implied_vol") is not None
+                            else None
+                        ),
+                        "last_price": match.get("last_price"),
+                    }
+                    st.json(debug_payload)
+            
+            # Positions table with greeks
+            display_cols = [
+                "tradingsymbol", "quantity", "strike", "option_type", "expiry", "dte",
+                "last_price", "implied_vol", "delta", "gamma", "vega", "theta",
+                "position_delta", "position_gamma", "position_vega", "position_theta",
+            ]
+            df = pd.DataFrame([{col: pos.get(col) for col in display_cols} for pos in debug_positions])
+            
+            # Expiry filter
+            expiry_values = sorted(
+                {
+                    exp.strftime("%Y-%m-%d")
+                    for exp in df["expiry"].dropna()
+                    if hasattr(exp, "strftime")
+                }
+            )
+            if expiry_values:
+                expiry_options = ["All"] + expiry_values
+                selected_expiry = st.selectbox("Filter by Expiry", expiry_options, key="greeks_debug_expiry")
+                if selected_expiry != "All":
+                    df = df[
+                        df["expiry"].apply(
+                            lambda exp: exp.strftime("%Y-%m-%d") if hasattr(exp, "strftime") else str(exp)
+                        )
+                        == selected_expiry
+                    ]
+            
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("Click 'Recompute Greeks' to populate debug values.")

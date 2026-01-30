@@ -6,10 +6,12 @@ Enhanced with Options Analytics Dashboard - Refactored with modular tabs.
 import os
 import sys
 import streamlit as st
+import streamlit.components.v1 as components
 import json
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from streamlit_extras.stylable_container import stylable_container
 
 # Add project root to path
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -71,17 +73,12 @@ except Exception:
 # Import tab render functions
 from views.tabs.login_tab import render_login_tab
 from views.tabs.portfolio_dashboard_tab import render_portfolio_dashboard_tab
-from views.tabs.diagnostics_tab import render_diagnostics_tab
 from views.tabs.market_regime_tab import render_market_regime_tab
-from views.tabs.risk_analysis_tab import render_risk_analysis_tab
-from views.tabs.risk_buckets_tab import render_risk_buckets_tab
+from views.tabs.stress_testing_tab import render_pre_trade_analysis_tab
 from views.tabs.trade_selector_tab import render_trade_selector_tab
+from views.tabs.risk_buckets_tab import render_risk_buckets_tab
 from views.tabs.equities_tab import render_equities_tab
-from views.tabs.portfolio_buckets_tab import render_portfolio_buckets_tab
-from views.tabs.stress_testing_tab import render_stress_testing_tab
-from views.tabs.hedge_lab_tab import render_hedge_lab_tab
 from views.tabs.historical_performance_tab import render_historical_performance_tab
-from views.tabs.greeks_debug_tab import render_greeks_debug_tab
 from views.tabs.product_overview_tab import render_product_overview_tab
 from views.tabs.derivatives_data_tab import render_derivatives_data_tab, load_cached_derivatives_data_for_session
 
@@ -168,6 +165,37 @@ def render():
     """Main entrypoint for the Streamlit view."""
     # set wider page layout
     st.set_page_config(layout="wide")
+
+    # Load GammaShield institutional theme
+    try:
+        with open("assets/gammashield.css") as f:
+            st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
+    except FileNotFoundError:
+        pass  # Fallback to default styling
+
+    # Load and encode logo
+    import base64
+    try:
+        with open("assets/gammashield-logo.png", "rb") as f:
+            logo_base64 = base64.b64encode(f.read()).decode()
+            logo_src = f"data:image/png;base64,{logo_base64}"
+    except FileNotFoundError:
+        logo_src = ""
+
+    st.sidebar.markdown(
+        f"""
+        <div class="gs-sidebar-brand" style="text-align: center; padding: 0.6rem 0 1rem 0; border-bottom: 1px solid var(--gs-border, #1F2A3D); margin: 0 0 2rem 0;">
+            <div style="display: flex; align-items: center; justify-content: center; gap: 0.75rem; margin-bottom: 0.5rem; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;">
+                {"<img src='" + logo_src + "' style='width: 100%; max-width: 180px; height: auto; object-fit: contain;' />" if logo_src else ""}                <div class="gs-sidebar-title" style="font-size: 2.2rem; font-weight: 800; margin: 0; background: linear-gradient(135deg, #2D7DFF 0%, #1B4FD8 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text; letter-spacing: -0.02em;">
+                </div>
+            </div>
+            <div class="gs-sidebar-subtitle" style="font-size: 0.8rem; color: var(--gs-muted, #A9B7D0); margin-top: 0.25rem; font-weight: 500; letter-spacing: 0.04em;">
+                Advanced Options Risk Engine
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     
     # Compact CSS styling for dashboard presentation
     st.markdown(
@@ -175,6 +203,38 @@ def render():
         <style>
         /* Slightly reduce global base font for the dashboard */
         html, body, .stApp { font-size: 13px; }
+
+        /* Remove default top padding above main content/nav */
+        [data-testid="stAppViewContainer"] > .main,
+        [data-testid="stAppViewContainer"] > .main > div,
+        [data-testid="stMainBlockContainer"],
+        [data-testid="stVerticalBlock"] {
+            padding-top: 0 !important;
+            margin-top: 0 !important;
+        }
+        
+        .main .block-container,
+        .block-container {
+            padding-top: 0 !important;
+            margin-top: 0 !important;
+            padding-left: 2rem !important;
+            padding-right: 2rem !important;
+        }
+        
+        /* Navigation container styling */
+        .gs-nav-container {
+            background: var(--gs-surface, #0B1220) !important;
+            border: 1px solid var(--gs-border, #1F2A3D) !important;
+            border-radius: 12px !important;
+            padding: 1rem 1.5rem !important;
+            margin: 1rem 0 1.5rem 0 !important;
+            display: none !important;
+        }
+        
+        /* Nav button columns */
+        .gs-nav-col {
+            padding: 0 0.35rem !important;
+        }
 
         /* Metric label/value sizing */
         div[data-testid="stMetricValue"], div[data-testid="stMetricDelta"] {
@@ -217,6 +277,11 @@ def render():
         div[data-testid="stMetricDelta"] { font-size: 12px !important; display: inline-flex !important; align-items: center; gap: 0.35rem; padding: 5px 10px}
         div[data-testid="stMetricDelta"] > span { padding: 0.12rem 1rem !important; border-radius: 999px !important; }
 
+        /* Remove top padding above sidebar logo */
+        [data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+            padding-top: 0 !important;
+        }
+
         /* Responsive fallbacks */
         @media (max-width: 900px) {
             .css-1lcbmhc, .css-1d391kg, .css-18e3th9, .css-12w0qpk { width: 48% !important; }
@@ -224,6 +289,7 @@ def render():
         @media (max-width: 520px) {
             .css-1lcbmhc, .css-1d391kg, .css-18e3th9, .css-12w0qpk { width: 100% !important; }
         }
+
         </style>
         """,
         unsafe_allow_html=True,
@@ -327,30 +393,42 @@ def render():
     # Initialize empty dataframes - data will be loaded from Derivatives Data tab
     # Each tab will load data from cache using their own reload buttons
     
-    # Top navigation bar (single active tab controls)
+    # Navigation tabs (single active tab controls)
     tabs = [
         {"key": "login", "label": "🔐 Login"},
         {"key": "portfolio", "label": "📊 Portfolio"},
-        {"key": "risk_analysis", "label": "🎯 Risk Analysis"},
         {"key": "equities", "label": "📈 Equities"},
-        {"key": "risk_buckets", "label": "Risk Buckets (50/30/20)"},
-        {"key": "portfolio_buckets", "label": "Portfolio Buckets"},
+        {"key": "risk_buckets", "label": "🛡️ Risk Buckets (50/30/20)"},
+        {"key": "pre_trade", "label": "🔬 Pre-Trade Analysis"},
         {"key": "market_regime", "label": "🌡️ Market Regime"},
-        {"key": "stress_testing", "label": "🧪 Stress Testing"},
-        {"key": "diagnostics", "label": "🔍 Position Diagnostics"},
-        {"key": "hedge_lab", "label": "🛡️ Hedge Lab"},
         {"key": "historical", "label": "📈 Historical Performance"},
-        {"key": "greeks_debug", "label": "🧪 Greeks Debug"},
         {"key": "product_overview", "label": "✨ Product Overview"},
-        {"key": "derivatives_data", "label": "💾 Derivatives Data"},
-        {"key": "trade_selector", "label": "🎯 Trade Selector"},
+        {"key": "derivatives_data", "label": "💾 Data Source"},
     ]
     tab_map = {t["key"]: t["label"] for t in tabs}
+    requested_tab = st.query_params.get("tab")
+    if requested_tab in tab_map:
+        st.session_state["active_tab_key"] = requested_tab
+        st.query_params.pop("tab", None)
     st.session_state.setdefault("active_tab_key", "login")
     if st.session_state["active_tab_key"] not in tab_map:
         st.session_state["active_tab_key"] = "login"
 
-    visible_keys = ["login", "portfolio", "risk_analysis", "risk_buckets", "stress_testing"]
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] {
+            background: #14171f;
+        }
+        [data-testid="stSidebar"] > div:first-child {
+            padding-top: 0 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    visible_keys = ["portfolio", "equities", "risk_buckets", "pre_trade", "market_regime"]
     overflow_keys = [t["key"] for t in tabs if t["key"] not in visible_keys]
     overflow_labels = ["⋯"] + [tab_map[key] for key in overflow_keys]
     if st.session_state["active_tab_key"] in overflow_keys:
@@ -358,58 +436,71 @@ def render():
     else:
         overflow_default = "⋯"
 
-    st.markdown(
-        """
-        <style>
-        /* Active button styling */
-        button[key="nav_login"][aria-pressed="true"],
-        button[key="nav_portfolio"][aria-pressed="true"],
-        button[key="nav_risk_analysis"][aria-pressed="true"],
-        button[key="nav_risk_buckets"][aria-pressed="true"],
-        button[key="nav_stress_testing"][aria-pressed="true"] {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
-            border: 2px solid #8b5cf6 !important;
-            color: white !important;
-            font-weight: 700 !important;
-        }
-        [data-testid="stSidebar"] {
-            background: #14171f;
-        }
-        [data-testid="stSidebar"] > div:first-child {
-            padding-top: 12px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    
-    with st.container():
-        nav_cols = st.columns(6)
-        for idx, key in enumerate(visible_keys):
-            label = tab_map[key]
-            is_active = st.session_state["active_tab_key"] == key
-            with nav_cols[idx]:
-                if st.button(label, key=f"nav_{key}", use_container_width=True, type="primary" if is_active else "secondary"):
-                    st.session_state["active_tab_key"] = key
-                    st.rerun()
-        with nav_cols[5]:
-            selection = st.selectbox(
-                "More",
-                overflow_labels,
-                index=overflow_labels.index(overflow_default),
-                key="nav_more",
-                label_visibility="collapsed",
+    def set_active_tab(tab_key: str) -> None:
+        st.session_state["active_tab_key"] = tab_key
+
+    def handle_nav_more_change() -> None:
+        selection = st.session_state.get("nav_more", "⋯")
+        if selection != "⋯":
+            selected_key = next(
+                (k for k, v in tab_map.items() if v == selection),
+                None,
             )
-            if selection != "⋯":
-                selected_key = next(
-                    (k for k, v in tab_map.items() if v == selection),
-                    None,
-                )
-                if selected_key:
-                    st.session_state["active_tab_key"] = selected_key
+            if selected_key:
+                st.session_state["active_tab_key"] = selected_key
+
+    st.markdown('<div id="gs-nav" class="gs-nav">', unsafe_allow_html=True)
+    nav_cols = st.columns(6)
+    for idx, key in enumerate(visible_keys):
+        label = tab_map[key]
+        is_active = st.session_state["active_tab_key"] == key
+        if is_active:
+            background = "#1b4fd8"
+            text_color = "#ffffff"
+            hover_bg = "#2d7dff"
+        else:
+            background = "#1f2a3d"
+            text_color = "#dbe6ff"
+            hover_bg = "#2a3547"
+
+        with nav_cols[idx]:
+            with stylable_container(
+                key=f"nav_btn_{key}",
+                css_styles=f"""
+                    button {{
+                        width: 100%;
+                        border-radius: 999px;
+                        padding: 0 rem 0 arem;
+                        background: {background} !important;
+                        color: {text_color} !important;
+                        border: 0 !important;
+                        font-weight: 700;
+                        font-size: 0.75rem;
+                        transition: background 150ms ease, transform 150ms ease;
+                        white-space: nowrap;
+                        box-shadow: {"0 0 0 2px #2d7dff inset" if is_active else "none"};
+                    }}
+                    button:hover {{
+                        background: {hover_bg} !important;
+                        transform: translateY(-1px);
+                    }}
+                """,
+            ):
+                st.button(label, key=f"nav_{key}", on_click=set_active_tab, args=(key,))
+    with nav_cols[5]:
+        st.selectbox(
+            "More",
+            overflow_labels,
+            index=overflow_labels.index(overflow_default),
+            key="nav_more",
+            label_visibility="collapsed",
+            on_change=handle_nav_more_change,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
     active_key = st.session_state["active_tab_key"]
 
     if active_key == "login":
+        st.markdown("---")
         render_login_tab()
         return
 
@@ -428,33 +519,39 @@ def render():
         )
 
     if active_key == "portfolio":
+        st.markdown("---")
         render_portfolio_dashboard_tab()
-    elif active_key == "risk_analysis":
-        render_risk_analysis_tab()
     elif active_key == "equities":
+        st.markdown("---")
         render_equities_tab()
     elif active_key == "risk_buckets":
+        st.markdown("---")
         render_risk_buckets_tab()
-    elif active_key == "portfolio_buckets":
-        render_portfolio_buckets_tab()
+    elif active_key == "pre_trade":
+        subtab = st.radio(
+            "Pre-Trade Tool",
+            ["Stress Testing", "Trade Selector"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+        if subtab == "Stress Testing":
+            st.markdown("---")
+            render_pre_trade_analysis_tab()
+        else:
+            st.markdown("---")
+            render_trade_selector_tab()
     elif active_key == "market_regime":
+        st.markdown("---")
         render_market_regime_tab()
-    elif active_key == "stress_testing":
-        render_stress_testing_tab()
-    elif active_key == "diagnostics":
-        render_diagnostics_tab()
-    elif active_key == "hedge_lab":
-        render_hedge_lab_tab()
     elif active_key == "historical":
+        st.markdown("---")
         render_historical_performance_tab()
-    elif active_key == "greeks_debug":
-        render_greeks_debug_tab()
     elif active_key == "product_overview":
+        st.markdown("---")
         render_product_overview_tab()
     elif active_key == "derivatives_data":
+        st.markdown("---")
         render_derivatives_data_tab()
-    elif active_key == "trade_selector":
-        render_trade_selector_tab()
 
     # markers are hidden via CSS; no closing tags required
     st.markdown(
