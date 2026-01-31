@@ -374,9 +374,9 @@ def _compute_trade_sim_metrics(
     legs: List[Dict[str, object]],
     config: SimulationConfig,
     account_size: float,
-) -> Tuple[float, float, float, float, float]:
+) -> Tuple[float, float, float, float, float, float, float]:
     if not legs or account_size <= 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     sigma, sigma_source = _get_sigma_source(legs)
     iv_shift = 0.0
@@ -415,6 +415,7 @@ def _compute_trade_sim_metrics(
     expected_pnl_inr = float(np.mean(pnl_tn))
     expected_pnl_pct = (expected_pnl_inr / account_size * 100.0) if account_size else 0.0
     mean_loss_inr = float(-np.mean(pnl_tn[pnl_tn < 0])) if np.any(pnl_tn < 0) else 0.0
+    prob_profit = float(np.mean(pnl_tn >= 0)) if pnl_tn.size else 0.0
 
     worst_count = max(1, int(math.ceil(0.01 * len(pnl_tn))))
     worst_slice = np.sort(pnl_tn)[:worst_count]
@@ -422,7 +423,7 @@ def _compute_trade_sim_metrics(
     es99_inr = abs(es99_tail_mean)
     es99_pct = (es99_inr / account_size * 100.0) if account_size else 0.0
 
-    return expected_pnl_inr, expected_pnl_pct, es99_inr, es99_pct, es99_tail_mean, mean_loss_inr
+    return expected_pnl_inr, expected_pnl_pct, es99_inr, es99_pct, es99_tail_mean, mean_loss_inr, prob_profit
 
 
 def compute_trade_risk(
@@ -461,7 +462,7 @@ def compute_trade_risk(
             es99_pct, es99_value, _, _ = _compute_trade_es99(
                 legs, account_size, scenarios, iv_regime, int(lookback_days)
             )
-            exp_pnl_value, exp_pnl_pct, _, _, es99_tail_mean, mean_loss_inr = _compute_trade_sim_metrics(
+            exp_pnl_value, exp_pnl_pct, _, _, es99_tail_mean, mean_loss_inr, prob_profit = _compute_trade_sim_metrics(
                 legs, sim_cfg, account_size
             )
             trade_greeks = calculate_portfolio_greeks(legs)
@@ -480,6 +481,7 @@ def compute_trade_risk(
             exp_pnl_pct, exp_pnl_value = 0.0, 0.0
             es99_tail_mean = 0.0
             mean_loss_inr = 0.0
+            prob_profit = 0.0
             theta_carry = 0.0
             theta_per_lakh = 0.0
             gamma_per_lakh = 0.0
@@ -532,6 +534,7 @@ def compute_trade_risk(
                 "tail_loss_inr": abs(es99_tail_mean) if es99_tail_mean < 0 else 0.0,
                 "theta_carry_inr": theta_carry,
                 "mean_loss_inr": mean_loss_inr,
+                "prob_profit": prob_profit,
                 "mean_tail_ratio": (mean_loss_inr / abs(es99_tail_mean))
                 if es99_tail_mean < 0
                 else 0.0,
@@ -2778,6 +2781,7 @@ def render_risk_buckets_tab() -> None:
             alt.Tooltip("expected_pnl_inr:Q", title="Mean PnL", format=",.0f"),
             alt.Tooltip("tail_loss_inr:Q", title="Tail Loss", format=",.0f"),
             alt.Tooltip("mean_loss_inr:Q", title="Mean Loss", format=",.0f"),
+            alt.Tooltip("prob_profit:Q", title="PoP", format=".1%"),
             alt.Tooltip("premium_received_inr:Q", title="Premium", format=",.0f"),
             alt.Tooltip("capital_inr:Q", title="Capital", format=",.0f"),
             alt.Tooltip("risk_reward:Q", title="Reward/Risk", format=".3f"),
@@ -2964,6 +2968,11 @@ def render_risk_buckets_tab() -> None:
                         legend=alt.Legend(title="Reward/Risk"),
                         scale=alt.Scale(scheme="redyellowgreen", clamp=True),
                     ),
+                    size=alt.Size(
+                        "prob_profit:Q",
+                        legend=alt.Legend(title="PoP"),
+                        scale=alt.Scale(range=[40, 400]),
+                    ),
                     shape=alt.Shape("option_side:N", legend=alt.Legend(title="Side")),
                     tooltip=tooltip_cols,
                 )
@@ -2978,6 +2987,11 @@ def render_risk_buckets_tab() -> None:
                         f"{y_field}:Q",
                         title=y_title,
                         scale=alt.Scale(type="log") if log_loss_axis else alt.Scale(zero=True),
+                    ),
+                    size=alt.Size(
+                        "prob_profit:Q",
+                        legend=None,
+                        scale=alt.Scale(range=[40, 400]),
                     ),
                     shape=alt.Shape("option_side:N", legend=alt.Legend(title="Side")),
                     tooltip=tooltip_cols,
