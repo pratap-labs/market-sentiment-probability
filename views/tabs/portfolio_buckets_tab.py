@@ -3,24 +3,22 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
-from typing import Dict, List, Tuple
+from datetime import datetime, date
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
 
 from scripts.utils import (
-    build_threshold_report,
     calculate_portfolio_greeks,
     compute_var_es_metrics,
     get_weighted_scenarios,
+    classify_bucket,
 )
 from scripts.utils.formatters import format_inr
+from scripts.utils.option_pricing import price_option
 from views.tabs.risk_analysis_tab import (
     DEFAULT_BUCKET_PROBS,
-    DEFAULT_ES99_LIMIT,
-    DEFAULT_THRESHOLD_NORMAL_SHARE,
-    DEFAULT_THRESHOLD_STRESS_SHARE,
     classify_zone,
     compute_historical_bucket_probabilities,
     get_iv_regime,
@@ -49,6 +47,9 @@ def _init_portfolio_bucket_state() -> None:
     st.session_state.setdefault("pb_allow_new_med", True)
     st.session_state.setdefault("pb_allow_new_high", True)
     st.session_state.setdefault("pb_es_lookback_days", 504)
+    st.session_state.setdefault("pb_spot_input", 0.0)
+    st.session_state.setdefault("pb_target_date", datetime.now().date())
+    st.session_state.setdefault("pb_forward_override", 0.0)
 
 
 def _sync_total_capital_from_account() -> None:
@@ -68,6 +69,38 @@ def _sync_total_capital_from_account() -> None:
 
 def _parse_label_list(value: str) -> List[str]:
     return [item.strip().lower() for item in (value or "").split(",") if item.strip()]
+
+
+def _resolve_target_date(target_date: Optional[object]) -> date:
+    if isinstance(target_date, date):
+        return target_date
+    if isinstance(target_date, datetime):
+        return target_date.date()
+    return datetime.now().date()
+
+
+def _resolve_time_to_expiry(leg: Dict[str, object], target_date: date) -> Optional[float]:
+    expiry = leg.get("expiry")
+    if isinstance(expiry, datetime):
+        expiry_date = expiry.date()
+    elif isinstance(expiry, date):
+        expiry_date = expiry
+    else:
+        expiry_date = None
+    if expiry_date is not None:
+        days = max((expiry_date - target_date).days, 0)
+        return max(days / 365.0, 1.0 / 365.0)
+    dte = leg.get("dte")
+    try:
+        dte_val = float(dte)
+        return max(dte_val / 365.0, 1.0 / 365.0) if dte_val >= 0 else None
+    except Exception:
+        pass
+    tte = leg.get("time_to_expiry")
+    try:
+        return float(tte)
+    except Exception:
+        return None
 
 
 def _derive_underlying(position: Dict[str, object]) -> str:
@@ -113,6 +146,12 @@ def _group_positions_by_trade(
 ) -> List[Dict[str, object]]:
     grouped: Dict[Tuple[str, str], Dict[str, object]] = {}
     for pos in positions:
+        try:
+            qty_val = float(pos.get("quantity") or 0.0)
+        except Exception:
+            qty_val = 0.0
+        if qty_val == 0.0:
+            continue
         if key_func:
             key = key_func(pos)
             if not isinstance(key, tuple):
@@ -141,36 +180,20 @@ def _compute_trade_es99(
     scenarios: List[object],
     iv_regime: str,
     lookback_days: int,
-) -> Tuple[float, float, float, float]:
-    trade_greeks = calculate_portfolio_greeks(legs)
-    spot = next((leg.get("spot_price") for leg in legs if leg.get("spot_price")), 0.0)
-    threshold_context = build_threshold_report(
-        portfolio={
-            "delta": trade_greeks.get("net_delta", 0.0),
-            "gamma": trade_greeks.get("net_gamma", 0.0),
-            "vega": trade_greeks.get("net_vega", 0.0),
-            "spot": float(spot or 0.0),
-            "nav": float(account_size),
-            "margin": 0.0,
-        },
-        scenarios=[
-            {
-                "name": scenario.name,
-                "dS_pct": scenario.ds_pct,
-                "dIV_pts": scenario.div_pts,
-                "type": scenario.category.upper(),
-            }
-            for scenario in scenarios
-        ],
-        master_pct=float(st.session_state.get("strategy_es_limit", DEFAULT_ES99_LIMIT)),
-        hard_stop_pct=float(st.session_state.get("strategy_es_limit", DEFAULT_ES99_LIMIT)) * 1.2,
-        normal_share=DEFAULT_THRESHOLD_NORMAL_SHARE,
-        stress_share=DEFAULT_THRESHOLD_STRESS_SHARE,
-    )
-    derived_rows = threshold_context.get("rows", [])
-    if not derived_rows:
-        return 0.0, 0.0, 0.0, 0.0
+    spot_override: Optional[float] = None,
+    forward_override: Optional[float] = None,
+    target_date: Optional[object] = None,
+    t_override_days: Optional[float] = None,
+    iv_snapshot_override: Optional[List[Optional[float]]] = None,
+    return_debug: bool = False,
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[str]]:
+    spot = float(spot_override or 0.0)
+    if spot <= 0 or not scenarios:
+        if return_debug:
+            return None, None, None, None, None, "invalid_spot" if spot <= 0 else "scenario_empty"
+        return 0.0, 0.0, 0.0, 0.0, 0.0
 
+    target_day = _resolve_target_date(target_date)
     bucket_probs, _, _ = compute_historical_bucket_probabilities(
         lookback=int(lookback_days),
         smoothing_enabled=False,
@@ -178,28 +201,144 @@ def _compute_trade_es99(
     )
     if not bucket_probs:
         bucket_probs = DEFAULT_BUCKET_PROBS.copy()
-    bucket_counts = defaultdict(int)
-    for row in derived_rows:
-        bucket_counts[row["bucket"]] += 1
-    for row in derived_rows:
-        bucket = row["bucket"]
+
+    bucket_counts: Dict[str, int] = defaultdict(int)
+    scenario_buckets: Dict[str, str] = {}
+    for scenario in scenarios:
+        bucket = classify_bucket(
+            {"type": scenario.category.upper(), "dS_pct": scenario.ds_pct, "dIV_pts": scenario.div_pts}
+        )
+        scenario_buckets[scenario.name] = bucket
+        bucket_counts[bucket] += 1
+
+    scenario_probs: Dict[str, float] = {}
+    for scenario in scenarios:
+        bucket = scenario_buckets.get(scenario.name, "E")
         bucket_prob = bucket_probs.get(bucket, 0.0)
         count = bucket_counts.get(bucket, 0)
-        row["probability"] = bucket_prob / count if count and bucket_prob > 0 else 0.0
+        scenario_probs[scenario.name] = bucket_prob / count if count and bucket_prob > 0 else 0.0
 
-    loss_distribution = [
-        {"loss_pct": row["loss_pct_nav"], "prob": row["probability"], "scenario": row["scenario"]}
-        for row in derived_rows
-    ]
+    risk_free_rate = 0.07
+    forward_base = float(forward_override) if forward_override and forward_override > 0 else None
+    scenario_pnls: Dict[str, float] = {}
+    used_total = 0
+    error_reason = None
+
+    for scenario in scenarios:
+        base_pnl = 0.0
+        for leg in legs:
+            try:
+                base_pnl += float(leg.get("pnl", leg.get("m2m", 0.0)) or 0.0)
+            except Exception:
+                continue
+        scenario_spot = spot * (1 + scenario.ds_pct / 100.0)
+        scenario_forward = forward_base * (1 + scenario.ds_pct / 100.0) if forward_base else None
+        scenario_iv_shift = scenario.div_pts / 100.0
+        total_pnl = base_pnl
+        used_positions = 0
+
+        for idx, leg in enumerate(legs):
+            option_type = leg.get("option_type") or leg.get("instrument_type")
+            strike = leg.get("strike", leg.get("strike_price"))
+            iv = leg.get("implied_vol")
+            if iv is None:
+                iv = leg.get("iv")
+            if iv is None:
+                iv = leg.get("implied_volatility")
+            if iv_snapshot_override is not None:
+                try:
+                    iv_override = iv_snapshot_override[idx]
+                except Exception:
+                    iv_override = None
+                if iv_override is not None:
+                    iv = iv_override
+            last_price = leg.get("last_price")
+            if last_price is None:
+                last_price = leg.get("ltp")
+            if last_price is None:
+                last_price = leg.get("close")
+            qty = leg.get("quantity", 0)
+
+            if option_type not in {"CE", "PE"}:
+                continue
+            if strike is None or iv is None or last_price is None:
+                continue
+
+            if t_override_days is not None:
+                try:
+                    tte = max(float(t_override_days) / 365.0, 1.0 / 365.0)
+                except Exception:
+                    tte = None
+            else:
+                tte = _resolve_time_to_expiry(leg, target_day)
+            if tte is None:
+                continue
+
+            shock_iv = max(float(iv) + scenario_iv_shift, 0.0001)
+            flag = "c" if option_type == "CE" else "p"
+            try:
+                new_price = price_option(
+                    flag,
+                    float(scenario_spot),
+                    float(strike),
+                    float(tte),
+                    risk_free_rate,
+                    float(shock_iv),
+                    model="black76",
+                    forward=scenario_forward,
+                )
+            except Exception:
+                continue
+            if new_price is None:
+                continue
+
+            total_pnl += (new_price - float(last_price)) * float(qty)
+            used_positions += 1
+            used_total += 1
+
+        if used_positions == 0:
+            total_pnl = base_pnl
+        scenario_pnls[scenario.name] = total_pnl
+    if used_total == 0:
+        error_reason = "missing_chain"
+        if return_debug:
+            return None, None, None, None, None, error_reason
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+    loss_distribution = []
+    expected_pnl_inr = 0.0
+    loss_prob = 0.0
+    loss_weighted = 0.0
+    for scenario in scenarios:
+        if scenario.name not in scenario_pnls:
+            continue
+        pnl_value = scenario_pnls.get(scenario.name, 0.0)
+        prob = scenario_probs.get(scenario.name, 0.0)
+        expected_pnl_inr += pnl_value * prob
+        if pnl_value < 0:
+            loss_weighted += (-pnl_value) * prob
+            loss_prob += prob
+        loss_pct = (-pnl_value / account_size * 100.0) if pnl_value < 0 and account_size else 0.0
+        loss_distribution.append({"loss_pct": loss_pct, "prob": prob, "scenario": scenario})
+
+    if not loss_distribution:
+        error_reason = "scenario_empty"
+        if return_debug:
+            return None, None, None, None, None, error_reason
+        return 0.0, 0.0, 0.0, 0.0, 0.0
     metrics = compute_var_es_metrics(loss_distribution, account_size)
-    expected_pnl_inr = sum(row.get("pnl_total", 0.0) * row.get("probability", 0.0) for row in derived_rows)
     expected_pnl_pct = (expected_pnl_inr / account_size * 100.0) if account_size else 0.0
-    return (
+    mean_loss_inr = (loss_weighted / loss_prob) if loss_prob > 0 else 0.0
+    result = (
         float(metrics.get("ES99", 0.0)),
         float(metrics.get("ES99Value", 0.0)),
         float(expected_pnl_pct),
         float(expected_pnl_inr),
+        float(mean_loss_inr),
     )
+    if return_debug:
+        return (*result, error_reason)
+    return result
 
 
 def _classify_trade_zone(
@@ -272,6 +411,31 @@ def render_portfolio_buckets_tab() -> None:
             format="%.2f",
             key="pb_total_capital",
         )
+    spot_default = float(st.session_state.get("pb_spot_input") or st.session_state.get("current_spot") or 0.0)
+    st.sidebar.number_input(
+        "Spot price (override)",
+        min_value=0.0,
+        step=10.0,
+        format="%.2f",
+        value=spot_default,
+        key="pb_spot_input",
+        help="Overrides spot used in trade ES99 for this tab.",
+    )
+    st.sidebar.date_input(
+        "Target date (repricing)",
+        value=st.session_state.get("pb_target_date", datetime.now().date()),
+        key="pb_target_date",
+        help="Used for Black-76 repricing (target date time to expiry).",
+    )
+    st.sidebar.number_input(
+        "Target-day futures price (optional)",
+        min_value=0.0,
+        step=10.0,
+        format="%.2f",
+        value=float(st.session_state.get("pb_forward_override", 0.0) or 0.0),
+        key="pb_forward_override",
+        help="Leave 0 to use spot-derived forward. Scenario shocks apply to this base.",
+    )
     alloc_low = st.sidebar.number_input("Low bucket allocation %", min_value=0.0, max_value=100.0, step=1.0, key="pb_alloc_low")
     alloc_med = st.sidebar.number_input("Medium bucket allocation %", min_value=0.0, max_value=100.0, step=1.0, key="pb_alloc_med")
     alloc_high = st.sidebar.number_input("High bucket allocation %", min_value=0.0, max_value=100.0, step=1.0, key="pb_alloc_high")
@@ -315,6 +479,9 @@ def render_portfolio_buckets_tab() -> None:
             iv_percentile = 35
     iv_regime, _ = get_iv_regime(iv_percentile)
     scenarios = get_weighted_scenarios(iv_regime)
+    spot_override = st.session_state.get("pb_spot_input")
+    forward_override = st.session_state.get("pb_forward_override")
+    target_date = st.session_state.get("pb_target_date")
 
     trades = _group_positions_by_trade(positions)
     trade_rows = []
@@ -323,8 +490,15 @@ def render_portfolio_buckets_tab() -> None:
         legs = trade["legs"]
         total_legs += len(legs)
         try:
-            es99_pct, es99_value, _, _ = _compute_trade_es99(
-                legs, total_capital, scenarios, iv_regime, int(lookback_days)
+            es99_pct, es99_value, _, _, _ = _compute_trade_es99(
+                legs,
+                total_capital,
+                scenarios,
+                iv_regime,
+                int(lookback_days),
+                spot_override=spot_override,
+                forward_override=forward_override,
+                target_date=target_date,
             )
         except Exception:
             es99_pct, es99_value = 0.0, 0.0

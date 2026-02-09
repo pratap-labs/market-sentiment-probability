@@ -269,9 +269,26 @@ def render_equities_tab() -> None:
 
     st.session_state.setdefault("equities_loaded", False)
     st.session_state.setdefault("equities_holdings", None)
+    st.session_state.setdefault("equities_autoload_attempted", False)
 
     api_key = st.session_state.get("kite_api_key")
     access_token = st.session_state.get("kite_access_token")
+
+    if (
+        api_key
+        and access_token
+        and KiteConnect is not None
+        and not st.session_state.get("equities_loaded")
+        and not st.session_state.get("equities_autoload_attempted")
+    ):
+        st.session_state["equities_autoload_attempted"] = True
+        try:
+            holdings = _fetch_holdings(api_key, access_token)
+            if holdings:
+                st.session_state["equities_holdings"] = holdings
+                st.session_state["equities_loaded"] = True
+        except Exception:
+            pass
     
     # Sidebar buttons to load holdings
     col_a, col_b = st.sidebar.columns(2)

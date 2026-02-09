@@ -23,6 +23,16 @@ from datetime import datetime
 CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
 
 
+@st.cache_data(ttl=259200)
+def _fetch_positions_cached(api_key: str, access_token: str):
+    if KiteConnect is None:
+        return []
+    kite = KiteConnect(api_key=api_key)
+    kite.set_access_token(access_token)
+    positions = kite.positions()
+    return positions.get("net", []) or []
+
+
 def load_from_cache(data_type: str) -> pd.DataFrame:
     """Load data from most recent cache file."""
     cache_file = CACHE_DIR / f"{data_type}_{datetime.now().strftime('%Y-%m-%d')}.csv"
@@ -66,7 +76,32 @@ def render_positions_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame
     if not kite_api_key:
         st.error("API key not found in session. Please log in again.")
         return
-        
+
+    if (
+        "enriched_positions" not in st.session_state
+        and not st.session_state.get("positions_autoload_attempted")
+        and not options_df.empty
+    ):
+        st.session_state["positions_autoload_attempted"] = True
+        try:
+            net_positions = _fetch_positions_cached(kite_api_key, access_token)
+            if net_positions:
+                market_regime = calculate_market_regime(options_df, nifty_df)
+                current_spot = market_regime.get("current_spot", 25000)
+                if nifty_df is not None and not nifty_df.empty and "close" in nifty_df.columns:
+                    try:
+                        current_spot = float(nifty_df["close"].dropna().iloc[-1])
+                    except Exception:
+                        pass
+                enriched = []
+                for pos in net_positions:
+                    enriched_pos = enrich_position_with_greeks(pos, options_df, current_spot)
+                    enriched.append(enriched_pos)
+                st.session_state["enriched_positions"] = enriched
+                st.session_state["current_spot"] = current_spot
+        except Exception:
+            pass
+
     kite = KiteConnect(api_key=kite_api_key)
     kite.set_access_token(access_token)
 

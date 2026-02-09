@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -20,8 +20,10 @@ from scripts.utils import (
     compute_var_es_metrics,
     get_weighted_scenarios,
     enrich_position_with_greeks,
+    classify_bucket,
 )
 from scripts.utils.formatters import format_inr
+from scripts.utils.option_pricing import price_option
 from views.tabs.portfolio_buckets_tab import (
     _classify_trade_zone,
     _compute_trade_es99,
@@ -44,7 +46,7 @@ from views.tabs.risk_analysis_tab import (
 from views.tabs import risk_analysis_tab as ra_tab
 from scripts.utils.stress_testing import Scenario
 from scripts.utils import classify_history_bucket
-from collections import Counter
+from collections import Counter, defaultdict
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -81,6 +83,12 @@ def _init_tba_state() -> None:
     st.session_state.setdefault("tba_iv_shock", 2.0)
     st.session_state.setdefault("tba_spot_overlay", False)
     st.session_state.setdefault("tba_spot_input", 0.0)
+    st.session_state.setdefault("tba_target_date", datetime.now().date())
+    st.session_state.setdefault("tba_forward_override", 0.0)
+    st.session_state.setdefault("tba_dense_scenarios", True)
+    st.session_state.setdefault("tba_scenario_step", 1.0)
+    st.session_state.setdefault("tba_scenario_max", 10.0)
+    st.session_state.setdefault("tba_iv_slope", 0.5)
     st.session_state.setdefault("tba_bucket_sim_target", "Portfolio")
     st.session_state.setdefault("tba_trade_filter_underlying", "All")
     st.session_state.setdefault("tba_trade_filter_week", "All")
@@ -95,10 +103,459 @@ def _init_tba_state() -> None:
     st.session_state.setdefault("tba_trade_group_selection", [])
     st.session_state.setdefault("tba_clear_trade_group", False)
     st.session_state.setdefault("tba_use_saved_groups", bool(st.session_state.get("tba_saved_trades")))
+    st.session_state.setdefault("tba_manual_bucket_assignments", {})
 
 
 def _saved_groups_path() -> Path:
     return Path("database") / "trade_groups.json"
+
+
+def _resolve_target_date(target_date: Optional[object]) -> date:
+    if isinstance(target_date, datetime):
+        return target_date.date()
+    if isinstance(target_date, date):
+        return target_date
+    return datetime.now().date()
+
+
+def _resolve_time_to_expiry(leg: Dict[str, object], target_date: date) -> Optional[float]:
+    expiry = leg.get("expiry")
+    if isinstance(expiry, datetime):
+        expiry_date = expiry.date()
+    elif isinstance(expiry, date):
+        expiry_date = expiry
+    else:
+        expiry_date = None
+    if expiry_date is not None:
+        days = max((expiry_date - target_date).days, 0)
+        return max(days / 365.0, 1.0 / 365.0)
+    dte = leg.get("dte")
+    try:
+        dte_val = float(dte)
+        return max(dte_val / 365.0, 1.0 / 365.0) if dte_val >= 0 else None
+    except Exception:
+        pass
+    tte = leg.get("time_to_expiry")
+    try:
+        return float(tte)
+    except Exception:
+        return None
+
+
+def _compute_trade_payoff_curve(
+    legs: List[Dict[str, object]],
+    spot: float,
+    forward_override: Optional[float],
+    target_date: Optional[object],
+    span_pct: float = 0.12,
+    steps: int = 60,
+    risk_free_rate: float = 0.07,
+    include_unrealized_pnl: bool = True,
+) -> pd.DataFrame:
+    if spot <= 0 or not legs:
+        return pd.DataFrame()
+    target_day = _resolve_target_date(target_date)
+    forward_base = float(forward_override) if forward_override and forward_override > 0 else None
+    low = max(1.0, spot * (1 - span_pct))
+    high = spot * (1 + span_pct)
+    grid = np.linspace(low, high, steps)
+    base_pnl = 0.0
+    if include_unrealized_pnl:
+        for leg in legs:
+            try:
+                base_pnl += float(leg.get("pnl", leg.get("m2m", 0.0)) or 0.0)
+            except Exception:
+                continue
+    rows = []
+    for grid_spot in grid:
+        total_pnl = base_pnl
+        used_positions = 0
+        missing_fields = 0
+        scenario_forward = forward_base * (grid_spot / spot) if forward_base else None
+        for leg in legs:
+            option_type = leg.get("option_type") or leg.get("instrument_type")
+            strike = leg.get("strike", leg.get("strike_price"))
+            iv = leg.get("implied_vol")
+            if iv is None:
+                iv = leg.get("iv")
+            if iv is None:
+                iv = leg.get("implied_volatility")
+            last_price = leg.get("last_price")
+            if last_price is None:
+                last_price = leg.get("ltp")
+            if last_price is None:
+                last_price = leg.get("close")
+            qty = leg.get("quantity", 0)
+            try:
+                qty_val = float(qty)
+            except Exception:
+                qty_val = 0.0
+            if qty_val == 0.0:
+                continue
+            if option_type not in {"CE", "PE"}:
+                continue
+            if strike is None or iv is None or last_price is None:
+                missing_fields += 1
+                continue
+            tte = _resolve_time_to_expiry(leg, target_day)
+            if tte is None:
+                missing_fields += 1
+                continue
+            flag = "c" if option_type == "CE" else "p"
+            try:
+                new_price = price_option(
+                    flag,
+                    float(grid_spot),
+                    float(strike),
+                    float(tte),
+                    risk_free_rate,
+                    float(iv),
+                    model="black76",
+                    forward=scenario_forward,
+                )
+            except Exception:
+                continue
+            if new_price is None:
+                continue
+            total_pnl += (new_price - float(last_price)) * float(qty)
+            used_positions += 1
+        if used_positions == 0:
+            total_pnl = 0.0
+        rows.append(
+            {
+                "spot": float(grid_spot),
+                "pnl": float(total_pnl),
+                "used_positions": int(used_positions),
+                "missing_fields": int(missing_fields),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _compute_expiry_payoff_curve(
+    legs: List[Dict[str, object]],
+    spot: float,
+    span_pct: float = 0.12,
+    steps: int = 60,
+    include_unrealized_pnl: bool = True,
+) -> pd.DataFrame:
+    if spot <= 0 or not legs:
+        return pd.DataFrame()
+    low = max(1.0, spot * (1 - span_pct))
+    high = spot * (1 + span_pct)
+    grid = np.linspace(low, high, steps)
+    base_pnl = 0.0
+    if include_unrealized_pnl:
+        for leg in legs:
+            try:
+                base_pnl += float(leg.get("pnl", leg.get("m2m", 0.0)) or 0.0)
+            except Exception:
+                continue
+    rows = []
+    for grid_spot in grid:
+        total_pnl = base_pnl
+        used_positions = 0
+        missing_fields = 0
+        for leg in legs:
+            option_type = leg.get("option_type") or leg.get("instrument_type")
+            strike = leg.get("strike", leg.get("strike_price"))
+            last_price = leg.get("last_price")
+            if last_price is None:
+                last_price = leg.get("ltp")
+            if last_price is None:
+                last_price = leg.get("close")
+            qty = leg.get("quantity", 0)
+            try:
+                qty_val = float(qty)
+            except Exception:
+                qty_val = 0.0
+            if qty_val == 0.0:
+                continue
+            if option_type not in {"CE", "PE"}:
+                continue
+            if strike is None or last_price is None:
+                missing_fields += 1
+                continue
+            strike_val = float(strike)
+            if option_type == "CE":
+                intrinsic = max(float(grid_spot) - strike_val, 0.0)
+            else:
+                intrinsic = max(strike_val - float(grid_spot), 0.0)
+            total_pnl += (intrinsic - float(last_price)) * float(qty_val)
+            used_positions += 1
+        if used_positions == 0:
+            total_pnl = base_pnl
+        rows.append(
+            {
+                "spot": float(grid_spot),
+                "pnl": float(total_pnl),
+                "used_positions": int(used_positions),
+                "missing_fields": int(missing_fields),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _apply_payoff_zone_shading(fig: go.Figure, curve_df: pd.DataFrame) -> None:
+    if curve_df.empty:
+        return
+    x_vals = curve_df["spot"]
+    y_vals = curve_df["pnl"]
+    pos_y = y_vals.where(y_vals >= 0, 0)
+    neg_y = y_vals.where(y_vals < 0, 0)
+    fig.add_trace(
+        go.Scatter(
+            x=x_vals,
+            y=pos_y,
+            mode="lines",
+            line=dict(width=0),
+            fill="tozeroy",
+            fillcolor="rgba(46, 204, 113, 0.22)",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x_vals,
+            y=neg_y,
+            mode="lines",
+            line=dict(width=0),
+            fill="tozeroy",
+            fillcolor="rgba(231, 76, 60, 0.22)",
+            hoverinfo="skip",
+            showlegend=False,
+        )
+    )
+
+
+def _add_expiry_split_line(fig: go.Figure, expiry_df: pd.DataFrame) -> None:
+    if expiry_df is None or expiry_df.empty:
+        return
+    x_vals = expiry_df["spot"]
+    y_vals = expiry_df["pnl"]
+    pos_x: List[float] = []
+    pos_y: List[Optional[float]] = []
+    neg_x: List[float] = []
+    neg_y: List[Optional[float]] = []
+
+    for i in range(len(x_vals)):
+        x = float(x_vals.iloc[i])
+        y = float(y_vals.iloc[i])
+
+        if y >= 0:
+            pos_x.append(x)
+            pos_y.append(y)
+            neg_x.append(x)
+            neg_y.append(None)
+        else:
+            pos_x.append(x)
+            pos_y.append(None)
+            neg_x.append(x)
+            neg_y.append(y)
+
+        if i < len(x_vals) - 1:
+            x_next = float(x_vals.iloc[i + 1])
+            y_next = float(y_vals.iloc[i + 1])
+            if (y >= 0 > y_next) or (y < 0 <= y_next):
+                if y_next != y:
+                    x_zero = x + (0.0 - y) * (x_next - x) / (y_next - y)
+                else:
+                    x_zero = x
+                pos_x.append(x_zero)
+                pos_y.append(0.0)
+                neg_x.append(x_zero)
+                neg_y.append(0.0)
+
+    fig.add_trace(
+        go.Scatter(
+            x=pos_x,
+            y=pos_y,
+            mode="lines",
+            line=dict(color="#58D68D", width=3),
+            name="On Expiry (Profit)",
+            showlegend=True,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=neg_x,
+            y=neg_y,
+            mode="lines",
+            line=dict(color="#E57373", width=3),
+            name="On Expiry (Loss)",
+            showlegend=True,
+        )
+    )
+
+
+def _segment_convexity_zones(
+    spots: Tuple[float, ...], conv_norm: Tuple[float, ...]
+) -> List[Dict[str, object]]:
+    zones: List[Dict[str, object]] = []
+    if not spots or not conv_norm or len(spots) != len(conv_norm):
+        return zones
+    def zone_of(value: float) -> str:
+        if value < 0.30:
+            return "THETA"
+        if value < 0.60:
+            return "WATCH"
+        return "ACTION"
+
+    current_zone = zone_of(conv_norm[0])
+    start_idx = 0
+    for i in range(1, len(spots)):
+        zone = zone_of(conv_norm[i])
+        if zone != current_zone:
+            zones.append(
+                {
+                    "zone": current_zone,
+                    "x0": float(spots[start_idx]),
+                    "x1": float(spots[i]),
+                    "idx0": start_idx,
+                    "idx1": i,
+                }
+            )
+            current_zone = zone
+            start_idx = i
+    zones.append(
+        {
+            "zone": current_zone,
+            "x0": float(spots[start_idx]),
+            "x1": float(spots[-1]),
+            "idx0": start_idx,
+            "idx1": len(spots) - 1,
+        }
+    )
+    return zones
+
+
+def _generate_dense_scenarios(max_abs: float, step: float, iv_slope: float) -> List[Scenario]:
+    scenarios: List[Scenario] = []
+    if step <= 0 or max_abs <= 0:
+        return scenarios
+    steps = int(round(max_abs / step))
+    for i in range(-steps, steps + 1):
+        ds = i * step
+        iv_pts = 0.0 if ds == 0 else abs(ds) * iv_slope
+        name = f"Spot {ds:+.0f}% / IV +{iv_pts:.1f}"
+        scenarios.append(Scenario(name=name, ds_pct=float(ds), div_pts=float(iv_pts), category="combined"))
+    return scenarios
+
+
+def _build_trade_scenario_table(
+    legs: List[Dict[str, object]],
+    scenarios: List[object],
+    spot: float,
+    forward_override: Optional[float],
+    target_date: Optional[object],
+    account_size: float,
+) -> pd.DataFrame:
+    if not legs or spot <= 0 or not scenarios:
+        return pd.DataFrame()
+    target_day = _resolve_target_date(target_date)
+    bucket_probs, _, _ = compute_historical_bucket_probabilities(
+        lookback=504,
+        smoothing_enabled=False,
+        smoothing_span=63,
+    )
+    if not bucket_probs:
+        bucket_probs = DEFAULT_BUCKET_PROBS.copy()
+    bucket_counts: Dict[str, int] = defaultdict(int)
+    scenario_buckets: Dict[str, str] = {}
+    for scenario in scenarios:
+        bucket = classify_bucket(
+            {"type": scenario.category.upper(), "dS_pct": scenario.ds_pct, "dIV_pts": scenario.div_pts}
+        )
+        scenario_buckets[scenario.name] = bucket
+        bucket_counts[bucket] += 1
+
+    scenario_probs: Dict[str, float] = {}
+    for scenario in scenarios:
+        bucket = scenario_buckets.get(scenario.name, "E")
+        bucket_prob = bucket_probs.get(bucket, 0.0)
+        count = bucket_counts.get(bucket, 0)
+        scenario_probs[scenario.name] = bucket_prob / count if count and bucket_prob > 0 else 0.0
+
+    risk_free_rate = 0.07
+    forward_base = float(forward_override) if forward_override and forward_override > 0 else None
+    rows: List[Dict[str, object]] = []
+    for scenario in scenarios:
+        scenario_spot = spot * (1 + scenario.ds_pct / 100.0)
+        scenario_forward = forward_base * (1 + scenario.ds_pct / 100.0) if forward_base else None
+        scenario_iv_shift = scenario.div_pts / 100.0
+        total_pnl = 0.0
+        used_positions = 0
+
+        for leg in legs:
+            option_type = leg.get("option_type") or leg.get("instrument_type")
+            strike = leg.get("strike", leg.get("strike_price"))
+            iv = leg.get("implied_vol")
+            if iv is None:
+                iv = leg.get("iv")
+            if iv is None:
+                iv = leg.get("implied_volatility")
+            last_price = leg.get("last_price")
+            if last_price is None:
+                last_price = leg.get("ltp")
+            if last_price is None:
+                last_price = leg.get("close")
+            qty = leg.get("quantity", 0)
+            try:
+                qty_val = float(qty)
+            except Exception:
+                qty_val = 0.0
+            if qty_val == 0.0:
+                continue
+            if option_type not in {"CE", "PE"}:
+                continue
+            if strike is None or iv is None or last_price is None:
+                continue
+            tte = _resolve_time_to_expiry(leg, target_day)
+            if tte is None:
+                continue
+            try:
+                total_pnl += float(leg.get("pnl", leg.get("m2m", 0.0)) or 0.0)
+            except Exception:
+                pass
+            shock_iv = max(float(iv) + scenario_iv_shift, 0.0001)
+            flag = "c" if option_type == "CE" else "p"
+            try:
+                new_price = price_option(
+                    flag,
+                    float(scenario_spot),
+                    float(strike),
+                    float(tte),
+                    risk_free_rate,
+                    float(shock_iv),
+                    model="black76",
+                    forward=scenario_forward,
+                )
+            except Exception:
+                continue
+            if new_price is None:
+                continue
+            total_pnl += (new_price - float(last_price)) * float(qty_val)
+            used_positions += 1
+
+        if used_positions == 0:
+            total_pnl = 0.0
+        loss_pct = (-total_pnl / account_size * 100.0) if total_pnl < 0 and account_size else 0.0
+        prob = scenario_probs.get(scenario.name, 0.0)
+        rows.append(
+            {
+                "Scenario": scenario.name,
+                "Bucket": scenario_buckets.get(scenario.name, "E"),
+                "dS% / dIV": f"{scenario.ds_pct:+.2f}% / {scenario.div_pts:+.1f}",
+                "Probability": f"{prob * 100:.4f}%",
+                "Repriced P&L (₹)": format_inr(total_pnl),
+                "Loss % NAV": f"{loss_pct:.4f}%",
+                "Loss × Prob": f"{(loss_pct * prob):.6f}%",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 
 
 def _load_saved_groups() -> List[Dict[str, object]]:
@@ -189,6 +646,12 @@ def build_trades_from_saved_groups(
         for idx, pos in enumerate(positions):
             pos_id = str(idx)
             if pos_id in leg_ids:
+                try:
+                    qty_val = float(pos.get("quantity") or 0.0)
+                except Exception:
+                    qty_val = 0.0
+                if qty_val == 0.0:
+                    continue
                 legs.append(pos)
         if not legs:
             continue
@@ -212,6 +675,7 @@ def build_trades_from_saved_groups(
                 "expiry": trade_name,
                 "legs": legs,
                 "option_side": trade_name,
+                "is_group_trade": True,
                 "earliest_expiry": min(expiries).strftime("%Y-%m-%d") if expiries else "—",
                 "latest_expiry": max(expiries).strftime("%Y-%m-%d") if expiries else "—",
                 "trade_name": trade_name,
@@ -230,6 +694,7 @@ def build_trades_using_existing_grouping(positions: List[Dict[str, object]]) -> 
 
     trades = _group_positions_by_trade(positions, key_func=_key_func)
     for trade in trades:
+        trade["is_group_trade"] = False
         expiries = []
         for leg in trade["legs"]:
             exp = leg.get("expiry")
@@ -374,9 +839,9 @@ def _compute_trade_sim_metrics(
     legs: List[Dict[str, object]],
     config: SimulationConfig,
     account_size: float,
-) -> Tuple[float, float, float, float, float, float, float]:
+) -> Tuple[float, float, float, float, float, float]:
     if not legs or account_size <= 0:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     sigma, sigma_source = _get_sigma_source(legs)
     iv_shift = 0.0
@@ -415,7 +880,6 @@ def _compute_trade_sim_metrics(
     expected_pnl_inr = float(np.mean(pnl_tn))
     expected_pnl_pct = (expected_pnl_inr / account_size * 100.0) if account_size else 0.0
     mean_loss_inr = float(-np.mean(pnl_tn[pnl_tn < 0])) if np.any(pnl_tn < 0) else 0.0
-    prob_profit = float(np.mean(pnl_tn >= 0)) if pnl_tn.size else 0.0
 
     worst_count = max(1, int(math.ceil(0.01 * len(pnl_tn))))
     worst_slice = np.sort(pnl_tn)[:worst_count]
@@ -423,13 +887,16 @@ def _compute_trade_sim_metrics(
     es99_inr = abs(es99_tail_mean)
     es99_pct = (es99_inr / account_size * 100.0) if account_size else 0.0
 
-    return expected_pnl_inr, expected_pnl_pct, es99_inr, es99_pct, es99_tail_mean, mean_loss_inr, prob_profit
+    return expected_pnl_inr, expected_pnl_pct, es99_inr, es99_pct, es99_tail_mean, mean_loss_inr
 
 
 def compute_trade_risk(
     trades: List[Dict[str, object]],
     account_size: float,
     lookback_days: int,
+    spot_override: Optional[float] = None,
+    forward_override: Optional[float] = None,
+    target_date: Optional[object] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, List[Dict[str, object]]]]:
     options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
     iv_percentile = 35
@@ -437,14 +904,7 @@ def compute_trade_risk(
         iv_percentile = 35
     iv_regime, _ = get_iv_regime(iv_percentile)
     scenarios = get_weighted_scenarios(iv_regime)
-    sim_cfg = SimulationConfig(
-        horizon_days=int(st.session_state.get("tba_sim_days", 10)),
-        paths=int(st.session_state.get("tba_sim_paths", 2000)),
-        iv_mode=st.session_state.get("tba_iv_mode", "IV Flat"),
-        iv_shock=float(st.session_state.get("tba_iv_shock", 2.0)),
-        include_spot_shocks=False,
-    )
-    horizon_days = max(1, min(int(sim_cfg.horizon_days), 20))
+    horizon_days = max(1, min(int(st.session_state.get("tba_sim_days", 10)), 20))
 
     rows = []
     legs_by_trade: Dict[str, List[Dict[str, object]]] = {}
@@ -459,11 +919,15 @@ def compute_trade_risk(
         )
         legs_by_trade[trade_id] = legs
         try:
-            es99_pct, es99_value, _, _ = _compute_trade_es99(
-                legs, account_size, scenarios, iv_regime, int(lookback_days)
-            )
-            exp_pnl_value, exp_pnl_pct, _, _, es99_tail_mean, mean_loss_inr, prob_profit = _compute_trade_sim_metrics(
-                legs, sim_cfg, account_size
+            es99_pct, es99_value, exp_pnl_pct, exp_pnl_value, mean_loss_inr = _compute_trade_es99(
+                legs,
+                account_size,
+                scenarios,
+                iv_regime,
+                int(lookback_days),
+                spot_override=spot_override,
+                forward_override=forward_override,
+                target_date=target_date,
             )
             trade_greeks = calculate_portfolio_greeks(legs)
             capital_in_lakhs = account_size / 100000.0 if account_size else 0.0
@@ -479,9 +943,7 @@ def compute_trade_risk(
         except Exception as exc:
             es99_pct, es99_value = 0.0, 0.0
             exp_pnl_pct, exp_pnl_value = 0.0, 0.0
-            es99_tail_mean = 0.0
             mean_loss_inr = 0.0
-            prob_profit = 0.0
             theta_carry = 0.0
             theta_per_lakh = 0.0
             gamma_per_lakh = 0.0
@@ -516,12 +978,15 @@ def compute_trade_risk(
         exp_pnl_value += premium_prorated
         exp_pnl_pct = (exp_pnl_value / account_size * 100.0) if account_size else 0.0
         margin_total = sum(_extract_margin(leg) for leg in legs)
+        tail_loss_inr = abs(es99_value) if es99_value else 0.0
+        es99_tail_pnl_inr = -tail_loss_inr if tail_loss_inr else 0.0
         rows.append(
             {
                 "trade_id": trade_id,
                 "underlying": trade["underlying"],
                 "week_id": trade["expiry"],
                 "option_side": trade_name or option_side,
+                "is_group_trade": bool(trade.get("is_group_trade", False)),
                 "earliest_expiry": trade.get("earliest_expiry", "—"),
                 "latest_expiry": trade.get("latest_expiry", "—"),
                 "legs": len(legs),
@@ -530,14 +995,11 @@ def compute_trade_risk(
                 "expected_pnl_inr": exp_pnl_value,
                 "expected_pnl_pct": exp_pnl_pct,
                 "risk_reward": (exp_pnl_value / abs(es99_value)) if es99_value else 0.0,
-                "es99_tail_pnl_inr": es99_tail_mean,
-                "tail_loss_inr": abs(es99_tail_mean) if es99_tail_mean < 0 else 0.0,
+                "es99_tail_pnl_inr": es99_tail_pnl_inr,
+                "tail_loss_inr": tail_loss_inr,
                 "theta_carry_inr": theta_carry,
                 "mean_loss_inr": mean_loss_inr,
-                "prob_profit": prob_profit,
-                "mean_tail_ratio": (mean_loss_inr / abs(es99_tail_mean))
-                if es99_tail_mean < 0
-                else 0.0,
+                "mean_tail_ratio": (mean_loss_inr / tail_loss_inr) if tail_loss_inr else 0.0,
                 "net_theta": trade_greeks.get("net_theta", 0.0),
                 "net_gamma": trade_greeks.get("net_gamma", 0.0),
                 "net_vega": trade_greeks.get("net_vega", 0.0),
@@ -565,6 +1027,7 @@ def assign_buckets(
     allocations: Dict[str, float],
     thresholds: Dict[str, float],
     zone_map: Dict[str, str],
+    manual_bucket_map: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     df = df_trades.copy()
     df["bucket"] = "Med"
@@ -574,6 +1037,17 @@ def assign_buckets(
     high_cap = total_capital * allocations[BUCKET_KEYS["High"]] / 100.0
 
     def _apply_bucket(row):
+        manual_bucket = None
+        if manual_bucket_map and row.get("is_group_trade"):
+            manual_bucket = manual_bucket_map.get(str(row.get("trade_id", "")))
+        if manual_bucket in {"Low", "Med", "High"}:
+            target_cap = {
+                "Low": low_cap,
+                "Med": med_cap,
+                "High": high_cap,
+            }[manual_bucket]
+            trade_pct = row["trade_es99_inr"] / target_cap * 100.0 if target_cap > 0 else 0.0
+            return manual_bucket, trade_pct
         zone_override = zone_map.get(str(row.get("zone_label", "")).strip(), "")
         if zone_override in {"low", "med", "high"}:
             target_cap = {"low": low_cap, "med": med_cap, "high": high_cap}[zone_override]
@@ -764,6 +1238,181 @@ def _get_spot_from_positions(positions: List[Dict[str, object]]) -> float:
     if spot_override:
         return float(spot_override)
     return _get_spot_fallback(positions)
+
+
+def _safe_leg_iv(leg: Dict[str, object]) -> Optional[float]:
+    for key in ("implied_vol", "iv", "implied_volatility"):
+        val = leg.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except Exception:
+                continue
+    return None
+
+
+def _infer_time_to_expiry_years(leg: Dict[str, object], base_date: Optional[datetime]) -> Optional[float]:
+    if leg.get("time_to_expiry") is not None:
+        try:
+            t = float(leg.get("time_to_expiry") or 0.0)
+            return max(t, 1.0 / 365.0)
+        except Exception:
+            pass
+    exp = leg.get("expiry")
+    if exp is None:
+        return None
+    try:
+        exp_dt = pd.to_datetime(exp, errors="coerce")
+    except Exception:
+        exp_dt = None
+    if exp_dt is None or pd.isna(exp_dt):
+        dte = leg.get("dte")
+        if dte is not None:
+            try:
+                days = max(int(float(dte)), 1)
+                return days / 365.0
+            except Exception:
+                return None
+        return None
+    base = base_date if isinstance(base_date, datetime) else datetime.now()
+    days = max((exp_dt.date() - base.date()).days, 1)
+    return days / 365.0
+
+
+def _compute_implied_vol_bisect(
+    flag: str,
+    spot: float,
+    strike: float,
+    time_to_expiry: float,
+    price: float,
+    risk_free_rate: float = 0.0,
+    forward: Optional[float] = None,
+) -> Optional[float]:
+    if price <= 0 or spot <= 0 or strike <= 0 or time_to_expiry <= 0:
+        return None
+    low = 1e-4
+    high = 3.0
+    price_low = price_option(flag, spot, strike, time_to_expiry, risk_free_rate, low, forward=forward)
+    price_high = price_option(flag, spot, strike, time_to_expiry, risk_free_rate, high, forward=forward)
+    if price_low is None or price_high is None:
+        return None
+    if price < price_low:
+        return low
+    if price > price_high:
+        return high
+    for _ in range(60):
+        mid = 0.5 * (low + high)
+        mid_price = price_option(flag, spot, strike, time_to_expiry, risk_free_rate, mid, forward=forward)
+        if mid_price is None:
+            return None
+        if mid_price > price:
+            high = mid
+        else:
+            low = mid
+    return 0.5 * (low + high)
+
+
+def _compute_leg_implied_vol(
+    leg: Dict[str, object],
+    spot: float,
+    base_date: Optional[datetime],
+    forward_override: Optional[float],
+) -> Optional[float]:
+    opt_type = str(leg.get("option_type") or leg.get("instrument_type") or "").upper()
+    flag = "c" if opt_type == "CE" else "p" if opt_type == "PE" else None
+    if flag is None:
+        return None
+    strike = leg.get("strike") or leg.get("strike_price")
+    try:
+        strike_val = float(strike)
+    except Exception:
+        return None
+    price = leg.get("last_price") or leg.get("ltp") or leg.get("close")
+    try:
+        price_val = float(price)
+    except Exception:
+        return None
+    t = _infer_time_to_expiry_years(leg, base_date)
+    if t is None:
+        return None
+    fwd = float(forward_override) if forward_override else None
+    return _compute_implied_vol_bisect(flag, spot, strike_val, t, price_val, 0.0, fwd)
+
+
+def _nearest_short_strikes(legs: List[Dict[str, object]]) -> Tuple[Optional[float], Optional[float]]:
+    short_call = None
+    short_put = None
+    for leg in legs:
+        try:
+            qty = float(leg.get("quantity") or 0.0)
+        except Exception:
+            qty = 0.0
+        if qty >= 0:
+            continue
+        opt_type = str(leg.get("option_type") or leg.get("instrument_type") or "").upper()
+        strike = leg.get("strike") or leg.get("strike_price")
+        try:
+            strike_val = float(strike)
+        except Exception:
+            continue
+        if opt_type == "CE":
+            short_call = strike_val if short_call is None else min(short_call, strike_val)
+        elif opt_type == "PE":
+            short_put = strike_val if short_put is None else max(short_put, strike_val)
+    return short_call, short_put
+
+
+def _days_to_expiry(legs: List[Dict[str, object]], base_date: Optional[datetime]) -> Optional[int]:
+    expiries = []
+    for leg in legs:
+        exp = leg.get("expiry")
+        if isinstance(exp, datetime):
+            expiries.append(exp.date())
+            continue
+        try:
+            dt = pd.to_datetime(exp, errors="coerce")
+        except Exception:
+            dt = None
+        if dt is None or pd.isna(dt):
+            dte = leg.get("dte")
+            if dte is not None:
+                try:
+                    return max(int(float(dte)), 1)
+                except Exception:
+                    continue
+        else:
+            expiries.append(dt.date())
+    if not expiries:
+        return None
+    base = base_date.date() if isinstance(base_date, datetime) else datetime.now().date()
+    days = (min(expiries) - base).days
+    return max(days, 1)
+
+
+def _compute_trade_es99_override(
+    legs: List[Dict[str, object]],
+    account_size: float,
+    scenarios: List[Scenario],
+    iv_regime: str,
+    lookback_days: int,
+    spot_override: float,
+    forward_override: float,
+    t_override_days: Optional[float],
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    es99_pct, es99_value, _, _, _, error_reason = _compute_trade_es99(
+        legs,
+        float(account_size),
+        scenarios,
+        iv_regime,
+        int(lookback_days),
+        spot_override=float(spot_override) if spot_override else None,
+        forward_override=float(forward_override) if forward_override else None,
+        t_override_days=t_override_days,
+        return_debug=True,
+    )
+    if es99_pct is None or es99_value is None:
+        return None, None, error_reason or "unknown"
+    return float(es99_pct), float(es99_value), None
 
 
 def _recompute_positions_with_spot(
@@ -1020,6 +1669,145 @@ def _format_breach(day: Optional[int], horizon: int) -> str:
     return f"{day}d" if day is not None else f"No breach in {horizon}d"
 
 
+def _compute_breach_probs(
+    pnl_paths: Optional[np.ndarray],
+    limit_inr: Optional[float],
+    day_window: int,
+) -> Optional[float]:
+    if pnl_paths is None or limit_inr is None:
+        return None
+    paths = np.asarray(pnl_paths)
+    if paths.ndim != 2 or paths.shape[1] == 0:
+        return None
+    window = min(int(day_window), paths.shape[1])
+    if window <= 0:
+        return None
+    breached = (paths[:, :window] <= limit_inr).any(axis=1)
+    return float(breached.mean())
+
+
+def render_bucket_header(
+    bucket_name: str,
+    bucket_metrics: Dict[str, object],
+    capital_context: Dict[str, float],
+    limits: Dict[str, float],
+) -> None:
+    total_capital = float(capital_context.get("total_capital") or 0.0)
+    target_capital = float(capital_context.get("target_capital") or 0.0)
+    deployed_capital = float(capital_context.get("deployed_capital") or 0.0)
+    target_pct = float(capital_context.get("target_pct") or 0.0)
+    deployed_pct_total = (deployed_capital / total_capital * 100.0) if total_capital else 0.0
+    deploy_util = (deployed_capital / target_capital * 100.0) if target_capital else 0.0
+    unallocated = max(target_capital - deployed_capital, 0.0)
+
+    es99_inr = float(bucket_metrics.get("bucket_es99_inr") or 0.0)
+    es99_pct_target = float(bucket_metrics.get("bucket_es99_pct_target") or 0.0)
+    es99_pct_total = (es99_inr / total_capital * 100.0) if total_capital else 0.0
+    es99_pct_deployed = (es99_inr / deployed_capital * 100.0) if deployed_capital else 0.0
+    es_limit_pct_target = float(limits.get("bucket_limit_pct") or 0.0)
+    es_limit_pct_total = es_limit_pct_target * (target_pct / 100.0)
+    es_limit_ratio = es99_pct_target / es_limit_pct_target if es_limit_pct_target else None
+
+    mean_pnl = bucket_metrics.get("mean_pnl")
+    median_pnl = bucket_metrics.get("median_pnl")
+    pop_pct = bucket_metrics.get("pop_pct")
+    p5 = bucket_metrics.get("p5")
+    p1 = bucket_metrics.get("p1")
+    es95 = bucket_metrics.get("es95")
+    es99 = bucket_metrics.get("es99")
+    ev_es99 = bucket_metrics.get("ev_es99")
+    breach_1d = bucket_metrics.get("prob_breach_1d")
+    breach_10d = bucket_metrics.get("prob_breach_10d")
+    prob_loss_pct = bucket_metrics.get("prob_loss_pct")
+    tail_ratio = bucket_metrics.get("tail_ratio")
+    gate_rows = bucket_metrics.get("gate_rows")
+    kill_switch = bucket_metrics.get("kill_switch", "OK")
+
+    status = bucket_metrics.get("overall_status", "PASS")
+    suggested_action = bucket_metrics.get("suggested_action", "")
+
+    badge = {"PASS": "✅", "WATCH": "⚠️", "FAIL": "❌"}
+    st.markdown(f"#### {bucket_name} Bucket — {badge.get(status, '')} {status}")
+
+    # Row 1: Deployed vs Target + Kill Switch
+    row1 = st.columns(2)
+    deploy_delta = format_inr(deployed_capital - target_capital)
+    row1[0].metric(
+        "Deployed vs Target",
+        f"{format_inr(deployed_capital)} / {format_inr(target_capital)}",
+        f"{deploy_util:.1f}% | Δ {deploy_delta}",
+    )
+    row1[1].metric("Kill Switch", str(kill_switch), suggested_action or "Hold")
+
+    # Row 2: ES99 Tail Loss + ES99 vs Limit
+    row2 = st.columns(2)
+    row2[0].metric(
+        "ES99 Tail Loss",
+        format_inr(es99_inr),
+        f"{es99_pct_total:.2f}% of total",
+    )
+    if es_limit_ratio is not None:
+        ratio_status = "PASS"
+        if es99_pct_target > es_limit_pct_target:
+            ratio_status = "FAIL"
+        elif es99_pct_target > 0.8 * es_limit_pct_target:
+            ratio_status = "WATCH"
+        row2[1].metric("ES99 vs Limit", f"{es_limit_ratio:.2f}x", ratio_status)
+    else:
+        row2[1].metric("ES99 vs Limit", "—", "—")
+
+    # Row 3: Expected PnL + EV/ES99
+    row3 = st.columns(2)
+    if mean_pnl is not None:
+        row3[0].metric("Expected PnL", format_inr(mean_pnl))
+    ev_label = f"{ev_es99:.2f}" if ev_es99 is not None else "N/A"
+    row3[1].metric("EV/|ES99|", ev_label)
+
+    # Row 4: POP + Breach Risk
+    row4 = st.columns(2)
+    if pop_pct is not None:
+        row4[0].metric("POP", f"{pop_pct:.1f}%")
+    breach_lines = []
+    if breach_1d is not None:
+        breach_lines.append(f"P1 breach: {breach_1d*100:.1f}%")
+    if breach_10d is not None:
+        breach_lines.append(f"P10 breach: {breach_10d*100:.1f}%")
+    breach_value = " | ".join(breach_lines) if breach_lines else "—"
+    row4[1].metric("Breach Risk", breach_value)
+
+    with st.expander("Show full bucket diagnostics", expanded=False):
+        diag_cols = st.columns(4, gap="small")
+        if median_pnl is not None:
+            diag_cols[0].metric("Median PnL", format_inr(median_pnl))
+        if prob_loss_pct is not None:
+            diag_cols[1].metric("Prob Loss", f"{prob_loss_pct:.1f}%")
+        if es99 is not None:
+            diag_cols[2].metric("ES99 (tail)", format_inr(es99))
+        if tail_ratio is not None:
+            diag_cols[3].metric("Tail Ratio", f"{float(tail_ratio):.2f}")
+        extra_cols = st.columns(3, gap="small")
+        if p5 is not None:
+            extra_cols[0].metric("VaR95", format_inr(p5))
+        if p1 is not None:
+            extra_cols[1].metric("VaR99", format_inr(p1))
+        if es95 is not None:
+            extra_cols[2].metric("ES95", format_inr(es95))
+        if gate_rows:
+            gate_df = pd.DataFrame(
+                [
+                    {
+                        "Gate": g["Gate"],
+                        "metric_value": g.get("metric_value", "—"),
+                        "threshold_value": g.get("threshold_value", "—"),
+                        "normalized_by": g.get("normalized_by", "—"),
+                        "status": f"{badge.get(g['Status'], '')} {g['Status']}",
+                        "action": g.get("Action", "—"),
+                    }
+                    for g in gate_rows
+                ]
+            )
+            st.dataframe(gate_df, use_container_width=True, hide_index=True)
+
 def _render_gate_settings(prefix: str) -> Dict[str, float]:
     defaults = {
         "gate_tail_ratio_watch": 30.0,
@@ -1034,6 +1822,7 @@ def _render_gate_settings(prefix: str) -> Dict[str, float]:
         "gate_portfolio_p10_fail_days": 4,
         "gate_bucket_p10_fail_days_med": 6,
         "gate_bucket_p10_fail_days_high": 3,
+        "gate_bucket_deploy_over_pct": 10.0,
     }
     config: Dict[str, float] = {}
     with st.expander("Gate settings", expanded=False):
@@ -1049,6 +1838,25 @@ def _render_gate_settings(prefix: str) -> Dict[str, float]:
             st.session_state[key] = val
             config[key] = float(val)
     return config
+
+
+def _gate_config_from_state() -> Dict[str, float]:
+    defaults = {
+        "gate_tail_ratio_watch": 30.0,
+        "gate_tail_ratio_fail": 60.0,
+        "gate_prob_loss_watch": 40.0,
+        "gate_prob_loss_fail": 50.0,
+        "gate_portfolio_breach_prob": 15.0,
+        "gate_bucket_breach_prob_low": 5.0,
+        "gate_bucket_breach_prob_med": 10.0,
+        "gate_bucket_breach_prob_high": 15.0,
+        "gate_p1_breach_fail_days": 2,
+        "gate_portfolio_p10_fail_days": 4,
+        "gate_bucket_p10_fail_days_med": 6,
+        "gate_bucket_p10_fail_days_high": 3,
+        "gate_bucket_deploy_over_pct": 10.0,
+    }
+    return {key: float(st.session_state.get(key, default)) for key, default in defaults.items()}
 
 
 def evaluate_gates_portfolio(
@@ -1242,6 +2050,12 @@ def evaluate_gates_bucket(
     median = kpis.get("median", 0.0)
     tail_ratio = kpis.get("tail_ratio", 0.0)
     bucket_limit_inr = limits.get("bucket_limit_inr", 0.0)
+    bucket_limit_pct = limits.get("bucket_limit_pct")
+    bucket_es99_pct = limits.get("bucket_es99_pct")
+    bucket_es99_inr = limits.get("bucket_es99_inr")
+    total_capital = limits.get("total_capital")
+    target_capital = limits.get("bucket_target_capital")
+    deployed_capital = limits.get("bucket_deployed_capital")
 
     bucket_key = bucket_name.lower()
     breach_prob_limit = config.get(f"gate_bucket_breach_prob_{bucket_key}", 10.0)
@@ -1262,6 +2076,12 @@ def evaluate_gates_bucket(
     gates.append(
         {
             "Gate": "G1 Survivability",
+            "metric_value": f"P1 breach day {p1_breach or '—'} | Prob breach {prob_breach:.1f}% | P1 {format_inr(p1_horizon)}",
+            "threshold_value": (
+                f"≤{int(config['gate_p1_breach_fail_days'])}d | "
+                f"{breach_prob_limit:.0f}% | {format_inr(p1_limit)}"
+            ),
+            "normalized_by": "TotalCap",
             "Value/Threshold": (
                 f"P1 breach day: {p1_breach or '—'} (≤{int(config['gate_p1_breach_fail_days'])}) | "
                 f"Prob breach: {prob_breach:.1f}% (limit {breach_prob_limit:.0f}%) | "
@@ -1303,6 +2123,9 @@ def evaluate_gates_bucket(
     gates.append(
         {
             "Gate": "G2 Speed of damage",
+            "metric_value": f"P10 breach day {p10_breach or '—'}",
+            "threshold_value": p10_rule,
+            "normalized_by": "TotalCap",
             "Value/Threshold": f"P10 breach day: {p10_breach or '—'} ({p10_rule})",
             "Status": status,
             "Reason": "; ".join(reasons) or "No near-term breach",
@@ -1325,6 +2148,9 @@ def evaluate_gates_bucket(
     gates.append(
         {
             "Gate": "G3 Asymmetry / convexity",
+            "metric_value": f"Tail {tail_ratio:.1f} | Mean {format_inr(mean)} | Median {format_inr(median)}",
+            "threshold_value": f">{config['gate_tail_ratio_watch']:.0f} watch / >{config['gate_tail_ratio_fail']:.0f} fail",
+            "normalized_by": "DeployedCap",
             "Value/Threshold": (
                 f"Tail ratio: {tail_ratio:.1f} (watch>{config['gate_tail_ratio_watch']:.0f}, "
                 f"fail>{config['gate_tail_ratio_fail']:.0f}) | Mean/Median: {format_inr(mean)} / {format_inr(median)}"
@@ -1356,6 +2182,9 @@ def evaluate_gates_bucket(
     gates.append(
         {
             "Gate": "G4 Carry quality",
+            "metric_value": f"Median {format_inr(median)} | Mean {format_inr(mean)} | Prob loss {prob_loss:.1f}%",
+            "threshold_value": f"watch ≥{config['gate_prob_loss_watch']:.0f}% / fail ≥{config['gate_prob_loss_fail']:.0f}%",
+            "normalized_by": "DeployedCap",
             "Value/Threshold": (
                 f"Median: {format_inr(median)} | Mean: {format_inr(mean)} | "
                 f"Prob loss: {prob_loss:.1f}% (watch ≥{config['gate_prob_loss_watch']:.0f}%)"
@@ -1369,8 +2198,6 @@ def evaluate_gates_bucket(
     # G5 Sizing
     status = "PASS"
     reasons = []
-    bucket_es99_pct = limits.get("bucket_es99_pct")
-    bucket_limit_pct = limits.get("bucket_limit_pct")
     if bucket_es99_pct is None or bucket_limit_pct is None:
         status = "WATCH"
         reasons.append("ES99 unavailable")
@@ -1381,9 +2208,40 @@ def evaluate_gates_bucket(
         elif bucket_es99_pct > 0.8 * bucket_limit_pct:
             status = "WATCH"
             reasons.append("ES99 near limit")
+    deploy_util_pct = None
+    if target_capital and deployed_capital is not None:
+        deploy_util_pct = (float(deployed_capital) / float(target_capital) * 100.0) if target_capital else 0.0
+        deploy_over = float(config.get("gate_bucket_deploy_over_pct", 10.0))
+        if deploy_util_pct > 100.0 + deploy_over:
+            status = "FAIL"
+            reasons.append("Deployment over target")
+        elif deploy_util_pct > 100.0:
+            status = "WATCH"
+            reasons.append("Deployment above target")
+    es99_pct_total = None
+    if total_capital and bucket_es99_inr is not None:
+        es99_pct_total = float(bucket_es99_inr) / float(total_capital) * 100.0
+    es99_pct_deployed = None
+    if deployed_capital and bucket_es99_inr is not None:
+        es99_pct_deployed = float(bucket_es99_inr) / float(deployed_capital) * 100.0
     gates.append(
         {
             "Gate": "G5 Sizing",
+            "metric_value": (
+                f"ES99 {bucket_es99_pct:.2f}% target | "
+                f"{es99_pct_total:.2f}% total | {es99_pct_deployed:.2f}% deployed"
+                if bucket_es99_pct is not None
+                and es99_pct_total is not None
+                and es99_pct_deployed is not None
+                else "ES99: —"
+            ),
+            "threshold_value": (
+                f"{bucket_limit_pct:.2f}% target | "
+                f"{(bucket_limit_pct * (limits.get('bucket_target_pct', 0.0) / 100.0)):.2f}% total"
+                if bucket_limit_pct is not None
+                else "—"
+            ),
+            "normalized_by": "TotalCap / DeployedCap",
             "Value/Threshold": (
                 f"ES99: {bucket_es99_pct:.2f}% (limit {bucket_limit_pct:.2f}%)"
                 if bucket_es99_pct is not None and bucket_limit_pct is not None
@@ -1637,10 +2495,12 @@ def _render_simulation(
         [
             {
                 "Gate": g["Gate"],
-                "Value/Threshold": g.get("Value/Threshold", "—"),
-                "Status": f"{badge.get(g['Status'], '')} {g['Status']}",
-                "Reason": g["Reason"],
-                "Action": g["Action"],
+                "metric_value": g.get("metric_value", "—"),
+                "threshold_value": g.get("threshold_value", "—"),
+                "normalized_by": g.get("normalized_by", "—"),
+                "status": f"{badge.get(g['Status'], '')} {g['Status']}",
+                "reason": g.get("Reason", "—"),
+                "action": g.get("Action", "—"),
             }
             for g in gates
         ]
@@ -1802,6 +2662,50 @@ def render_risk_buckets_tab() -> None:
             key="tba_spot_input",
             help="Overrides spot used in ES99/scenario calculations for this tab.",
         )
+        st.date_input(
+            "Target date (repricing)",
+            value=st.session_state.get("tba_target_date", datetime.now().date()),
+            key="tba_target_date",
+            help="Used for Black-76 repricing (target date time to expiry).",
+        )
+        st.number_input(
+            "Target-day futures price (optional)",
+            min_value=0.0,
+            step=10.0,
+            format="%.2f",
+            value=float(st.session_state.get("tba_forward_override", 0.0) or 0.0),
+            key="tba_forward_override",
+            help="Leave 0 to use spot-derived forward. Scenario shocks apply to this base.",
+        )
+        st.toggle(
+            "Use dense scenarios (-10% to +10%)",
+            value=st.session_state.get("tba_dense_scenarios", True),
+            key="tba_dense_scenarios",
+        )
+        st.number_input(
+            "Scenario step (%)",
+            min_value=0.5,
+            max_value=5.0,
+            step=0.5,
+            value=float(st.session_state.get("tba_scenario_step", 1.0)),
+            key="tba_scenario_step",
+        )
+        st.number_input(
+            "Scenario max abs move (%)",
+            min_value=5.0,
+            max_value=15.0,
+            step=1.0,
+            value=float(st.session_state.get("tba_scenario_max", 10.0)),
+            key="tba_scenario_max",
+        )
+        st.number_input(
+            "IV shock slope (pts per 1%)",
+            min_value=0.0,
+            max_value=5.0,
+            step=0.1,
+            value=float(st.session_state.get("tba_iv_slope", 1.0)),
+            key="tba_iv_slope",
+        )
         alloc_low = st.number_input("Low bucket allocation %", min_value=0.0, max_value=100.0, step=1.0, value=st.session_state["tba_alloc_low"], key="tba_alloc_low")
         alloc_med = st.number_input("Med bucket allocation %", min_value=0.0, max_value=100.0, step=1.0, value=st.session_state["tba_alloc_med"], key="tba_alloc_med")
         alloc_high = st.number_input("High bucket allocation %", min_value=0.0, max_value=100.0, step=1.0, value=st.session_state["tba_alloc_high"], key="tba_alloc_high")
@@ -1818,25 +2722,117 @@ def render_risk_buckets_tab() -> None:
         st.caption("Note: Scenario analysis (±2%, ±3.5% shocks) is always included")
 
     saved_groups = st.session_state.get("tba_saved_trades", [])
-    use_saved = bool(saved_groups)
+    use_saved = bool(st.session_state.get("tba_use_saved_groups", bool(saved_groups)))
+    if not saved_groups:
+        use_saved = False
     st.session_state["tba_use_saved_groups"] = use_saved
-    trades = build_trades_using_existing_grouping(positions)
-    if use_saved:
+    grouped_leg_ids = {leg_id for group in saved_groups for leg_id in group.get("legs", [])}
+    if use_saved and grouped_leg_ids:
+        ungrouped_positions = [
+            pos for idx, pos in enumerate(positions) if str(idx) not in grouped_leg_ids
+        ]
+        trades = build_trades_using_existing_grouping(ungrouped_positions)
         trades += build_trades_from_saved_groups(positions, saved_groups)
-    trades_df, legs_by_trade = compute_trade_risk(trades, float(total_capital), lookback_days=504)
+    else:
+        trades = build_trades_using_existing_grouping(positions)
+    trade_spot_override = st.session_state.get("tba_spot_input")
+    if not trade_spot_override:
+        st.warning("Set Spot price (override) in this tab to enable Black-76 trade ES99.")
+    trade_forward_override = st.session_state.get("tba_forward_override")
+    trade_target_date = st.session_state.get("tba_target_date")
+    trades_df, legs_by_trade = compute_trade_risk(
+        trades,
+        float(total_capital),
+        lookback_days=504,
+        spot_override=trade_spot_override,
+        forward_override=trade_forward_override,
+        target_date=trade_target_date,
+    )
 
     thresholds = {
         "low": float(st.session_state.get("tba_trade_low_max")),
         "med": float(st.session_state.get("tba_trade_med_max")),
     }
     zone_map = _parse_zone_map(st.session_state.get("tba_zone_map", ""))
-    trades_df = assign_buckets(trades_df, float(total_capital), allocations, thresholds, zone_map)
-
-    subtab1, subtab2, subtab3, subtab4 = st.tabs(
-        ["Portfolio Level", "Bucket Level", "Trade Level", "Meta Information"]
+    manual_bucket_map: Dict[str, str] = {}
+    if not trades_df.empty:
+        grouped_trade_ids = (
+            trades_df.loc[trades_df["is_group_trade"], "trade_id"].astype(str).tolist()
+        )
+        for trade_id in grouped_trade_ids:
+            key = f"tba_manual_bucket_{trade_id}"
+            selection = st.session_state.get(key, "Auto")
+            if selection in {"Low", "Med", "High"}:
+                manual_bucket_map[trade_id] = selection
+    st.session_state["tba_manual_bucket_assignments"] = manual_bucket_map
+    trades_df = assign_buckets(
+        trades_df,
+        float(total_capital),
+        allocations,
+        thresholds,
+        zone_map,
+        manual_bucket_map=manual_bucket_map,
     )
 
-    with subtab1:
+    bucket_limits = {
+        "low": st.session_state.get("tba_bucket_es_limit_low", 2.0),
+        "med": st.session_state.get("tba_bucket_es_limit_med", 3.0),
+        "high": st.session_state.get("tba_bucket_es_limit_high", 5.0),
+    }
+
+    margin_used = st.session_state.get("margin_used")
+    total_margin_used = float(margin_used) if margin_used is not None else None
+    bucket_df = aggregate_buckets(trades_df, float(total_capital), allocations, bucket_limits, total_margin_used)
+    bucket_df["kill_switch"] = bucket_df["bucket"].apply(
+        lambda b: "RED"
+        if bucket_df.loc[bucket_df["bucket"] == b, "bucket_es99_pct_of_bucket_capital"].values[0]
+        > st.session_state.get(f"tba_bucket_es_limit_{b.lower()}", 0.0)
+        else "OK"
+    )
+    sim_cfg = SimulationConfig(
+        horizon_days=int(st.session_state.get("tba_sim_days")),
+        paths=int(st.session_state.get("tba_sim_paths")),
+        iv_mode=st.session_state.get("tba_iv_mode"),
+        iv_shock=float(st.session_state.get("tba_iv_shock")),
+        include_spot_shocks=True,
+    )
+    allocations_total = sum(allocations.values())
+    allocations_ok = abs(allocations_total - 100.0) <= 0.01
+    bucket_positions_map: Dict[str, List[Dict[str, object]]] = {}
+    bucket_sim_map: Dict[str, Optional[Dict[str, object]]] = {}
+    for bucket in BUCKET_ORDER:
+        bucket_positions: List[Dict[str, object]] = []
+        for _, row in trades_df[trades_df["bucket"] == bucket].iterrows():
+            bucket_positions.extend(row["legs_detail"])
+        bucket_positions_map[bucket] = bucket_positions
+        bucket_limit = st.session_state.get(f"tba_bucket_es_limit_{bucket.lower()}", None)
+        bucket_cap = total_capital * allocations[BUCKET_KEYS[bucket]] / 100.0
+        bucket_sim_map[bucket] = simulate_forward_pnl(bucket_positions, sim_cfg, bucket_limit, bucket_cap)
+
+    subtab_labels = ["Portfolio Level", "Bucket Level", "Trade Level", "Meta Information", "Settings"]
+    subtab_keys = ["portfolio", "bucket", "trade", "meta", "settings"]
+    label_to_key = dict(zip(subtab_labels, subtab_keys))
+    key_to_label = dict(zip(subtab_keys, subtab_labels))
+    requested_subtab = st.query_params.get("rb_subtab")
+    if isinstance(requested_subtab, list):
+        requested_subtab = requested_subtab[0] if requested_subtab else None
+    if requested_subtab not in subtab_keys:
+        requested_subtab = None
+    default_key = requested_subtab or st.session_state.get("rb_subtab_key") or "portfolio"
+    default_index = subtab_keys.index(default_key)
+    selected_label = st.radio(
+        "Risk Buckets Tabs",
+        subtab_labels,
+        index=default_index,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="rb_subtab_selector",
+    )
+    active_subtab = label_to_key[selected_label]
+    st.session_state["rb_subtab_key"] = active_subtab
+    st.query_params["rb_subtab"] = active_subtab
+
+    if active_subtab == "portfolio":
         st.markdown("## 📊 Portfolio-Level Risk Analysis")
         st.markdown("---")
         
@@ -2217,41 +3213,11 @@ def render_risk_buckets_tab() -> None:
         else:
             st.info("No NIFTY history available to render bucket distribution.")
 
-    with subtab2:
-        with controls.expander("Bucket Controls", expanded=False):
-            st.session_state.setdefault("tba_bucket_es_limit_low", 2.0)
-            st.session_state.setdefault("tba_bucket_es_limit_med", 3.0)
-            st.session_state.setdefault("tba_bucket_es_limit_high", 5.0)
-            st.number_input("Low bucket ES99 limit %", min_value=0.0, step=0.1, value=st.session_state["tba_bucket_es_limit_low"], key="tba_bucket_es_limit_low")
-            st.number_input("Med bucket ES99 limit %", min_value=0.0, step=0.1, value=st.session_state["tba_bucket_es_limit_med"], key="tba_bucket_es_limit_med")
-            st.number_input("High bucket ES99 limit %", min_value=0.0, step=0.1, value=st.session_state["tba_bucket_es_limit_high"], key="tba_bucket_es_limit_high")
-            st.number_input("Low trade ES99 max %", min_value=0.0, step=0.1, value=st.session_state["tba_trade_low_max"], key="tba_trade_low_max")
-            st.number_input("Med trade ES99 max %", min_value=0.0, step=0.1, value=st.session_state["tba_trade_med_max"], key="tba_trade_med_max")
-            st.text_area("Zone → tier mapping (JSON or key=val)", value=st.session_state["tba_zone_map"], key="tba_zone_map")
-        if st.session_state.get("tba_zone_map") and not zone_map:
-            st.warning("Zone mapping invalid; ignoring zone overrides.")
-
-        bucket_limits = {
-            "low": st.session_state.get("tba_bucket_es_limit_low", 2.0),
-            "med": st.session_state.get("tba_bucket_es_limit_med", 3.0),
-            "high": st.session_state.get("tba_bucket_es_limit_high", 5.0),
-        }
-        
-        # Get actual margin used from portfolio
-        margin_used = st.session_state.get("margin_used")
-        total_margin_used = float(margin_used) if margin_used is not None else None
-        
-        bucket_df = aggregate_buckets(trades_df, float(total_capital), allocations, bucket_limits, total_margin_used)
-        bucket_df["kill_switch"] = bucket_df["bucket"].apply(
-            lambda b: "RED"
-            if bucket_df.loc[bucket_df["bucket"] == b, "bucket_es99_pct_of_bucket_capital"].values[0]
-            > st.session_state.get(f"tba_bucket_es_limit_{b.lower()}", 0.0)
-            else "OK"
-        )
-        
+    if active_subtab == "bucket":
         # ========== BUCKET STATUS CARDS ==========
         st.markdown("### 📊 Bucket Status Overview")
         status_cols = st.columns(3)
+        gate_config = _gate_config_from_state()
         
         for idx, bucket_name in enumerate(["Low", "Med", "High"]):
             bucket_key = bucket_name.lower()
@@ -2267,76 +3233,111 @@ def render_risk_buckets_tab() -> None:
             bucket_es99_inr = bucket_data["bucket_es99_inr"]
             bucket_es99_pct = bucket_data["bucket_es99_pct_of_bucket_capital"]
             bucket_es99_limit = bucket_limits[bucket_key]
-            bucket_kill_switch = bucket_data["kill_switch"]
+            bucket_limit_inr = None
+            if allocations_ok and bucket_es99_limit is not None:
+                bucket_limit_inr = -float(bucket_target_capital) * float(bucket_es99_limit) / 100.0
+
+            sim = bucket_sim_map.get(bucket_name.capitalize())
+            summary = sim.get("summary") if isinstance(sim, dict) else None
+            fan = sim.get("fan") if isinstance(sim, dict) else None
+            pnl_paths = sim.get("pnl_paths") if isinstance(sim, dict) else None
+
+            mean_pnl = summary.get("mean") if isinstance(summary, dict) else None
+            median_pnl = summary.get("median") if isinstance(summary, dict) else None
+            prob_loss = summary.get("prob_loss") if isinstance(summary, dict) else None
+            pop_pct = (1.0 - prob_loss) * 100.0 if prob_loss is not None else None
+            p5 = summary.get("p5") if isinstance(summary, dict) else None
+            p1 = summary.get("p1") if isinstance(summary, dict) else None
+
+            es95 = None
+            es99 = None
+            if pnl_paths is not None:
+                pnl_arr = np.asarray(pnl_paths)
+                if pnl_arr.ndim == 2 and pnl_arr.shape[0] > 0:
+                    final_pnl = pnl_arr[:, -1]
+                    cutoff_95 = np.percentile(final_pnl, 5)
+                    cutoff_99 = np.percentile(final_pnl, 1)
+                    es95 = float(final_pnl[final_pnl <= cutoff_95].mean()) if (final_pnl <= cutoff_95).any() else None
+                    es99 = float(final_pnl[final_pnl <= cutoff_99].mean()) if (final_pnl <= cutoff_99).any() else None
+
+            prob_breach_1d = _compute_breach_probs(pnl_paths, bucket_limit_inr, 1)
+            prob_breach_10d = _compute_breach_probs(pnl_paths, bucket_limit_inr, 10)
+
+            p10_breach = None
+            p1_breach = None
+            if isinstance(fan, pd.DataFrame) and not fan.empty and bucket_limit_inr is not None:
+                p10_breach = _breach_day(fan["P10"].tolist(), bucket_limit_inr)
+                p1_breach = _breach_day(fan["P1"].tolist(), bucket_limit_inr)
+
+            kpis = {
+                "p1_horizon": float(fan["P1"].iloc[-1]) if isinstance(fan, pd.DataFrame) and not fan.empty else 0.0,
+                "p10_horizon": float(fan["P10"].iloc[-1]) if isinstance(fan, pd.DataFrame) and not fan.empty else 0.0,
+                "p50_horizon": float(fan["P50"].iloc[-1]) if isinstance(fan, pd.DataFrame) and not fan.empty else 0.0,
+                "mean": float(mean_pnl) if mean_pnl is not None else 0.0,
+                "median": float(median_pnl) if median_pnl is not None else 0.0,
+                "prob_loss_pct": float(prob_loss * 100.0) if prob_loss is not None else 0.0,
+                "prob_breach_pct": float(summary.get("prob_breach") or 0.0) * 100.0 if isinstance(summary, dict) else 0.0,
+                "p1_breach_day": p1_breach,
+                "p10_breach_day": p10_breach,
+                "tail_ratio": (
+                    abs(float(fan["P1"].iloc[-1])) / max(1.0, abs(float(fan["P50"].iloc[-1])))
+                    if isinstance(fan, pd.DataFrame) and not fan.empty
+                    else 0.0
+                ),
+            }
+            gate_limits = {
+                "bucket_limit_inr": bucket_limit_inr or 0.0,
+                "bucket_limit_pct": float(bucket_es99_limit or 0.0),
+                "bucket_es99_pct": float(bucket_es99_pct),
+                "bucket_es99_inr": float(bucket_es99_inr),
+                "total_capital": float(total_capital),
+                "bucket_target_capital": float(bucket_target_capital),
+                "bucket_deployed_capital": float(bucket_actual_capital),
+                "bucket_target_pct": float(bucket_target_pct),
+            }
+            gates, overall, suggested = evaluate_gates_bucket(kpis, gate_limits, gate_config, bucket_name)
             
             with status_cols[idx]:
-                st.subheader(f"🔹 {bucket_name} Bucket")
-                
-                # Capital usage metric
-                capital_delta = bucket_actual_capital - bucket_target_capital
-                st.metric(
-                    "Capital Usage",
-                    format_inr(bucket_actual_capital),
-                    delta=format_inr(capital_delta) if capital_delta != 0 else None,
-                    delta_color="inverse"
+                render_bucket_header(
+                    bucket_name,
+                    {
+                        "bucket_es99_inr": float(bucket_es99_inr),
+                        "bucket_es99_pct_target": float(bucket_es99_pct),
+                        "mean_pnl": mean_pnl,
+                        "median_pnl": median_pnl,
+                        "pop_pct": pop_pct,
+                        "p5": p5,
+                        "p1": p1,
+                        "es95": es95,
+                        "es99": es99,
+                        "ev_es99": (float(mean_pnl) / abs(float(bucket_es99_inr)))
+                        if mean_pnl is not None and bucket_es99_inr
+                        else None,
+                        "prob_breach_1d": prob_breach_1d,
+                        "prob_breach_10d": prob_breach_10d,
+                        "prob_loss_pct": float(prob_loss * 100.0) if prob_loss is not None else None,
+                        "tail_ratio": kpis.get("tail_ratio"),
+                        "overall_status": overall,
+                        "suggested_action": suggested,
+                        "gate_rows": gates,
+                        "kill_switch": bucket_data.get("kill_switch", "OK"),
+                    },
+                    {
+                        "total_capital": float(total_capital),
+                        "target_capital": float(bucket_target_capital),
+                        "deployed_capital": float(bucket_actual_capital),
+                        "target_pct": float(bucket_target_pct),
+                    },
+                    {
+                        "bucket_limit_pct": float(bucket_es99_limit or 0.0),
+                    },
                 )
-                st.caption(f"Target: {bucket_target_pct:.0f}% | {format_inr(bucket_target_capital)}")
-                
-                # ES99 metric
-                es99_delta_pct = bucket_es99_pct - bucket_es99_limit
-                st.metric(
-                    "ES99",
-                    f"{bucket_es99_pct:.1f}% | {format_inr(bucket_es99_inr)}",
-                    delta=f"{es99_delta_pct:+.1f}%" if abs(es99_delta_pct) > 0.1 else None,
-                    delta_color="inverse"
-                )
-                st.caption(f"Limit: {bucket_es99_limit:.1f}%")
-                
-                # Kill switch status
-                if bucket_kill_switch == "RED":
-                    st.error("🔴 Kill Switch: RED")
-                else:
-                    st.success("🟢 Kill Switch: OK")
-                
-                # Over allocation warning
-                if bucket_actual_capital > bucket_target_capital * 1.1:
-                    st.warning("⚠️ Over target by >10%")
         
         # Unallocated capital
         total_actual_capital = bucket_df["actual_allocated_capital"].sum()
         unallocated_capital = max(total_capital - total_actual_capital, 0.0)
         unallocated_pct = (unallocated_capital / total_capital * 100.0) if total_capital else 0.0
         st.caption(f"💰 Unallocated Capital: {format_inr(unallocated_capital)} ({unallocated_pct:.1f}%)")
-        
-        st.markdown("---")
-        
-        # Table 1: Bucket Sizing (Capital Allocation)
-        st.markdown("### Bucket Sizing - Capital Allocation")
-        sizing_df = bucket_df[["bucket", "target_capital_pct", "actual_capital_pct", "capital_delta_pct", "trades", "legs"]].copy()
-        sizing_df["target_capital_pct"] = sizing_df["target_capital_pct"].apply(lambda x: f"{int(round(x))}%")
-        sizing_df["actual_capital_pct"] = sizing_df["actual_capital_pct"].apply(lambda x: f"{int(round(x))}%")
-        sizing_df["capital_delta_pct"] = sizing_df["capital_delta_pct"].apply(lambda x: f"{int(round(x)):+}%")
-        sizing_df.columns = ["Bucket", "Target %", "Actual %", "Delta %", "Trades", "Legs"]
-        st.dataframe(sizing_df, use_container_width=True, hide_index=True)
-        
-        # Table 2: ES99 Risk per Bucket
-        st.markdown("### ES99 Risk per Bucket")
-        es99_df = bucket_df[["bucket", "target_es99_pct", "bucket_es99_pct_of_bucket_capital", "delta_pct", "kill_switch"]].copy()
-        es99_df["target_es99_pct"] = es99_df["target_es99_pct"].apply(lambda x: f"{int(round(x))}%")
-        es99_df["bucket_es99_pct_of_bucket_capital"] = es99_df["bucket_es99_pct_of_bucket_capital"].apply(lambda x: f"{int(round(x))}%")
-        es99_df["delta_pct"] = es99_df["delta_pct"].apply(lambda x: f"{int(round(x)):+}%")
-        es99_df.columns = ["Bucket", "Target ES99 %", "Actual ES99 %", "Delta %", "Kill Switch"]
-        st.dataframe(es99_df, use_container_width=True, hide_index=True)
-
-        usage_df = trades_df.copy()
-        if usage_df["margin"].notna().any():
-            usage_df["usage_inr"] = usage_df["margin"].fillna(0.0)
-            usage_label = "Margin usage"
-        else:
-            usage_df["usage_inr"] = usage_df["trade_es99_inr"].abs()
-            usage_label = "Risk-weighted usage (ES99)"
-        usage_summary = usage_df.groupby("bucket")["usage_inr"].sum()
-        st.caption(f"{usage_label}: {', '.join([f'{b} {format_inr(v)}' for b, v in usage_summary.items()])}")
 
         # Bucket charts in 2 columns
         bucket_chart_col1, bucket_chart_col2 = st.columns(2)
@@ -2356,8 +3357,13 @@ def render_risk_buckets_tab() -> None:
             ).configure_view(strokeOpacity=0)
             st.altair_chart(chart, use_container_width=True)
         with bucket_chart_col2:
-            st.markdown("### Bucket Trades")
-            data = bucket_df.set_index("bucket")["trades"].reset_index()
+            st.markdown("### Bucket Expected PnL")
+            data = (
+                trades_df.groupby("bucket")["expected_pnl_inr"]
+                .sum()
+                .reindex(bucket_df["bucket"])
+                .reset_index()
+            )
             data.columns = ['name', 'value']
             chart = alt.Chart(data).mark_bar(size=50, color="#4FBFD6", opacity=0.85).encode(
                 x=alt.X('name:N', title=None),
@@ -2373,27 +3379,16 @@ def render_risk_buckets_tab() -> None:
 
         st.markdown("### Forward Simulation & Scenario Table by Bucket")
         gate_config = _render_gate_settings("bucket_gates")
-        sim_cfg = SimulationConfig(
-            horizon_days=int(st.session_state.get("tba_sim_days")),
-            paths=int(st.session_state.get("tba_sim_paths")),
-            iv_mode=st.session_state.get("tba_iv_mode"),
-            iv_shock=float(st.session_state.get("tba_iv_shock")),
-            include_spot_shocks=True,  # Always include scenarios for bucket level
-        )
-        allocations_total = sum(allocations.values())
-        allocations_ok = abs(allocations_total - 100.0) <= 0.01
         if not allocations_ok:
             st.warning("Bucket allocations do not sum to 100%; bucket limits may be incorrect.")
         portfolio_limit_inr = -float(total_capital) * float(portfolio_es_limit) / 100.0
         bucket_tabs = st.tabs([f"{bucket} Bucket" for bucket in BUCKET_ORDER])
         for tab, bucket in zip(bucket_tabs, BUCKET_ORDER):
             with tab:
-                bucket_positions: List[Dict[str, object]] = []
-                for _, row in trades_df[trades_df["bucket"] == bucket].iterrows():
-                    bucket_positions.extend(row["legs_detail"])
+                bucket_positions = bucket_positions_map.get(bucket, [])
                 bucket_limit = st.session_state.get(f"tba_bucket_es_limit_{bucket.lower()}", None)
                 bucket_cap = total_capital * allocations[BUCKET_KEYS[bucket]] / 100.0
-                sim = simulate_forward_pnl(bucket_positions, sim_cfg, bucket_limit, bucket_cap)
+                sim = bucket_sim_map.get(bucket)
                 bucket_limit_inr = None
                 if allocations_ok and bucket_limit is not None:
                     bucket_limit_inr = -float(bucket_cap) * float(bucket_limit) / 100.0
@@ -2416,6 +3411,21 @@ def render_risk_buckets_tab() -> None:
                             if not bucket_df.empty
                             else 0.0
                         ),
+                        "bucket_es99_inr": float(
+                            bucket_df.loc[bucket_df["bucket"] == bucket, "bucket_es99_inr"]
+                            .values[0]
+                            if not bucket_df.empty
+                            else 0.0
+                        ),
+                        "total_capital": float(total_capital),
+                        "bucket_target_capital": float(bucket_cap),
+                        "bucket_deployed_capital": float(
+                            bucket_df.loc[bucket_df["bucket"] == bucket, "actual_allocated_capital"]
+                            .values[0]
+                            if not bucket_df.empty
+                            else 0.0
+                        ),
+                        "bucket_target_pct": float(allocations[BUCKET_KEYS[bucket]]),
                     },
                 )
                 _render_scenario_table(
@@ -2426,312 +3436,69 @@ def render_risk_buckets_tab() -> None:
                     title="Scenario Table (with calibrated probabilities)",
                 )
 
-    with subtab3:
+    if active_subtab == "trade":
         st.markdown("### Trade Level")
-        st.caption(
-            "Expected PnL is the mean simulated PnL at the end of the current horizon "
-            f"({int(st.session_state.get('tba_sim_days', 10))} days), includes theta carry, "
-            "and adds pro-rated premium received."
-        )
-        with st.expander("Zone rules (per 1L capital)"):
-            options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
-            iv_percentile = 35
-            if (
-                isinstance(options_df_cache, pd.DataFrame)
-                and not options_df_cache.empty
-                and "iv" in options_df_cache.columns
-            ):
-                iv_percentile = 35
-            iv_regime, _ = get_iv_regime(iv_percentile)
-            st.caption(f"IV regime: {iv_regime}")
-            st.dataframe(_zone_rules_table(iv_regime), use_container_width=True, hide_index=True)
-        with st.expander("Trade Grouping (Manual)", expanded=False):
-            saved_groups = st.session_state.get("tba_saved_trades", [])
-            grouped_leg_ids = {leg_id for group in saved_groups for leg_id in group.get("legs", [])}
-            if st.session_state.get("tba_clear_trade_group"):
-                for idx in range(len(positions)):
-                    key = f"tba_leg_select_{idx}"
-                    if str(idx) not in grouped_leg_ids:
-                        st.session_state[key] = False
-                st.session_state["tba_trade_group_name"] = ""
-                st.session_state["tba_clear_trade_group"] = False
-            st.caption("Select legs to group (grouped legs are locked).")
-            selected_legs = []
-            for idx, pos in enumerate(positions):
-                pos_id = str(idx)
-                label = _position_label(pos, idx)
-                is_grouped = pos_id in grouped_leg_ids
-                checkbox_key = f"tba_leg_select_{idx}"
-                checked = st.checkbox(
-                    f"{label}{' (grouped)' if is_grouped else ''}",
-                    value=is_grouped or bool(st.session_state.get(checkbox_key, False)),
-                    key=checkbox_key,
-                    disabled=is_grouped,
-                )
-                if checked and not is_grouped:
-                    selected_legs.append(pos_id)
-            group_name = st.text_input("Trade name", key="tba_trade_group_name")
-            if st.button("Save trade group", type="secondary"):
-                if not selected_legs:
-                    st.warning("Select at least one leg to save a trade group.")
-                else:
-                    saved_groups.append({"name": group_name or "Manual Trade", "legs": selected_legs})
-                    st.session_state["tba_saved_trades"] = saved_groups
-                    _save_saved_groups(saved_groups)
-                    st.session_state["tba_clear_trade_group"] = True
-                    st.success("Trade group saved.")
-            apply_cols = st.columns([0.5, 0.5])
-            if apply_cols[0].button("Apply groupings", type="primary"):
-                st.session_state["tba_use_saved_groups"] = True
-            if apply_cols[1].button("Use auto grouping"):
-                st.session_state["tba_use_saved_groups"] = False
-            if saved_groups:
-                st.caption("Saved groups (only these trades will be shown):")
-                for idx, group in enumerate(saved_groups):
-                    label = group.get("name") or f"Group {idx + 1}"
-                    cols = st.columns([0.8, 0.2])
-                    cols[0].write(label)
-                    leg_labels = []
-                    for leg_id in group.get("legs", []):
-                        try:
-                            leg_idx = int(leg_id)
-                        except Exception:
-                            continue
-                        if 0 <= leg_idx < len(positions):
-                            leg_labels.append(_position_label(positions[leg_idx], leg_idx))
-                    if leg_labels:
-                        cols[0].caption(" | ".join(leg_labels))
-                    if cols[1].button("Remove", key=f"tba_remove_group_{idx}"):
-                        st.session_state["tba_saved_trades"] = [
-                            g for g_i, g in enumerate(saved_groups) if g_i != idx
-                        ]
-                        _save_saved_groups(st.session_state["tba_saved_trades"])
-                        if not st.session_state.get("tba_saved_trades"):
-                            st.session_state["tba_use_saved_groups"] = False
-        filter_cols = st.columns(5)
-        underlyings = ["All"] + sorted(trades_df["underlying"].dropna().unique().tolist())
-        weeks = ["All"] + sorted(trades_df["week_id"].dropna().unique().tolist())
-        sides = ["All"] + sorted(trades_df["option_side"].dropna().unique().tolist())
-        buckets = ["All"] + sorted(trades_df["bucket"].dropna().unique().tolist())
-        zones = ["All"] + sorted(trades_df["zone_label"].dropna().unique().tolist())
-        filter_underlying = filter_cols[0].selectbox("Underlying", underlyings, key="tba_trade_filter_underlying")
-        filter_week = filter_cols[1].selectbox("Week", weeks, key="tba_trade_filter_week")
-        filter_side = filter_cols[2].selectbox("Side", sides, key="tba_trade_filter_side")
-        filter_bucket = filter_cols[3].selectbox("Bucket", buckets, key="tba_trade_filter_bucket")
-        filter_zone = filter_cols[4].selectbox("Zone", zones, key="tba_trade_filter_zone")
-
         df = trades_df.copy()
-        if filter_underlying != "All":
-            df = df[df["underlying"] == filter_underlying]
-        if filter_week != "All":
-            df = df[df["week_id"] == filter_week]
-        if filter_side != "All":
-            df = df[df["option_side"] == filter_side]
-        if filter_bucket != "All":
-            df = df[df["bucket"] == filter_bucket]
-        if filter_zone != "All":
-            df = df[df["zone_label"] == filter_zone]
-
-        sort_choice = st.selectbox(
-            "Sort by",
-            [
-                "trade_es99_inr",
-                "trade_es99_pct_of_bucket_cap",
-                "expected_pnl_inr",
-                "risk_reward",
-                "theta_carry_inr",
-                "mean_loss_inr",
-                "mean_tail_ratio",
-                "premium_received_inr",
-                "premium_prorated_inr",
-                "theta_per_lakh",
-                "gamma_per_lakh",
-                "vega_per_lakh",
-                "margin",
-                "week_id",
-            ],
-            key="tba_trade_sort",
-        )
-        df = df.sort_values(sort_choice, ascending=False)
+        df = df.sort_values("trade_es99_inr", ascending=False)
         df["theta_per_lakh_label"] = df.apply(
             lambda row: f"{row['theta_per_lakh']:.1f} ({row['theta_label']})"
-            if row.get("theta_per_lakh") is not None
+            if row["theta_per_lakh"] is not None
             else "—",
             axis=1,
         )
         df["gamma_per_lakh_label"] = df.apply(
             lambda row: f"{row['gamma_per_lakh']:.4f} ({row['gamma_label']})"
-            if row.get("gamma_per_lakh") is not None
+            if row["gamma_per_lakh"] is not None
             else "—",
             axis=1,
         )
         df["vega_per_lakh_label"] = df.apply(
             lambda row: f"{row['vega_per_lakh']:.1f} ({row['vega_label']})"
-            if row.get("vega_per_lakh") is not None
+            if row["vega_per_lakh"] is not None
             else "—",
             axis=1,
         )
-        st.dataframe(
-            df[
-                [
-                    "underlying",
-                    "week_id",
-                    "option_side",
-                    "earliest_expiry",
-                    "latest_expiry",
-                    "legs",
-                    "bucket",
-                    "trade_es99_inr",
-                    "trade_es99_pct_of_bucket_cap",
-                    "expected_pnl_inr",
-                    "expected_pnl_pct",
-                    "risk_reward",
-                    "theta_carry_inr",
-                    "mean_loss_inr",
-                    "mean_tail_ratio",
-                    "premium_received_inr",
-                    "premium_prorated_inr",
-                    "theta_per_lakh_label",
-                    "gamma_per_lakh_label",
-                    "vega_per_lakh_label",
-                    "margin",
-                    "zone_label",
-                    "mtd_pnl",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.download_button(
-            "Download trades CSV",
-            df.to_csv(index=False),
-            file_name="tba_trades.csv",
-        )
-
-        for _, row in df.iterrows():
-            with st.expander(
-                f"{row['underlying']} | {row['week_id']} | {row['option_side']} | {row['bucket']}"
-            ):
-                legs_df = pd.DataFrame(
-                    [
-                        {
-                            "symbol": leg.get("tradingsymbol"),
-                            "strike": leg.get("strike"),
-                            "type": leg.get("option_type") or leg.get("instrument_type"),
-                            "qty": leg.get("quantity"),
-                            "avg_price": leg.get("average_price"),
-                            "ltp": leg.get("last_price"),
-                            "pnl": leg.get("pnl", leg.get("m2m")),
-                            "delta": leg.get("delta"),
-                            "gamma": leg.get("gamma"),
-                            "vega": leg.get("vega"),
-                            "theta": leg.get("theta"),
-                            "pos_delta": leg.get("position_delta"),
-                            "pos_gamma": leg.get("position_gamma"),
-                            "pos_vega": leg.get("position_vega"),
-                            "pos_theta": leg.get("position_theta"),
-                        }
-                        for leg in row["legs_detail"]
-                    ]
-                )
-                st.dataframe(legs_df, use_container_width=True, hide_index=True)
-
-        st.info("Forward simulation is available at Portfolio and Bucket levels only.")
-
-        st.markdown("---")
-        st.markdown("### 📊 Tail Loss vs Mean PnL Chart")
-        
-        # Load saved groups for filtering
-        saved_groups = st.session_state.get("tba_saved_trades", [])
-        
-        control_cols = st.columns(5)
+        control_cols = st.columns(3)
         with control_cols[0]:
             norm_mode = st.selectbox(
                 "Normalize",
                 ["Absolute INR", "Per 1L capital", "Per bucket cap %"],
                 key="tba_trade_chart_norm",
             )
+        log_loss_axis = False
+        tail_cap_inr = 0.0
         with control_cols[1]:
-            log_loss_axis = st.toggle("Log scale (loss axis)", value=False, key="tba_trade_chart_log")
-        with control_cols[2]:
-            tail_cap_label = "Tail cap (INR)"
-            if norm_mode == "Per 1L capital":
-                tail_cap_label = "Tail cap (per 1L)"
-            elif norm_mode == "Per bucket cap %":
-                tail_cap_label = "Tail cap (%)"
-            tail_cap_inr = st.number_input(
-                tail_cap_label,
-                min_value=0.0,
-                step=1_000.0 if norm_mode == "Absolute INR" else 1.0,
-                value=float(st.session_state.get("tba_trade_tail_cap_inr", 200_000.0)),
-                key="tba_trade_tail_cap_inr",
-            )
-        with control_cols[3]:
             show_individual_trades = st.toggle(
                 "Show individual trades",
                 value=True,
                 key="tba_show_individual_trades",
             )
-        with control_cols[4]:
+        with control_cols[2]:
             show_group_trades = st.toggle(
                 "Show group trades",
                 value=True,
                 key="tba_show_group_trades",
             )
-        
-        use_saved = bool(saved_groups)
-        
-        chart_df = trades_df.copy()
-        group_names = {g.get("name") for g in saved_groups if g.get("name")}
-        
-        # Debug info
-        with st.expander("🔍 Debug Info", expanded=False):
-            st.write(f"Total trades: {len(chart_df)}")
-            st.write(f"Saved groups: {len(saved_groups)}")
-            st.write(f"Group names: {group_names}")
-            st.write(f"Use saved groups: {use_saved}")
-            st.write("Option side values in trades_df:")
-            st.write(chart_df["option_side"].value_counts())
-        
-        # Apply filtering based on toggle states
-        if group_names:
-            # Both toggles off: show nothing
-            if not show_individual_trades and not show_group_trades:
-                chart_df = chart_df[chart_df["option_side"].isna()]  # Empty dataframe
-            # Only individual trades
-            elif show_individual_trades and not show_group_trades:
-                chart_df = chart_df[~chart_df["option_side"].isin(group_names)]
-            # Only group trades
-            elif not show_individual_trades and show_group_trades:
-                chart_df = chart_df[chart_df["option_side"].isin(group_names)]
-            # Both toggles on: show everything (no filtering needed)
-        
-        chart_df["theta_per_lakh_label"] = chart_df.apply(
-            lambda row: f"{row['theta_per_lakh']:.1f} ({row['theta_label']})"
-            if row["theta_per_lakh"] is not None
-            else "—",
-            axis=1,
-        )
-        chart_df["gamma_per_lakh_label"] = chart_df.apply(
-            lambda row: f"{row['gamma_per_lakh']:.4f} ({row['gamma_label']})"
-            if row["gamma_per_lakh"] is not None
-            else "—",
-            axis=1,
-        )
-        chart_df["vega_per_lakh_label"] = chart_df.apply(
-            lambda row: f"{row['vega_per_lakh']:.1f} ({row['vega_label']})"
-            if row["vega_per_lakh"] is not None
-            else "—",
-            axis=1,
-        )
+
+        st.markdown("---")
+        st.markdown("### 📊 Tail Loss vs Mean PnL Chart")
+
+        chart_df = df.copy()
+        if not show_individual_trades and not show_group_trades:
+            chart_df = chart_df.iloc[0:0]
+        elif show_individual_trades and not show_group_trades:
+            chart_df = chart_df[~chart_df["is_group_trade"]]
+        elif not show_individual_trades and show_group_trades:
+            chart_df = chart_df[chart_df["is_group_trade"]]
+
+        chart_df["trade_kind"] = np.where(chart_df["is_group_trade"], "Group", "Auto")
         chart_df["label_expiry"] = chart_df["earliest_expiry"].fillna("—")
         chart_df.loc[chart_df["label_expiry"].isin(["—", "UNKNOWN"]), "label_expiry"] = chart_df["week_id"]
-        chart_df["trade_label"] = (
-            chart_df["underlying"].astype(str)
-            + " | "
-            + chart_df["label_expiry"].astype(str)
-            + " | "
-            + chart_df["option_side"].astype(str)
+        chart_df["trade_label"] = chart_df.apply(
+            lambda row: f"{row['underlying']} | {row['option_side']}"
+            if row.get("is_group_trade")
+            else f"{row['underlying']} | {row['label_expiry']} | {row['option_side']}",
+            axis=1,
         )
         chart_df["capital_inr"] = chart_df["margin"].fillna(0.0)
         chart_df.loc[chart_df["capital_inr"] <= 0, "capital_inr"] = chart_df["premium_received_inr"].abs()
@@ -2773,6 +3540,7 @@ def render_risk_buckets_tab() -> None:
 
         tooltip_cols = [
             alt.Tooltip("trade_id:N", title="Trade"),
+            alt.Tooltip("trade_kind:N", title="Kind"),
             alt.Tooltip("week_id:N", title="Week"),
             alt.Tooltip("option_side:N", title="Side"),
             alt.Tooltip("bucket:N", title="Bucket"),
@@ -2781,7 +3549,6 @@ def render_risk_buckets_tab() -> None:
             alt.Tooltip("expected_pnl_inr:Q", title="Mean PnL", format=",.0f"),
             alt.Tooltip("tail_loss_inr:Q", title="Tail Loss", format=",.0f"),
             alt.Tooltip("mean_loss_inr:Q", title="Mean Loss", format=",.0f"),
-            alt.Tooltip("prob_profit:Q", title="PoP", format=".1%"),
             alt.Tooltip("premium_received_inr:Q", title="Premium", format=",.0f"),
             alt.Tooltip("capital_inr:Q", title="Capital", format=",.0f"),
             alt.Tooltip("risk_reward:Q", title="Reward/Risk", format=".3f"),
@@ -2946,18 +3713,28 @@ def render_risk_buckets_tab() -> None:
             ("tail_loss", "tail_loss_value", y_tail_title),
         ]:
             plot_df = chart_df.copy()
+            plot_df = plot_df.replace([np.inf, -np.inf], np.nan)
+            plot_df = plot_df.dropna(subset=["x_value", y_field])
             if log_loss_axis:
                 plot_df = plot_df[plot_df[y_field] > 0]
+            if plot_df.empty:
+                st.info("No chart data available for the current filters/normalization.")
+                continue
             x_min = float(plot_df["x_value"].min()) if not plot_df.empty else 0.0
             x_max = float(plot_df["x_value"].max()) if not plot_df.empty else 1.0
             y_max = float(plot_df[y_field].max()) if not plot_df.empty else 1.0
+            if x_min == x_max:
+                x_min -= 1.0
+                x_max += 1.0
+            x_pad = (x_max - x_min) * 0.1
+            x_domain = [x_min - x_pad, x_max + x_pad]
             positive_df = plot_df[plot_df["expected_pnl_inr"] >= 0]
             negative_df = plot_df[plot_df["expected_pnl_inr"] < 0]
             base_positive = (
                 alt.Chart(positive_df)
                 .mark_circle(opacity=0.85, strokeWidth=1.2)
                 .encode(
-                    x=alt.X("x_value:Q", title=x_title, scale=alt.Scale(domain=[-10000, 10000])),
+                    x=alt.X("x_value:Q", title=x_title, scale=alt.Scale(domain=x_domain)),
                     y=alt.Y(
                         f"{y_field}:Q",
                         title=y_title,
@@ -2968,12 +3745,7 @@ def render_risk_buckets_tab() -> None:
                         legend=alt.Legend(title="Reward/Risk"),
                         scale=alt.Scale(scheme="redyellowgreen", clamp=True),
                     ),
-                    size=alt.Size(
-                        "prob_profit:Q",
-                        legend=alt.Legend(title="PoP"),
-                        scale=alt.Scale(range=[40, 400]),
-                    ),
-                    shape=alt.Shape("option_side:N", legend=alt.Legend(title="Side")),
+                    shape=alt.Shape("trade_kind:N", legend=alt.Legend(title="Kind")),
                     tooltip=tooltip_cols,
                 )
                 .properties(height=600)
@@ -2982,18 +3754,13 @@ def render_risk_buckets_tab() -> None:
                 alt.Chart(negative_df)
                 .mark_circle(opacity=0.85, strokeWidth=1.2, color="#d9534f")
                 .encode(
-                    x=alt.X("x_value:Q", title=x_title, scale=alt.Scale(domain=[-10000, 10000])),
+                    x=alt.X("x_value:Q", title=x_title, scale=alt.Scale(domain=x_domain)),
                     y=alt.Y(
                         f"{y_field}:Q",
                         title=y_title,
                         scale=alt.Scale(type="log") if log_loss_axis else alt.Scale(zero=True),
                     ),
-                    size=alt.Size(
-                        "prob_profit:Q",
-                        legend=None,
-                        scale=alt.Scale(range=[40, 400]),
-                    ),
-                    shape=alt.Shape("option_side:N", legend=alt.Legend(title="Side")),
+                    shape=alt.Shape("trade_kind:N", legend=alt.Legend(title="Kind")),
                     tooltip=tooltip_cols,
                 )
                 .properties(height=600)
@@ -3013,13 +3780,869 @@ def render_risk_buckets_tab() -> None:
             chart = alt.layer(*layers)
             st.altair_chart(chart, use_container_width=True)
 
-    with subtab4:
+        st.markdown("---")
+        options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
+        iv_percentile = 35
+        if isinstance(options_df_cache, pd.DataFrame) and not options_df_cache.empty and "iv" in options_df_cache.columns:
+            iv_percentile = 35
+        iv_regime, _ = get_iv_regime(iv_percentile)
+        if st.session_state.get("tba_dense_scenarios", True):
+            scenarios = _generate_dense_scenarios(
+                float(st.session_state.get("tba_scenario_max", 10.0)),
+                float(st.session_state.get("tba_scenario_step", 1.0)),
+                float(st.session_state.get("tba_iv_slope", 1.0)),
+            )
+        else:
+            scenarios = get_weighted_scenarios(iv_regime)
+        lookback_days = 504
+        st.markdown("### Payoff Curve (Target Date)")
+        if not trade_spot_override or trade_spot_override <= 0:
+            st.info("Set Spot price (override) in this tab to generate the payoff curve.")
+        else:
+            include_unrealized = st.toggle(
+                "Include unrealized P&L",
+                value=True,
+                key="tba_payoff_include_unrealized",
+                help="Adds current unrealized P&L (pnl/m2m) to the projected curve.",
+            )
+            payoff_sources = []
+            for trade_id, legs in legs_by_trade.items():
+                payoff_sources.append(("Trade", trade_id, legs))
+            for idx, pos in enumerate(positions):
+                try:
+                    qty_val = float(pos.get("quantity") or 0.0)
+                except Exception:
+                    qty_val = 0.0
+                if qty_val != 0.0:
+                    payoff_sources.append(("Single", _position_label(pos, idx), [pos]))
+            if not payoff_sources:
+                st.info("No positions or trades available for payoff curve.")
+            else:
+                labels = [f"{kind}: {name}" for kind, name, _ in payoff_sources]
+                label_to_legs = {label: legs for label, (_, _, legs) in zip(labels, payoff_sources)}
+                selected_label = st.selectbox("Select trade / position", labels, key="tba_payoff_select")
+                legs = label_to_legs.get(selected_label, [])
+                curve_df = _compute_trade_payoff_curve(
+                    legs,
+                    float(trade_spot_override),
+                    trade_forward_override,
+                    trade_target_date,
+                    include_unrealized_pnl=include_unrealized,
+                )
+                if not curve_df.empty:
+                    spot_value = float(trade_spot_override or 0.0)
+                    base_date = None
+                    if trade_target_date:
+                        try:
+                            base_date = datetime.combine(trade_target_date, datetime.min.time())
+                        except Exception:
+                            base_date = None
+                    dte_days = _days_to_expiry(legs, base_date)
+                    iv_atm = None
+                    leg_iv_debug = []
+                    iv_candidates = []
+                    for leg in legs:
+                        iv_val = None
+                        try:
+                            qty = float(leg.get("quantity") or 0.0)
+                        except Exception:
+                            qty = 0.0
+                        if qty < 0:
+                            iv_val = _safe_leg_iv(leg)
+                            if iv_val is None:
+                                iv_val = _compute_leg_implied_vol(
+                                    leg,
+                                    spot_value,
+                                    base_date,
+                                    trade_forward_override,
+                                )
+                            if iv_val is not None:
+                                iv_candidates.append(iv_val)
+                        model_price = None
+                        if iv_val is not None:
+                            opt_type = str(
+                                leg.get("option_type") or leg.get("instrument_type") or ""
+                            ).upper()
+                            flag = "c" if opt_type == "CE" else "p" if opt_type == "PE" else None
+                            strike_val = leg.get("strike") or leg.get("strike_price")
+                            try:
+                                strike_val = float(strike_val)
+                            except Exception:
+                                strike_val = None
+                            t_val = _infer_time_to_expiry_years(leg, base_date)
+                            if flag and strike_val and t_val:
+                                model_price = price_option(
+                                    flag,
+                                    spot_value,
+                                    strike_val,
+                                    t_val,
+                                    0.0,
+                                    iv_val,
+                                    forward=float(trade_forward_override)
+                                    if trade_forward_override
+                                    else None,
+                                )
+                        leg_iv_debug.append(
+                            {
+                                "symbol": leg.get("tradingsymbol"),
+                                "qty": leg.get("quantity"),
+                                "strike": leg.get("strike") or leg.get("strike_price"),
+                                "type": leg.get("option_type") or leg.get("instrument_type"),
+                                "price": leg.get("last_price") or leg.get("ltp") or leg.get("close"),
+                                "expiry": leg.get("expiry"),
+                                "iv_used": iv_val if qty < 0 else None,
+                                "model_price": model_price if qty < 0 else None,
+                            }
+                        )
+                    iv_atm = float(pd.Series(iv_candidates).median()) if iv_candidates else None
+                    expected_move = None
+                    if spot_value > 0 and dte_days is not None and iv_atm is not None:
+                        t_years = max(dte_days, 1) / 365.0
+                        expected_move = spot_value * iv_atm * math.sqrt(t_years)
+
+                    if (curve_df["used_positions"] <= 0).all():
+                        st.warning(
+                            "Payoff curve is flat because required fields are missing "
+                            "(strike, IV, price, or expiry). Check the legs data."
+                        )
+                        debug_rows = []
+                        for leg in legs:
+                            debug_rows.append(
+                                {
+                                    "symbol": leg.get("tradingsymbol"),
+                                    "qty": leg.get("quantity"),
+                                    "strike": leg.get("strike") or leg.get("strike_price"),
+                                    "iv": leg.get("implied_vol")
+                                    or leg.get("iv")
+                                    or leg.get("implied_volatility"),
+                                    "price": leg.get("last_price")
+                                    or leg.get("ltp")
+                                    or leg.get("close"),
+                                    "expiry": leg.get("expiry"),
+                                    "dte": leg.get("dte"),
+                                    "tte": leg.get("time_to_expiry"),
+                                    "type": leg.get("option_type") or leg.get("instrument_type"),
+                                }
+                            )
+                        st.dataframe(pd.DataFrame(debug_rows), use_container_width=True, hide_index=True)
+                    expiry_df = _compute_expiry_payoff_curve(
+                        legs,
+                        float(trade_spot_override),
+                        include_unrealized_pnl=include_unrealized,
+                    )
+                    x_min = float(curve_df["spot"].min())
+                    x_max = float(curve_df["spot"].max())
+                    if x_min == x_max:
+                        x_min -= 1.0
+                        x_max += 1.0
+                    payoff_chart = make_subplots(
+                        rows=3,
+                        cols=1,
+                        shared_xaxes=True,
+                        vertical_spacing=0.10,
+                        row_heights=[0.5, 0.3, 0.2],
+                        subplot_titles=(
+                            "Payoff curve (Target Date vs Expiry)",
+                            "Target P&L with Convexity Zones",
+                            "Convexity (|d²PnL|, normalized)",
+                        ),
+                    )
+                    payoff_chart.add_trace(
+                        go.Scatter(
+                            x=curve_df["spot"],
+                            y=curve_df["pnl"],
+                            mode="lines",
+                            name="On Target Date",
+                            line=dict(color="#2EC4B6", width=3),
+                        ),
+                        row=1,
+                        col=1,
+                    )
+                    if not expiry_df.empty:
+                        _add_expiry_split_line(payoff_chart, expiry_df)
+                    shade_df = expiry_df if not expiry_df.empty else curve_df
+                    _apply_payoff_zone_shading(payoff_chart, shade_df)
+                    for trace in payoff_chart.data:
+                        if getattr(trace, "fill", None) == "tozeroy" and getattr(trace, "fillcolor", None):
+                            if "46, 204, 113" in trace.fillcolor:
+                                trace.fillcolor = "rgba(46, 204, 113, 0.10)"
+                            elif "231, 76, 60" in trace.fillcolor:
+                                trace.fillcolor = "rgba(231, 76, 60, 0.10)"
+                    show_convexity = st.toggle(
+                        "Show Convexity Overlay",
+                        value=True,
+                        key="tba_payoff_convexity_overlay",
+                        help="Convexity shows where small spot moves cause accelerating P&L changes (gamma risk).",
+                    )
+                    curv_spots = None
+                    curv_norm = None
+                    if show_convexity:
+                        curve_sorted = curve_df.sort_values("spot")
+                        curv_spots = curve_sorted["spot"].to_numpy(dtype=float)
+                        pnl_vals = curve_sorted["pnl"].to_numpy(dtype=float)
+                        n_points = len(curv_spots)
+                        d2 = np.full(n_points, np.nan)
+                        for i in range(1, n_points - 1):
+                            grid_step = curv_spots[i + 1] - curv_spots[i]
+                            if grid_step <= 0:
+                                grid_step = 50.0
+                            step = grid_step
+                            d2[i] = (pnl_vals[i + 1] - 2 * pnl_vals[i] + pnl_vals[i - 1]) / (
+                                step**2
+                            )
+                        curv = np.abs(d2)
+                        curv_scale = np.nanpercentile(curv, 95) if np.isfinite(curv).any() else 0.0
+                        if curv_scale and curv_scale > 0:
+                            curv_norm = np.clip(curv / curv_scale, 0, 1)
+                        else:
+                            curv_norm = np.zeros_like(curv)
+                        curv_norm = np.nan_to_num(curv_norm, nan=0.0)
+                        zones = _segment_convexity_zones(
+                            tuple(curv_spots.tolist()), tuple(curv_norm.tolist())
+                        )
+                        zone_styles = {
+                            "THETA": ("#7AE582", 0.10, "HOLD / THETA"),
+                            "WATCH": ("#FFD166", 0.14, "WATCH (tighten risk)"),
+                            "ACTION": ("#FF5C8A", 0.18, "ADJUST / REDUCE TAIL"),
+                        }
+                        payoff_chart.add_trace(
+                            go.Scatter(
+                                x=curv_spots,
+                                y=pnl_vals,
+                                mode="lines",
+                                name="Target P&L (zones)",
+                                line=dict(color="#2EC4B6", width=2),
+                                showlegend=False,
+                            ),
+                            row=2,
+                            col=1,
+                        )
+                        for zone in zones:
+                            fillcolor, opacity, _ = zone_styles[zone["zone"]]
+                            payoff_chart.add_vrect(
+                                x0=zone["x0"],
+                                x1=zone["x1"],
+                                fillcolor=fillcolor,
+                                opacity=opacity,
+                                line_width=0,
+                                layer="below",
+                                row=2,
+                                col=1,
+                            )
+                        if zones:
+                            y_positions = [0.98, 0.90, 0.82, 0.74, 0.66, 0.58]
+                            for idx, zone in enumerate(zones):
+                                _, _, label_text = zone_styles[zone["zone"]]
+                                y_pos = y_positions[idx % len(y_positions)]
+                                payoff_chart.add_annotation(
+                                    x=(zone["x0"] + zone["x1"]) / 2.0,
+                                    y=y_pos,
+                                    xref="x2",
+                                    yref="y2 domain",
+                                    text=label_text,
+                                    showarrow=False,
+                                    font=dict(size=11, color="#E6EDF3"),
+                                    align="center",
+                                    row=2,
+                                    col=1,
+                                )
+                        conv_at_spot = float(np.interp(spot_value, curv_spots, curv_norm))
+                        if conv_at_spot < 0.3:
+                            now_text = "NOW: HOLD"
+                        elif conv_at_spot < 0.6:
+                            now_text = "NOW: WATCH"
+                        else:
+                            now_text = "NOW: ADJUST"
+                        payoff_chart.add_annotation(
+                            x=spot_value,
+                            y=0.92,
+                            xref="x2",
+                            yref="y2 domain",
+                            text=now_text,
+                            showarrow=False,
+                            font=dict(size=12, color="#E6EDF3"),
+                            bgcolor="rgba(15, 23, 42, 0.65)",
+                            bordercolor="rgba(148, 163, 184, 0.6)",
+                            borderwidth=1,
+                            row=2,
+                            col=1,
+                        )
+                        payoff_chart.add_annotation(
+                            x=0.01,
+                            y=0.98,
+                            xref="paper",
+                            yref="paper",
+                            text=(
+                                "Zones derived from target-curve convexity: "
+                                "<0.3 Hold, 0.3–0.6 Watch, >0.6 Adjust"
+                            ),
+                            showarrow=False,
+                            align="left",
+                            font=dict(size=10, color="#C7D0DA"),
+                            bgcolor="rgba(15, 23, 42, 0.6)",
+                            bordercolor="rgba(148, 163, 184, 0.4)",
+                            borderwidth=1,
+                            row=2,
+                            col=1,
+                        )
+                        payoff_chart.add_annotation(
+                            x=0.02,
+                            y=0.12,
+                            xref="x2 domain",
+                            yref="y2 domain",
+                            text=(
+                                "<b>Legend</b><br>"
+                                "<span style='color:#7AE582;'>Green/Yellow:</span> Theta dominates<br>"
+                                "<span style='color:#FF5C8A;'>Red:</span> Gamma dominates, losses accelerate"
+                            ),
+                            showarrow=False,
+                            align="left",
+                            font=dict(size=10, color="#C7D0DA"),
+                            bgcolor="rgba(15, 23, 42, 0.6)",
+                            bordercolor="rgba(148, 163, 184, 0.4)",
+                            borderwidth=1,
+                            row=2,
+                            col=1,
+                        )
+                        short_strikes = []
+                        for leg in legs:
+                            try:
+                                qty_val = float(leg.get("quantity") or 0.0)
+                            except Exception:
+                                qty_val = 0.0
+                            if qty_val >= 0:
+                                continue
+                            strike_val = leg.get("strike") or leg.get("strike_price")
+                            try:
+                                strike_val = float(strike_val)
+                            except Exception:
+                                strike_val = None
+                            if strike_val is not None:
+                                short_strikes.append(strike_val)
+                        if conv_at_spot >= 0.6 and short_strikes:
+                            buffer = expected_move * 0.25 if expected_move else max(
+                                (x_max - x_min) * 0.02, 1.0
+                            )
+                            near_strikes = [
+                                s
+                                for s in short_strikes
+                                if (s - buffer) <= spot_value <= s
+                            ]
+                            if near_strikes:
+                                payoff_chart.add_annotation(
+                                    x=spot_value,
+                                    y=0.78,
+                                    xref="x2",
+                                    yref="y2 domain",
+                                    text="Entering short-strike convexity ramp",
+                                    showarrow=False,
+                                    font=dict(size=11, color="#F87171"),
+                                    bgcolor="rgba(15, 23, 42, 0.7)",
+                                    bordercolor="rgba(248, 113, 113, 0.5)",
+                                    borderwidth=1,
+                                    row=2,
+                                    col=1,
+                                )
+                    spot_line = dict(color="#7EA6D5", width=1, dash="dash")
+                    payoff_chart.add_shape(
+                        type="line",
+                        x0=float(trade_spot_override),
+                        x1=float(trade_spot_override),
+                        y0=0,
+                        y1=1,
+                        xref="x",
+                        yref="y domain",
+                        line=spot_line,
+                    )
+                    payoff_chart.add_shape(
+                        type="line",
+                        x0=float(trade_spot_override),
+                        x1=float(trade_spot_override),
+                        y0=0,
+                        y1=1,
+                        xref="x2",
+                        yref="y2 domain",
+                        line=spot_line,
+                    )
+                    payoff_chart.add_shape(
+                        type="line",
+                        x0=float(trade_spot_override),
+                        x1=float(trade_spot_override),
+                        y0=0,
+                        y1=1,
+                        xref="x3",
+                        yref="y3 domain",
+                        line=spot_line,
+                    )
+                    if expected_move and expected_move > 0:
+                        for mult, color in [(0.5, "#7F8C8D"), (1.0, "#566573")]:
+                            upper = spot_value + mult * expected_move
+                            lower = spot_value - mult * expected_move
+                            payoff_chart.add_vline(
+                                x=float(lower),
+                                line_dash="dash",
+                                line_color=color,
+                                line_width=1,
+                                row=2,
+                                col=1,
+                            )
+                            payoff_chart.add_vline(
+                                x=float(upper),
+                                line_dash="dash",
+                                line_color=color,
+                                line_width=1,
+                                row=2,
+                                col=1,
+                            )
+                    if show_convexity and curv_spots is not None and curv_norm is not None:
+                        payoff_chart.add_trace(
+                            go.Scatter(
+                                x=curv_spots,
+                                y=curv_norm,
+                                mode="lines",
+                                line=dict(color="#F4A261", width=2),
+                                name="Convexity",
+                            ),
+                            row=3,
+                            col=1,
+                        )
+                        payoff_chart.add_hline(
+                            y=0.3,
+                            line_dash="dot",
+                            line_color="#9AA5B1",
+                            row=3,
+                            col=1,
+                        )
+                        payoff_chart.add_hline(
+                            y=0.7,
+                            line_dash="dot",
+                            line_color="#D9534F",
+                            row=3,
+                            col=1,
+                        )
+                    payoff_chart.update_xaxes(range=[x_min, x_max], row=1, col=1)
+                    payoff_chart.update_xaxes(range=[x_min, x_max], row=2, col=1)
+                    payoff_chart.update_xaxes(range=[x_min, x_max], row=3, col=1, title_text="Spot")
+                    payoff_chart.update_yaxes(title_text="P&L (₹)", row=1, col=1)
+                    payoff_chart.update_yaxes(
+                        title_text="Target P&L (₹)", row=2, col=1
+                    )
+                    payoff_chart.update_yaxes(
+                        title_text="Convexity (|d²PnL|, normalized)", range=[0, 1], row=3, col=1
+                    )
+                    payoff_chart.update_layout(
+                        showlegend=True,
+                        height=900,
+                        margin=dict(l=50, r=20, t=60, b=50),
+                    )
+                    st.plotly_chart(payoff_chart, use_container_width=True)
+                    st.caption(
+                        "Convexity shows where small spot moves cause accelerating P&L changes "
+                        "(gamma risk). Based on target-date pricing."
+                    )
+                    ref_df = expiry_df if not expiry_df.empty else curve_df
+                    max_profit = float(ref_df["pnl"].max())
+                    max_loss = float(ref_df["pnl"].min())
+                    kpis = st.columns(2)
+                    kpis[0].metric("Max Profit (expiry)", format_inr(max_profit))
+                    kpis[1].metric("Max Loss (expiry)", format_inr(max_loss))
+                    unrealized_pnl = sum(float(leg.get("pnl", leg.get("m2m", 0.0)) or 0.0) for leg in legs)
+                    pnl_kpis = st.columns(2)
+                    pnl_kpis[0].metric("Profit Left", format_inr(max_profit - unrealized_pnl))
+                    pnl_kpis[1].metric("Loss Left", format_inr(max_loss - unrealized_pnl))
+                    es99_pct, es99_value, exp_pnl_pct, exp_pnl_value, _ = _compute_trade_es99(
+                        legs,
+                        float(total_capital),
+                        scenarios,
+                        iv_regime,
+                        int(lookback_days),
+                        spot_override=trade_spot_override,
+                        forward_override=trade_forward_override,
+                        target_date=trade_target_date,
+                    )
+                    conv_at_spot = None
+                    conv_regime = "N/A"
+                    conv_color = "#9AA5B1"
+                    curve_sorted = curve_df.sort_values("spot")
+                    conv_spots = curve_sorted["spot"].to_numpy(dtype=float)
+                    conv_pnl = curve_sorted["pnl"].to_numpy(dtype=float)
+                    n_points = len(conv_spots)
+                    if n_points >= 3 and spot_value > 0:
+                        d2 = np.full(n_points, np.nan)
+                        for i in range(1, n_points - 1):
+                            d2[i] = conv_pnl[i + 1] - 2 * conv_pnl[i] + conv_pnl[i - 1]
+                        conv = np.abs(d2)
+                        conv_scale = (
+                            np.nanpercentile(conv, 95) if np.isfinite(conv).any() else 0.0
+                        )
+                        if conv_scale and conv_scale > 0:
+                            conv_norm = np.clip(conv / conv_scale, 0, 1)
+                        else:
+                            conv_norm = np.zeros_like(conv)
+                        conv_norm = np.nan_to_num(conv_norm, nan=0.0)
+                        conv_at_spot = float(np.interp(spot_value, conv_spots, conv_norm))
+                        if conv_at_spot < 0.3:
+                            conv_regime = "Theta"
+                            conv_color = "#2ECC71"
+                        elif conv_at_spot < 0.6:
+                            conv_regime = "Fragile"
+                            conv_color = "#F4A261"
+                        else:
+                            conv_regime = "Gamma"
+                            conv_color = "#EF476F"
+                    # New KPIs: Distance (σ) and Risk Accel
+                    distance_sigma_value = None
+                    if spot_value > 0 and dte_days is not None and iv_atm is not None:
+                        t_years = max(dte_days, 1) / 365.0
+                        expected_move = spot_value * iv_atm * math.sqrt(t_years)
+                        short_call_strike, short_put_strike = _nearest_short_strikes(legs)
+                        ref_strike = None
+                        if short_call_strike is not None and short_put_strike is not None:
+                            dist_call = abs(spot_value - short_call_strike)
+                            dist_put = abs(spot_value - short_put_strike)
+                            ref_strike = short_call_strike if dist_call <= dist_put else short_put_strike
+                        else:
+                            ref_strike = short_call_strike if short_call_strike is not None else short_put_strike
+                        if ref_strike is not None:
+                            distance_sigma_value = abs(spot_value - ref_strike) / max(expected_move, 1e-9)
+
+                    theta_per_day = None
+                    try:
+                        theta_per_day = float(calculate_portfolio_greeks(legs).get("net_theta", 0.0))
+                    except Exception:
+                        theta_per_day = None
+                    expected_theta_1d = abs(theta_per_day) if theta_per_day is not None else None
+
+                    adverse_loss = None
+                    sigma_move = None
+                    pnl_at_spot = None
+                    if spot_value > 0 and iv_atm is not None and dte_days is not None:
+                        t_years = max(dte_days, 1) / 365.0
+                        sigma_move = spot_value * iv_atm * math.sqrt(t_years)
+                        if sigma_move > 0:
+                            curve_sorted = curve_df.sort_values("spot")
+                            interp_spots = curve_sorted["spot"].to_numpy(dtype=float)
+                            interp_pnl = curve_sorted["pnl"].to_numpy(dtype=float)
+                            pnl_at_spot = float(np.interp(spot_value, interp_spots, interp_pnl))
+                            pnl_up = float(np.interp(spot_value + sigma_move, interp_spots, interp_pnl))
+                            pnl_down = float(np.interp(spot_value - sigma_move, interp_spots, interp_pnl))
+                            if include_unrealized:
+                                pnl_at_spot += unrealized_pnl
+                                pnl_up += unrealized_pnl
+                                pnl_down += unrealized_pnl
+                            loss_up = pnl_up - pnl_at_spot
+                            loss_down = pnl_down - pnl_at_spot
+                            adverse_loss = min(loss_up, loss_down)
+
+                    es99_1d_value = None
+                    es99_next_value = None
+                    risk_accel_value = None
+                    risk_accel_label = ""
+                    tail_up = None
+                    tail_down = None
+                    if expected_theta_1d and expected_theta_1d > 0 and iv_atm is not None:
+                        target_date_1d = None
+                        if trade_target_date:
+                            try:
+                                target_date_1d = trade_target_date + timedelta(days=1)
+                            except Exception:
+                                target_date_1d = None
+                        sigma_1d_pct = float(iv_atm) * math.sqrt(1.0 / 252.0)
+                        k_shock = 0.25
+                        spot_up = spot_value * (1.0 + k_shock * sigma_1d_pct)
+                        spot_down = spot_value * (1.0 - k_shock * sigma_1d_pct)
+                        t_override_days = max((dte_days or 1) - 1, 1)
+                        _, es99_up, err_up = _compute_trade_es99_override(
+                            legs,
+                            float(total_capital),
+                            scenarios,
+                            iv_regime,
+                            int(lookback_days),
+                            float(spot_up),
+                            float(trade_forward_override or 0.0),
+                            t_override_days,
+                        )
+                        _, es99_down, err_down = _compute_trade_es99_override(
+                            legs,
+                            float(total_capital),
+                            scenarios,
+                            iv_regime,
+                            int(lookback_days),
+                            float(spot_down),
+                            float(trade_forward_override or 0.0),
+                            t_override_days,
+                        )
+                        tail_now = abs(es99_value)
+                        tail_up = abs(es99_up) if es99_up is not None else None
+                        tail_down = abs(es99_down) if es99_down is not None else None
+                        es99_next_value = None
+                        if tail_up is not None or tail_down is not None:
+                            es99_next_value = max(tail_up or 0.0, tail_down or 0.0)
+                        es99_1d_value = es99_next_value
+                        if es99_next_value is not None:
+                            delta_es99 = es99_next_value - tail_now
+                            risk_accel_value = delta_es99 / max(expected_theta_1d, 1e-6)
+                            if risk_accel_value <= 0.0:
+                                risk_accel_label = "Improving"
+                            elif risk_accel_value <= 1.0:
+                                risk_accel_label = "Stable"
+                            elif risk_accel_value <= 3.0:
+                                risk_accel_label = "Watch"
+                            else:
+                                risk_accel_label = "Directional"
+
+                    delta_pain = None
+                    delta_pain_label = "N/A"
+                    if adverse_loss is not None and expected_theta_1d and expected_theta_1d > 0:
+                        delta_pain = abs(adverse_loss) / expected_theta_1d
+                        if delta_pain < 1.0:
+                            delta_pain_label = "Theta OK"
+                        elif delta_pain < 2.0:
+                            delta_pain_label = "Fragile"
+                        else:
+                            delta_pain_label = "Gamma Dominant (HEDGE)"
+
+                    conv_label = "N/A"
+                    if conv_at_spot is not None:
+                        if conv_at_spot < 0.3:
+                            conv_label = "Theta"
+                        elif conv_at_spot < 0.6:
+                            conv_label = "Fragile"
+                        else:
+                            conv_label = "Gamma"
+
+                    row3 = st.columns(4)
+                    row3[0].metric("ES99 (INR)", format_inr(es99_value))
+                    row3[1].metric("Expected P&L (INR)", format_inr(exp_pnl_value))
+                    row3[2].metric(
+                        "1σ Adverse Move Loss (₹)",
+                        format_inr(adverse_loss) if adverse_loss is not None else "N/A",
+                    )
+                    row3[3].metric(
+                        "Theta / Day (₹)",
+                        format_inr(expected_theta_1d) if expected_theta_1d is not None else "N/A",
+                    )
+
+                    regime_label = "THETA DOMINANT"
+                    if (conv_at_spot is not None and conv_at_spot >= 0.60) or (
+                        risk_accel_value is not None and risk_accel_value >= 3.0
+                    ):
+                        regime_label = "GAMMA DOMINANT"
+                    elif conv_at_spot is not None and conv_at_spot >= 0.30:
+                        regime_label = "FRAGILE"
+
+                    row4 = st.columns(4)
+                    with row4[0]:
+                        conv_value_text = f"{conv_at_spot:.2f}" if conv_at_spot is not None else "N/A"
+                        conv_delta = (
+                            f"{conv_label} · target-date" if conv_label != "N/A" else "N/A"
+                        )
+                        st.metric(
+                            "Convexity (spot)",
+                            conv_value_text,
+                            delta=conv_delta,
+                            delta_color="normal",
+                        )
+                    row4[1].metric(
+                        "Delta Pain Ratio",
+                        f"{delta_pain:.2f}" if delta_pain is not None else "N/A",
+                        delta=delta_pain_label,
+                        delta_color="normal",
+                    )
+                    if risk_accel_value is not None:
+                        row4[2].metric("Risk Accel", f"{risk_accel_value:.2f}", risk_accel_label)
+                    else:
+                        row4[2].metric("Risk Accel", "N/A")
+                    strike_buffer_text = (
+                        f"{distance_sigma_value:.2f}" if distance_sigma_value is not None else "N/A"
+                    )
+                    with row4[3]:
+                        st.metric(
+                            "Strike Buffer (σ)",
+                            strike_buffer_text,
+                            delta="Structural distance",
+                            delta_color="off",
+                        )
+
+                    # POP and Reward/Risk from scenario distribution
+                    scenario_df = _build_trade_scenario_table(
+                        legs,
+                        scenarios,
+                        float(trade_spot_override),
+                        trade_forward_override,
+                        trade_target_date,
+                        float(total_capital),
+                    )
+                    pop_pct = 0.0
+                    if not scenario_df.empty:
+                        for _, row in scenario_df.iterrows():
+                            try:
+                                pnl_inr = float(
+                                    str(row.get("Repriced P&L (₹)", "0")).replace("₹", "").replace(",", "")
+                                )
+                            except Exception:
+                                pnl_inr = 0.0
+                            try:
+                                prob_pct = float(str(row.get("Probability", "0")).replace("%", ""))
+                            except Exception:
+                                prob_pct = 0.0
+                            if pnl_inr >= 0:
+                                pop_pct += prob_pct
+                    rr = (exp_pnl_value / abs(es99_value)) if es99_value else 0.0
+                    pop_kpis = st.columns(2)
+                    pop_kpis[0].metric("POP", f"{pop_pct:.2f}%")
+                    pop_kpis[1].metric("Reward/Risk", f"{rr:.2f}")
+
+                    theta_intent_action = {
+                        "GAMMA DOMINANT": "Theta broken → Hedge / Reduce / Exit",
+                        "FRAGILE": "Tighten risk, stop adding",
+                        "THETA DOMINANT": "Hold for decay",
+                    }
+                    gamma_intent_action = {
+                        "GAMMA DOMINANT": "Expected state → Trade direction / manage delta",
+                        "FRAGILE": "Wait for expansion or clear break",
+                        "THETA DOMINANT": "Poor gamma → Avoid / wait",
+                    }
+                    action_row = st.columns(1)
+                    with action_row[0]:
+                        st.markdown(
+                            "<div style='background: var(--gs-card); border: 1px solid var(--gs-border); "
+                            "border-radius: 14px; padding: 1rem; margin: 0.6rem 0; box-shadow: 0 2px 8px rgba(0,0,0,0.15);'>"
+                            "<div style='color: var(--gs-silver); font-size: 0.75rem; font-weight: 600; "
+                            "text-transform: uppercase; letter-spacing: 0.05em;'>Action</div>"
+                            "<div style='color: var(--gs-text); font-size: 0.95rem; font-weight: 600; "
+                            "margin-top: 0.35rem; line-height: 1.35;'>"
+                            f"Theta trade → {theta_intent_action[regime_label]}<br>"
+                            f"Gamma trade → {gamma_intent_action[regime_label]}"
+                            "</div>"
+                            "</div>",
+                            unsafe_allow_html=True,
+                        )
+                    with st.expander("IV Debug (computed)", expanded=False):
+                        if iv_atm is None:
+                            st.warning("No short-leg IV could be computed; Strike Buffer (σ) set to N/A.")
+                        if leg_iv_debug:
+                            st.dataframe(pd.DataFrame(leg_iv_debug), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No IV debug rows available.")
+                    with st.expander("Risk Accel Debug", expanded=False):
+                        t_now = (max(dte_days, 1) / 365.0) if dte_days is not None else None
+                        t_next = (max(dte_days - 1, 1) / 365.0) if dte_days is not None else None
+                        st.dataframe(
+                            pd.DataFrame(
+                                [
+                                    {
+                                        "ES99_now": es99_value,
+                                        "ES99_up": es99_up if "es99_up" in locals() else None,
+                                        "ES99_down": es99_down if "es99_down" in locals() else None,
+                                        "tail_now": abs(es99_value),
+                                        "tail_up": tail_up,
+                                        "tail_down": tail_down,
+                                        "tail_next": es99_next_value,
+                                        "theta_per_day": theta_per_day,
+                                        "spot": spot_value,
+                                        "S_up": spot_up if "spot_up" in locals() else None,
+                                        "S_down": spot_down if "spot_down" in locals() else None,
+                                        "T_now": t_now,
+                                        "T_next": t_next,
+                                        "k": k_shock if "k_shock" in locals() else None,
+                                        "sigma_1d_pct": sigma_1d_pct if "sigma_1d_pct" in locals() else None,
+                                        "error_reason_up": err_up if "err_up" in locals() else None,
+                                        "error_reason_down": err_down if "err_down" in locals() else None,
+                                    }
+                                ]
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    with st.expander("Scenario Table (repriced)"):
+                        if scenario_df.empty:
+                            st.info("No scenario rows available.")
+                        else:
+                            st.dataframe(scenario_df, use_container_width=True, hide_index=True)
+                            dist_rows = []
+                            for _, row in scenario_df.iterrows():
+                                try:
+                                    pnl_inr = float(
+                                        str(row.get("Repriced P&L (₹)", "0")).replace("₹", "").replace(",", "")
+                                    )
+                                except Exception:
+                                    pnl_inr = 0.0
+                                try:
+                                    prob_pct = float(str(row.get("Probability", "0")).replace("%", ""))
+                                except Exception:
+                                    prob_pct = 0.0
+                                dist_rows.append(
+                                    {
+                                        "Scenario": row.get("Scenario"),
+                                        "P&L (₹)": pnl_inr,
+                                        "Probability %": prob_pct,
+                                    }
+                                )
+                            dist_df = pd.DataFrame(dist_rows).sort_values("P&L (₹)")
+                            if not dist_df.empty:
+                                dist_df["cum_prob"] = dist_df["Probability %"].cumsum()
+                                dist_df["tail"] = dist_df["cum_prob"] <= 1.0
+                                st.markdown("#### P&L Distribution")
+                                colors = []
+                                for pnl, tail in zip(dist_df["P&L (₹)"], dist_df["tail"]):
+                                    if tail:
+                                        colors.append("rgba(231, 76, 60, 0.85)")
+                                    else:
+                                        colors.append("#E57373" if pnl < 0 else "#58D68D")
+                                dist_fig = go.Figure()
+                                dist_fig.add_bar(
+                                    x=dist_df["Scenario"],
+                                    y=dist_df["P&L (₹)"],
+                                    marker_color=colors,
+                                    name="P&L (₹)",
+                                    customdata=dist_df[["Probability %", "cum_prob"]],
+                                    hovertemplate="Scenario: %{x}<br>P&L: %{y:.0f}<br>Prob %: %{customdata[0]:.4f}<br>Cum Prob %: %{customdata[1]:.4f}<extra></extra>",
+                                )
+                                dist_fig.add_scatter(
+                                    x=dist_df["Scenario"],
+                                    y=dist_df["cum_prob"],
+                                    mode="lines+markers",
+                                    name="Cumulative Prob %",
+                                    yaxis="y2",
+                                    line=dict(color="#F5B041", width=2),
+                                    customdata=dist_df[["Probability %", "cum_prob"]],
+                                    hovertemplate="Scenario: %{x}<br>Cum Prob %: %{customdata[1]:.4f}<br>Prob %: %{customdata[0]:.4f}<extra></extra>",
+                                )
+                                dist_fig.update_layout(
+                                    yaxis=dict(title="P&L (₹)"),
+                                    yaxis2=dict(
+                                        title="Cumulative Probability %",
+                                        overlaying="y",
+                                        side="right",
+                                        range=[0, max(1.0, float(dist_df["cum_prob"].max()))],
+                                    ),
+                                    xaxis=dict(title="Scenario (sorted by P&L)"),
+                                    showlegend=True,
+                                )
+                                st.plotly_chart(dist_fig, use_container_width=True)
+                else:
+                    st.info("Payoff curve unavailable (missing IV/strike/price).")
+
+    if active_subtab == "meta":
         st.markdown("### How to Read This Tab (Process)")
         st.markdown(
             "- Start at **Portfolio Level**: check total capital, overall ES99, and forward-sim KPIs.\n"
             "- Then go to **Bucket Level**: verify capital allocations and ES99 vs bucket limits.\n"
             "- Finally, review **Trade Level** to see which weekly trades drive risk and their zone labels."
         )
+        with st.expander("Zone rules (per 1L capital)"):
+            options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
+            iv_percentile = 35
+            if (
+                isinstance(options_df_cache, pd.DataFrame)
+                and not options_df_cache.empty
+                and "iv" in options_df_cache.columns
+            ):
+                iv_percentile = 35
+            iv_regime, _ = get_iv_regime(iv_percentile)
+            st.caption(f"IV regime: {iv_regime}")
+            st.dataframe(_zone_rules_table(iv_regime), use_container_width=True, hide_index=True)
 
         st.markdown("### How to Think About a Trade (Core)")
         st.markdown(
@@ -3142,3 +4765,128 @@ def render_risk_buckets_tab() -> None:
             "- **G5 Sizing**: ES99 vs configured limits (Portfolio limit % and Bucket limit %).\n"
             "- Gate thresholds are bucket-aware where noted, and editable in **Gate settings** under each forward simulation."
         )
+
+    if active_subtab == "settings":
+        st.markdown("### Manual Bucket Assignment (Grouped Trades)")
+        grouped_df = trades_df[trades_df["is_group_trade"]].copy()
+        if grouped_df.empty:
+            st.info("No grouped trades available. Create groups below.")
+        else:
+            st.caption("Assign buckets manually for grouped trades. Auto uses rules.")
+            header_cols = st.columns([0.45, 0.2, 0.2, 0.15])
+            header_cols[0].markdown("**Trade**")
+            header_cols[1].markdown("**ES99 (₹)**")
+            header_cols[2].markdown("**Expected PnL (₹)**")
+            header_cols[3].markdown("**Bucket**")
+            for _, row in grouped_df.iterrows():
+                trade_id = str(row["trade_id"])
+                row_cols = st.columns([0.45, 0.2, 0.2, 0.15])
+                row_cols[0].write(trade_id)
+                row_cols[1].write(format_inr(row["trade_es99_inr"]))
+                row_cols[2].write(format_inr(row["expected_pnl_inr"]))
+                row_cols[3].selectbox(
+                    "Bucket",
+                    ["Auto", "Low", "Med", "High"],
+                    key=f"tba_manual_bucket_{trade_id}",
+                    label_visibility="collapsed",
+                )
+
+        with st.expander("Trade Grouping (Manual)", expanded=False):
+            def _set_grouping_notice(level: str, message: str) -> None:
+                st.session_state["tba_grouping_notice"] = (level, message)
+
+            def _save_trade_group() -> None:
+                saved = st.session_state.get("tba_saved_trades", [])
+                grouped_ids = {leg_id for group in saved for leg_id in group.get("legs", [])}
+                selected = []
+                for idx in range(len(positions)):
+                    key = f"tba_leg_select_{idx}"
+                    if st.session_state.get(key) and str(idx) not in grouped_ids:
+                        selected.append(str(idx))
+                if not selected:
+                    _set_grouping_notice("warning", "Select at least one leg to save a trade group.")
+                    return
+                group_name = st.session_state.get("tba_trade_group_name", "") or "Manual Trade"
+                saved.append({"name": group_name, "legs": selected})
+                st.session_state["tba_saved_trades"] = saved
+                _save_saved_groups(saved)
+                st.session_state["tba_use_saved_groups"] = True
+                st.session_state["tba_trade_group_name"] = ""
+                for leg_id in selected:
+                    st.session_state[f"tba_leg_select_{leg_id}"] = True
+                _set_grouping_notice("success", "Trade group saved.")
+
+            def _remove_trade_group(idx: int) -> None:
+                saved = st.session_state.get("tba_saved_trades", [])
+                if idx < 0 or idx >= len(saved):
+                    return
+                group = saved[idx]
+                for leg_id in group.get("legs", []):
+                    st.session_state[f"tba_leg_select_{leg_id}"] = False
+                st.session_state["tba_saved_trades"] = [g for g_i, g in enumerate(saved) if g_i != idx]
+                _save_saved_groups(st.session_state["tba_saved_trades"])
+                if not st.session_state.get("tba_saved_trades"):
+                    st.session_state["tba_use_saved_groups"] = False
+                _set_grouping_notice("info", "Trade group removed.")
+
+            def _delete_all_groups() -> None:
+                saved = st.session_state.get("tba_saved_trades", [])
+                grouped_ids = {leg_id for group in saved for leg_id in group.get("legs", [])}
+                for leg_id in grouped_ids:
+                    st.session_state[f"tba_leg_select_{leg_id}"] = False
+                st.session_state["tba_saved_trades"] = []
+                _save_saved_groups([])
+                st.session_state["tba_use_saved_groups"] = False
+                _set_grouping_notice("info", "All groups deleted.")
+
+            saved_groups = st.session_state.get("tba_saved_trades", [])
+            grouped_leg_ids = {leg_id for group in saved_groups for leg_id in group.get("legs", [])}
+            st.caption("Select legs to group (grouped legs are locked).")
+            selected_legs = []
+            for idx, pos in enumerate(positions):
+                pos_id = str(idx)
+                label = _position_label(pos, idx)
+                is_grouped = pos_id in grouped_leg_ids
+                checkbox_key = f"tba_leg_select_{idx}"
+                checked = st.checkbox(
+                    f"{label}{' (grouped)' if is_grouped else ''}",
+                    value=is_grouped or bool(st.session_state.get(checkbox_key, False)),
+                    key=checkbox_key,
+                    disabled=is_grouped,
+                )
+                if checked and not is_grouped:
+                    selected_legs.append(pos_id)
+            group_name = st.text_input("Trade name", key="tba_trade_group_name")
+            st.button("Save trade group", type="secondary", on_click=_save_trade_group)
+            notice = st.session_state.get("tba_grouping_notice")
+            if notice:
+                level, message = notice
+                if level == "warning":
+                    st.warning(message)
+                elif level == "success":
+                    st.success(message)
+                else:
+                    st.info(message)
+            if saved_groups:
+                st.caption("Saved groups:")
+                for idx, group in enumerate(saved_groups):
+                    label = group.get("name") or f"Group {idx + 1}"
+                    cols = st.columns([0.8, 0.2])
+                    cols[0].write(label)
+                    leg_labels = []
+                    for leg_id in group.get("legs", []):
+                        try:
+                            leg_idx = int(leg_id)
+                        except Exception:
+                            continue
+                        if 0 <= leg_idx < len(positions):
+                            leg_labels.append(_position_label(positions[leg_idx], leg_idx))
+                    if leg_labels:
+                        cols[0].caption(" | ".join(leg_labels))
+                    cols[1].button(
+                        "Remove",
+                        key=f"tba_remove_group_{idx}",
+                        on_click=_remove_trade_group,
+                        args=(idx,),
+                    )
+                st.button("Delete all groups", type="secondary", on_click=_delete_all_groups)

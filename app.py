@@ -81,6 +81,8 @@ from views.tabs.equities_tab import render_equities_tab
 from views.tabs.historical_performance_tab import render_historical_performance_tab
 from views.tabs.product_overview_tab import render_product_overview_tab
 from views.tabs.derivatives_data_tab import render_derivatives_data_tab, load_cached_derivatives_data_for_session
+from views.tabs.positions_tab import _fetch_positions_cached
+from scripts.utils import enrich_position_with_greeks, calculate_market_regime
 
 
 def save_kite_credentials(
@@ -407,12 +409,14 @@ def render():
     ]
     tab_map = {t["key"]: t["label"] for t in tabs}
     requested_tab = st.query_params.get("tab")
+    if isinstance(requested_tab, list):
+        requested_tab = requested_tab[0] if requested_tab else None
     if requested_tab in tab_map:
         st.session_state["active_tab_key"] = requested_tab
-        st.query_params.pop("tab", None)
     st.session_state.setdefault("active_tab_key", "login")
     if st.session_state["active_tab_key"] not in tab_map:
         st.session_state["active_tab_key"] = "login"
+    st.query_params["tab"] = st.session_state["active_tab_key"]
 
     st.markdown(
         """
@@ -438,6 +442,7 @@ def render():
 
     def set_active_tab(tab_key: str) -> None:
         st.session_state["active_tab_key"] = tab_key
+        st.query_params["tab"] = tab_key
 
     def handle_nav_more_change() -> None:
         selection = st.session_state.get("nav_more", "⋯")
@@ -448,6 +453,7 @@ def render():
             )
             if selected_key:
                 st.session_state["active_tab_key"] = selected_key
+                st.query_params["tab"] = selected_key
 
     st.markdown('<div id="gs-nav" class="gs-nav">', unsafe_allow_html=True)
     nav_cols = st.columns(6)
@@ -517,6 +523,42 @@ def render():
             f"⚠️ Derivatives cache missing or expired for: {missing_str}. "
             "Please load fresh data from the Derivatives Data tab."
         )
+
+    # Autoload cached positions on reload (same as Positions tab "Load Cache")
+    if (
+        "enriched_positions" not in st.session_state
+        and not st.session_state.get("positions_cache_autoloaded")
+        and st.session_state.get("kite_access_token")
+        and st.session_state.get("kite_api_key")
+        and st.session_state.get("options_df_cache") is not None
+    ):
+        st.session_state["positions_cache_autoloaded"] = True
+        try:
+            net_positions = _fetch_positions_cached(
+                st.session_state["kite_api_key"], st.session_state["kite_access_token"]
+            )
+            if net_positions:
+                options_df = st.session_state.get("options_df_cache")
+                nifty_df = st.session_state.get("nifty_df_cache")
+                market_regime = calculate_market_regime(options_df, nifty_df)
+                current_spot = market_regime.get("current_spot", 25000)
+                if (
+                    nifty_df is not None
+                    and hasattr(nifty_df, "empty")
+                    and not nifty_df.empty
+                    and "close" in nifty_df.columns
+                ):
+                    try:
+                        current_spot = float(nifty_df["close"].dropna().iloc[-1])
+                    except Exception:
+                        pass
+                enriched = []
+                for pos in net_positions:
+                    enriched.append(enrich_position_with_greeks(pos, options_df, current_spot))
+                st.session_state["enriched_positions"] = enriched
+                st.session_state["current_spot"] = current_spot
+        except Exception:
+            pass
 
     if active_key == "portfolio":
         st.markdown("---")

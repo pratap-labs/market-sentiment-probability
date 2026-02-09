@@ -6,7 +6,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from collections import Counter
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import sys
 import os
@@ -22,10 +22,11 @@ from scripts.utils import (
     classify_history_bucket,
     compute_var_es_metrics,
 )
-try:
-    from py_vollib.black_scholes import black_scholes as bs
-except Exception:
-    bs = None
+from scripts.utils.option_pricing import (
+    infer_forward_from_futures_df,
+    price_option,
+    pricing_model_available,
+)
 
 from views.tabs.derivatives_data_tab import load_from_cache as _load_from_cache
 
@@ -38,6 +39,41 @@ DEFAULT_THRESHOLD_MASTER_PCT = 1.0
 DEFAULT_THRESHOLD_HARD_STOP_PCT = 1.2
 DEFAULT_THRESHOLD_NORMAL_SHARE = 0.5
 DEFAULT_THRESHOLD_STRESS_SHARE = 0.9
+
+REPRICING_MODEL_LABELS = {
+    "Black-76 (futures/forward)": "black76",
+    "Black-Scholes (spot)": "black_scholes",
+}
+
+
+def _repricing_controls(spot: float) -> Tuple[str, Optional[float], str]:
+    options = list(REPRICING_MODEL_LABELS.keys())
+    selection = st.sidebar.selectbox(
+        "Scenario repricing model",
+        options,
+        index=0,
+        key="repriced_pricing_model",
+        help="Use Black-76 with futures/forward price to align with Sensibull projections.",
+    )
+    model_key = REPRICING_MODEL_LABELS.get(selection, "black76")
+    forward_price = None
+    if model_key == "black76":
+        futures_df = st.session_state.get("nifty_futures_df_cache", pd.DataFrame())
+        default_forward = infer_forward_from_futures_df(futures_df, spot)
+        forward_input = st.sidebar.number_input(
+            "Target-day futures price (optional)",
+            min_value=0.0,
+            value=float(default_forward) if default_forward else 0.0,
+            step=10.0,
+            format="%.2f",
+            key="repriced_forward_override",
+            help="Leave 0 to use spot-derived forward. Scenario shocks apply to this base.",
+        )
+        forward_price = float(forward_input) if forward_input > 0 else None
+
+    st.session_state["repriced_pricing_model_key"] = model_key
+    st.session_state["repriced_forward_base"] = forward_price
+    return model_key, forward_price, selection
 
 
 def _load_cache_silent(data_type: str) -> pd.DataFrame:
@@ -287,16 +323,34 @@ def render_risk_analysis_tab():
     derived_rows = threshold_context.get("rows", [])
     repriced_map: Dict[str, Dict[str, object]] = {}
     repriced_skipped = {"missing_fields": 0, "no_price": 0}
-    if bs is not None:
+    spot_override = st.session_state.get("stress_spot_override")
+    if spot_override is None:
+        st.info("Repriced P&L requires Spot Override input from the Stress Testing tab.")
+        repricing_available = False
+        pricing_model = None
+        forward_price = None
+        pricing_label = None
+    else:
+        pricing_model, forward_price, pricing_label = _repricing_controls(float(spot_override))
+        repricing_available = pricing_model_available(pricing_model)
+    if repricing_available:
         positions = st.session_state.get("enriched_positions", [])
         if positions:
             repriced_rows, repriced_skipped = _repriced_scenario_rows(
                 positions,
                 scenarios,
-                current_spot,
+                float(spot_override),
                 account_size,
+                pricing_model=pricing_model,
+                forward_price=forward_price,
             )
             repriced_map = {row["Scenario"]: row for row in repriced_rows}
+        st.caption(
+            f"Repriced P&L uses {pricing_label}"
+            + (f" | Forward used: {forward_price:.2f}" if forward_price else "")
+        )
+    else:
+        st.info("Selected pricing model unavailable; repriced P&L disabled.")
     def _parse_inr(val: str) -> float:
         cleaned = str(val).replace("₹", "").replace(",", "").strip()
         try:
@@ -1115,6 +1169,8 @@ def _repriced_scenario_rows(
     spot: float,
     capital: float,
     risk_free_rate: float = 0.07,
+    pricing_model: str = "black76",
+    forward_price: Optional[float] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, int]]:
     rows: List[Dict[str, object]] = []
     skipped = {"missing_fields": 0, "no_price": 0}
@@ -1123,6 +1179,9 @@ def _repriced_scenario_rows(
 
     for scenario in scenarios:
         scenario_spot = spot * (1 + scenario.ds_pct / 100.0)
+        scenario_forward = None
+        if forward_price is not None:
+            scenario_forward = forward_price * (1 + scenario.ds_pct / 100.0)
         scenario_iv_shift = scenario.div_pts / 100.0
         total_pnl = 0.0
         used_positions = 0
@@ -1147,8 +1206,19 @@ def _repriced_scenario_rows(
             shock_iv = max(float(iv) + scenario_iv_shift, 0.0001)
             flag = "c" if option_type == "CE" else "p"
             try:
-                new_price = bs(flag, scenario_spot, float(strike), float(tte), risk_free_rate, shock_iv)
+                new_price = price_option(
+                    flag,
+                    scenario_spot,
+                    float(strike),
+                    float(tte),
+                    risk_free_rate,
+                    shock_iv,
+                    model=pricing_model,
+                    forward=scenario_forward,
+                )
             except Exception:
+                continue
+            if new_price is None:
                 continue
 
             total_pnl += (new_price - float(last_price)) * float(qty)

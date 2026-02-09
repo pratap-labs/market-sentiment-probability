@@ -5,6 +5,146 @@ This dashboard provides comprehensive options trading analytics, position manage
 
 ---
 
+## Product Summary
+
+This product is a multi-tab options portfolio dashboard that unifies live positions, equity holdings, market regime context, risk simulation, and pre‑trade screening. It’s built around a 4‑layer risk workflow (Portfolio → Bucket → Trade → Meta) and supports both cached data and fresh API pulls.
+
+---
+
+## Sections & KPI Inventory (by Tab)
+
+### 🔐 Login
+- **Section: Authentication**
+  - Kite API key
+  - Kite API secret
+  - Login status / access token state
+
+### 📊 Portfolio
+- **Section: Capital & Performance**
+  - Account Size
+  - Margin Used (₹, %)
+  - Net P&L (₹, %)
+  - Theta/Day (₹, % of capital)
+  - ROI (Annualized)
+  - Days to Recover
+  - Theta Efficiency (%)
+  - Notional Exposure (₹, leverage)
+- **Section: Greeks & Risk**
+  - Net Delta (units)
+  - Delta (₹/pt)
+  - Net Gamma
+  - Net Vega (₹/IV)
+  - Delta Notional (₹)
+  - Vega % Capital
+- **Section: Portfolio–Market Alignment**
+  - Volatility stance (Aligned / Watch)
+  - Directional stance (Aligned / Watch)
+  - Term risk stance
+  - Health status (Pass / Watch / Fail)
+  - Recommendations list
+- **Section: Positions Table**
+  - Symbol, Quantity, Strike, Type, DTE
+  - Avg Price, LTP, P&L
+  - IV
+  - Greeks (Delta, Gamma, Vega, Theta)
+  - Position Greeks (Greek × Quantity)
+
+### 📈 Equities
+- **Section: Equity Sleeve KPIs**
+  - Equity Sleeve Value
+  - Allocation %
+  - Sleeve Drawdown %
+  - Sleeve Stress Loss (₹, %)
+  - Equity ES99 Contribution %
+- **Section: Under-water Summary**
+  - Holdings Under Water (%)
+  - Weighted Avg Time Under Water (days)
+- **Section: Equity Scenario Table**
+  - Symbol, Qty, Avg Cost, LTP, Market Value
+  - Stress Loss (₹)
+  - ES99 (₹, if available)
+
+### 🛡️ Risk Buckets (50/30/20)
+- **Subtab: Portfolio Level**
+  - Forward Simulation KPIs: Mean, Median, P5, P1, Prob. Loss, Prob. Breach, Days to Breach (P10/P1), Tail Ratio
+  - Portfolio ES99 (% and ₹)
+  - Margin Used (%)
+  - ES99 top contributors by underlying / bucket / week
+  - Zone classification (Theta/Gamma/Vega normalized)
+- **Subtab: Bucket Level**
+  - Panel: Manual bucket assignment for each grouped trade
+  - Charts: Bucket ES99 (% and ₹) and Bucket Expected PnL
+  - Forward Simulation KPIs per bucket (same as portfolio)
+  - Scenario Table (probability‑weighted)
+- **Subtab: Trade Level**
+  - Trade ES99 (₹, % of bucket)
+  - Tail Loss (₹)
+  - Mean PnL (₹, %)
+  - Mean Loss (₹)
+  - Risk/Reward
+  - Theta Carry (₹)
+  - Premium Received / Pro‑rated Premium
+  - Theta/Gamma/Vega per 1L
+  - Zone Label
+  - MTD P&L
+- **Subtab: Meta Information**
+  - Bucket sizing and rules
+  - Process definitions and rule references
+  - Zone rules per ₹1L
+  - ES99 / simulation interpretation
+
+### 🔬 Pre-Trade Analysis
+- **Section: Stress Testing**
+  - ES99 Limit (% NAV)
+  - Spot Override
+  - Zone placement (Theta/Gamma/Vega per ₹1L)
+  - Scenario results (loss vs limits)
+- **Section: Trade Selector**
+  - Strategy, expiry, strike distance, wing width
+  - Premium, Max Profit, Max Loss
+  - Expected PnL, POP
+  - Tail Loss (CVaR), RR
+  - Net Greeks (Delta/Gamma/Vega/Theta)
+
+### 🌡️ Market Regime
+- **Section: Regime Summary**
+  - IV Rank / Percentile
+  - Put‑Call Ratio (PCR)
+  - Skew (put vs call IV)
+  - Term Structure (near vs far IV)
+- **Section: Strategy Guidance**
+  - Suggested strategy list
+  - Risk warnings / watch flags
+
+### 📈 Historical Performance
+- **Section: Upload & Normalize**
+  - Symbol
+  - Realized P&L (₹)
+  - Realized P&L (%)
+- **Section: Performance Breakdown**
+  - P&L by month
+  - P&L by expiry type
+  - Win/Loss distribution
+  - Top/Bottom contributors
+
+### ✨ Product Overview
+- **Section: Framework Summary**
+  - Portfolio → Bucket → Trade → Meta workflow
+  - Risk limits / kill switch references
+- **Section: Daily Workflow**
+  - Morning check, intraday check, EOD review
+
+### 💾 Data Source
+- **Section: Cache Status**
+  - NIFTY OHLCV cache freshness
+  - Futures cache freshness
+  - Options CE/PE cache freshness
+- **Section: Data Load**
+  - Load Cache
+  - Fetch Fresh
+
+If you want to remove “unuseful” KPIs, tell me which ones to drop (or give a rule like “hide raw greeks” or “hide portfolio alignment flags”). 
+
 ## Main Dashboard Tabs
 
 ### 1. 🔐 Login Tab

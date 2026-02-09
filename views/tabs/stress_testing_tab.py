@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import plotly.express as px
@@ -17,10 +17,11 @@ from scripts.utils import (
     DEFAULT_LOT_SIZE,
     enrich_position_with_greeks,
 )
-try:
-    from py_vollib.black_scholes import black_scholes as bs
-except Exception:
-    bs = None
+from scripts.utils.option_pricing import (
+    infer_forward_from_futures_df,
+    price_option,
+    pricing_model_available,
+)
 from views.tabs.risk_analysis_tab import (
     classify_zone,
     get_iv_regime,
@@ -127,6 +128,41 @@ INSIGHTS = {
         "Cut size rapidly on 1% adverse move; let delta hedges absorb spikes.",
     ],
 }
+
+REPRICING_MODEL_LABELS = {
+    "Black-76 (futures/forward)": "black76",
+    "Black-Scholes (spot)": "black_scholes",
+}
+
+
+def _repricing_controls(spot: float) -> Tuple[str, Optional[float], str]:
+    options = list(REPRICING_MODEL_LABELS.keys())
+    selection = st.sidebar.selectbox(
+        "Scenario repricing model",
+        options,
+        index=0,
+        key="repriced_pricing_model",
+        help="Use Black-76 with futures/forward price to align with Sensibull projections.",
+    )
+    model_key = REPRICING_MODEL_LABELS.get(selection, "black76")
+    forward_price = None
+    if model_key == "black76":
+        futures_df = st.session_state.get("nifty_futures_df_cache", pd.DataFrame())
+        default_forward = infer_forward_from_futures_df(futures_df, spot)
+        forward_input = st.sidebar.number_input(
+            "Target-day futures price (optional)",
+            min_value=0.0,
+            value=float(default_forward) if default_forward else 0.0,
+            step=10.0,
+            format="%.2f",
+            key="repriced_forward_override",
+            help="Leave 0 to use spot-derived forward. Scenario shocks apply to this base.",
+        )
+        forward_price = float(forward_input) if forward_input > 0 else None
+
+    st.session_state["repriced_pricing_model_key"] = model_key
+    st.session_state["repriced_forward_base"] = forward_price
+    return model_key, forward_price, selection
 
 
 def _ensure_default_inputs():
@@ -362,6 +398,8 @@ def _repriced_scenario_rows(
     capital: float,
     thresholds: Dict[str, float],
     risk_free_rate: float = 0.07,
+    pricing_model: str = "black76",
+    forward_price: Optional[float] = None,
 ) -> Tuple[List[Dict[str, object]], Dict[str, int]]:
     rows: List[Dict[str, object]] = []
     skipped = {"missing_fields": 0, "no_price": 0}
@@ -370,6 +408,9 @@ def _repriced_scenario_rows(
 
     for scenario in scenarios:
         scenario_spot = spot * (1 + scenario.ds_pct / 100.0)
+        scenario_forward = None
+        if forward_price is not None:
+            scenario_forward = forward_price * (1 + scenario.ds_pct / 100.0)
         scenario_iv_shift = scenario.div_pts / 100.0
         total_pnl = 0.0
         used_positions = 0
@@ -394,8 +435,19 @@ def _repriced_scenario_rows(
             shock_iv = max(float(iv) + scenario_iv_shift, 0.0001)
             flag = "c" if option_type == "CE" else "p"
             try:
-                new_price = bs(flag, scenario_spot, float(strike), float(tte), risk_free_rate, shock_iv)
+                new_price = price_option(
+                    flag,
+                    scenario_spot,
+                    float(strike),
+                    float(tte),
+                    risk_free_rate,
+                    shock_iv,
+                    model=pricing_model,
+                    forward=scenario_forward,
+                )
             except Exception:
+                continue
+            if new_price is None:
                 continue
 
             total_pnl += (new_price - float(last_price)) * float(qty)
@@ -432,12 +484,17 @@ def _repriced_position_audit(
     scenario: object,
     spot: float,
     risk_free_rate: float = 0.07,
+    pricing_model: str = "black76",
+    forward_price: Optional[float] = None,
 ) -> pd.DataFrame:
     rows: List[Dict[str, object]] = []
     if not positions or spot <= 0:
         return pd.DataFrame()
 
     scenario_spot = spot * (1 + scenario.ds_pct / 100.0)
+    scenario_forward = None
+    if forward_price is not None:
+        scenario_forward = forward_price * (1 + scenario.ds_pct / 100.0)
     scenario_iv_shift = scenario.div_pts / 100.0
 
     for pos in positions:
@@ -457,8 +514,19 @@ def _repriced_position_audit(
         shock_iv = max(float(iv) + scenario_iv_shift, 0.0001)
         flag = "c" if option_type == "CE" else "p"
         try:
-            new_price = bs(flag, scenario_spot, float(strike), float(tte), risk_free_rate, shock_iv)
+            new_price = price_option(
+                flag,
+                scenario_spot,
+                float(strike),
+                float(tte),
+                risk_free_rate,
+                shock_iv,
+                model=pricing_model,
+                forward=scenario_forward,
+            )
         except Exception:
+            continue
+        if new_price is None:
             continue
 
         pnl = (new_price - float(last_price)) * float(qty)
@@ -746,7 +814,7 @@ def render_pre_trade_analysis_tab():
         smoothing_enabled=False,
         smoothing_span=63,
     )
-    bucket_rows = _compute_bucket_rows(delta, gamma, vega, capital, st.session_state.get("current_spot", 25000), bucket_probs)
+    bucket_rows = _compute_bucket_rows(delta, gamma, vega, capital, spot, bucket_probs)
     st.caption(
         f"Historical bucket mix ({history_count}d lookback): "
         f"A {bucket_probs['A']*100:.1f}%, B {bucket_probs['B']*100:.1f}%, "
@@ -805,10 +873,13 @@ def render_pre_trade_analysis_tab():
         stress_share=DEFAULT_THRESHOLD_STRESS_SHARE,
     )
 
+    pricing_model, forward_price, pricing_label = _repricing_controls(spot)
+    repricing_available = pricing_model_available(pricing_model)
+
     repriced_rows: List[Dict[str, object]] = []
     repriced_map: Dict[str, Dict[str, object]] = {}
     repriced_skipped = {"missing_fields": 0, "no_price": 0}
-    if bs is not None:
+    if repricing_available:
         positions = st.session_state.get("enriched_positions", [])
         if positions:
             repriced_rows, repriced_skipped = _repriced_scenario_rows(
@@ -817,6 +888,8 @@ def render_pre_trade_analysis_tab():
                 spot,
                 capital,
                 threshold_context.get("thresholds", {}),
+                pricing_model=pricing_model,
+                forward_price=forward_price,
             )
             repriced_map = {row["Scenario"]: row for row in repriced_rows}
 
@@ -894,9 +967,10 @@ def render_pre_trade_analysis_tab():
         "Reprices each option at shocked spot/IV to capture gamma/vega changes. "
         "Repriced P&L is shown inside the main scenario table."
     )
-    if bs is None:
-        st.warning("Black-Scholes library unavailable; repricing panel disabled.")
+    if not repricing_available:
+        st.warning("Selected pricing model unavailable; repricing panel disabled.")
         return
+    st.caption(f"Pricing model: {pricing_label}" + (f" | Forward used: {forward_price:.2f}" if forward_price else ""))
 
     positions = st.session_state.get("enriched_positions", [])
     if not positions:
@@ -954,8 +1028,8 @@ def render_pre_trade_analysis_tab():
 
     st.markdown("### Scenario Repricing Audit")
     st.caption("Select a scenario to review per-position repricing inputs and P&L.")
-    if bs is None:
-        st.warning("Black-Scholes library unavailable; audit panel disabled.")
+    if not repricing_available:
+        st.warning("Selected pricing model unavailable; audit panel disabled.")
         return
     if not positions:
         st.info("Load positions first to run the audit.")
@@ -964,7 +1038,13 @@ def render_pre_trade_analysis_tab():
     selected_name = st.sidebar.selectbox("Scenario to audit", scenario_names, key="repriced_audit_scenario")
     selected = next((s for s in scenarios if s.name == selected_name), None)
     if selected:
-        audit_df = _repriced_position_audit(positions, selected, spot)
+        audit_df = _repriced_position_audit(
+            positions,
+            selected,
+            spot,
+            pricing_model=pricing_model,
+            forward_price=forward_price,
+        )
         if audit_df.empty:
             st.info("No option positions available for repricing audit.")
         else:
