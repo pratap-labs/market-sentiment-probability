@@ -34,10 +34,6 @@ def calculate_var(positions: List[Dict], spot: float, nifty_df: Optional[pd.Data
     spot_move_2sigma = spot * (2 * daily_vol)
     
     
-    print(f'DEBUG VaR: daily_vol={daily_vol:.4f} ({daily_vol*100:.2f}%)')
-    print(f'DEBUG VaR: total_delta={total_delta:.2f}, total_gamma={total_gamma:.4f}, total_vega={total_vega:.2f}')
-    print(f'DEBUG VaR: spot={spot:.0f}, spot_move_2sigma={spot_move_2sigma:.0f} ({spot_move_2sigma/spot*100:.2f}%)')
-    
     # IV move assumption: 5 volatility points (0.05) for stress scenario
     iv_move = 0.05
     
@@ -46,12 +42,8 @@ def calculate_var(positions: List[Dict], spot: float, nifty_df: Optional[pd.Data
     gamma_contribution = 0.5 * total_gamma * (spot_move_2sigma ** 2)
     vega_contribution = total_vega * iv_move
     
-    print(f'DEBUG VaR components: delta={delta_contribution:.0f}, gamma={gamma_contribution:.0f}, vega={vega_contribution:.0f}')
-    
     var = abs(delta_contribution + gamma_contribution + vega_contribution)
-    
-    print(f'DEBUG VaR: final VaR={var:.0f}')
-    
+
     return var
 
 

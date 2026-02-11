@@ -50,9 +50,7 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
         try:
             last_close = nifty_df["close"].dropna().iloc[-1]
             current_spot = float(last_close)
-            print(f"DEBUG: using spot from nifty_df.close = {current_spot}")
         except Exception as e:
-            print(f"DEBUG: failed to extract spot from nifty_df: {e}")
             current_spot = None
 
     # Fallback to options underlying_value if nifty_df doesn't provide a valid spot
@@ -61,10 +59,7 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
             current_spot = latest_options["underlying_value"].iloc[0]
             if pd.isna(current_spot):
                 raise ValueError("underlying_value is NaN")
-            print(f"DEBUG: using spot from options_df.underlying_value = {current_spot}")
         except Exception as e:
-            msg = "DEBUG: latest spot missing from both nifty_df.close and options_df.underlying_value — cannot compute market regime"
-            print(msg)
             try:
                 st.warning("Latest underlying spot is missing in both NIFTY prices and options data. Ensure upstream data ingestion includes a valid spot price.")
             except Exception:
@@ -104,7 +99,6 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
         day_spot = day_options["underlying_value"].iloc[0]
         if pd.isna(day_spot):
             skipped_days.append(date)
-            print(f"DEBUG: skipping date {date} because underlying_value is NaN")
             continue
         day_atm = round(day_spot / 50) * 50
         day_atm_options = day_options[
@@ -130,9 +124,6 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
     else:
         iv_rank = 50
 
-    if skipped_days:
-        print(f"DEBUG: skipped {len(skipped_days)} historical days due to missing underlying_value. Examples: {skipped_days[:5]}")
-    
     # Calculate realized volatility from NIFTY daily
     if "close" in nifty_df.columns and len(nifty_df) > 30:
         returns = nifty_df["close"].pct_change().dropna()[-30:]
@@ -162,8 +153,8 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
             put_oi = puts["open_int"].sum()
             call_oi = calls["open_int"].sum()
             pcr_oi = put_oi / call_oi if call_oi > 0 else 0
-    except Exception as e:
-        print(f"DEBUG: PCR calculation failed: {e}")
+    except Exception:
+        pass
     
     # ========== 2. VOLATILITY SKEW (25-delta risk reversal) ==========
     skew = 0
@@ -213,8 +204,8 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
             put_25d_iv = np.mean(put_ivs)
             call_25d_iv = np.mean(call_ivs)
             skew = put_25d_iv - call_25d_iv  # Positive = put skew (fear)
-    except Exception as e:
-        print(f"DEBUG: Skew calculation failed: {e}")
+    except Exception:
+        pass
     
     # ========== 3. TERM STRUCTURE ==========
     # Compare near-term vs next-term IV
@@ -254,8 +245,8 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
                         far_iv = np.mean(far_ivs)
                         # Positive = contango (normal), Negative = backwardation (stress)
                         term_structure = far_iv - near_iv
-    except Exception as e:
-        print(f"DEBUG: Term structure calculation failed: {e}")
+    except Exception:
+        pass
     
     # ========== 4. MARKET REGIME CLASSIFICATION ==========
     regime_name = "Unknown"
@@ -278,8 +269,8 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
                 regime_name = "Elevated IV - Sell Bias"
             else:
                 regime_name = "Compressed IV - Buy Bias"
-    except Exception as e:
-        print(f"DEBUG: Regime classification failed: {e}")
+    except Exception:
+        pass
     
     # ========== 5. NIFTY TREND INDICATORS ==========
     sma_20 = 0
@@ -308,8 +299,8 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
                 ranges = pd.concat([high_low, high_close, low_close], axis=1)
                 true_range = ranges.max(axis=1)
                 atr = true_range.rolling(14).mean().iloc[-1]
-    except Exception as e:
-        print(f"DEBUG: Trend indicators calculation failed: {e}")
+    except Exception:
+        pass
     
     # ========== 6. VOLATILITY PERCENTILE ==========
     rv_percentile = 50
@@ -327,8 +318,8 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
                 # Percentile of current realized vol
                 below = sum(1 for rv in historical_rvs if rv < realized_vol)
                 rv_percentile = (below / len(historical_rvs)) * 100
-    except Exception as e:
-        print(f"DEBUG: RV percentile calculation failed: {e}")
+    except Exception:
+        pass
     
     # ========== 7. MAX PAIN ==========
     max_pain_strike = atm_strike
@@ -365,8 +356,8 @@ def calculate_market_regime(options_df: pd.DataFrame, nifty_df: pd.DataFrame) ->
                 if total_pain < min_pain:
                     min_pain = total_pain
                     max_pain_strike = strike
-    except Exception as e:
-        print(f"DEBUG: Max pain calculation failed: {e}")
+    except Exception:
+        pass
     
     return {
         # Original metrics

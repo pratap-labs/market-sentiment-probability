@@ -5,3 +5,5 @@ database/*
 __pycache__/
 *.pyc
 .pycache_local/
+node_modules/
+dist/

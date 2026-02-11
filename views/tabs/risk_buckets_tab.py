@@ -2809,7 +2809,7 @@ def render_risk_buckets_tab() -> None:
         bucket_cap = total_capital * allocations[BUCKET_KEYS[bucket]] / 100.0
         bucket_sim_map[bucket] = simulate_forward_pnl(bucket_positions, sim_cfg, bucket_limit, bucket_cap)
 
-    subtab_labels = ["Portfolio Level", "Bucket Level", "Trade Level", "Meta Information", "Settings"]
+    subtab_labels = ["Portfolio", "Buckets", "Trades", "Meta Information", "Settings"]
     subtab_keys = ["portfolio", "bucket", "trade", "meta", "settings"]
     label_to_key = dict(zip(subtab_labels, subtab_keys))
     key_to_label = dict(zip(subtab_keys, subtab_labels))

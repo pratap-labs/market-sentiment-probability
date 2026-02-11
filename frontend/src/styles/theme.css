@@ -1,0 +1,60 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
+
+:root {
+  --gs-bg: #0b0e14;
+  --gs-surface: #11151f;
+  --gs-card: #1c2128;
+  --gs-border: #1f2a3d;
+
+  --gs-text: #e7eef9;
+  --gs-muted: #a9b7d0;
+  --gs-silver: #b9c4d6;
+
+  --gs-accent: #2d7dff;
+  --gs-accent2: #1b4fd8;
+
+  --gs-success: #2ecc71;
+  --gs-danger: #ff4d4d;
+  --gs-warning: #ffb020;
+
+  --gs-shadow-1: 0 2px 8px rgba(0, 0, 0, 0.2);
+  --gs-shadow-2: 0 8px 20px rgba(0, 0, 0, 0.25);
+
+  --gs-radius-sm: 10px;
+  --gs-radius-md: 14px;
+  --gs-radius-lg: 18px;
+
+  --gs-space-1: 4px;
+  --gs-space-2: 8px;
+  --gs-space-3: 12px;
+  --gs-space-4: 16px;
+  --gs-space-5: 24px;
+  --gs-space-6: 32px;
+  --gs-space-7: 40px;
+  --gs-space-8: 56px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Inter", system-ui, -apple-system, sans-serif;
+  background: var(--gs-bg);
+  color: var(--gs-text);
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}

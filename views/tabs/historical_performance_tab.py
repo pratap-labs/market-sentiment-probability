@@ -102,7 +102,6 @@ def _prepare_trades(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     symbol_col = _find_column(df, ["Symbol"])
     realized_col = _find_column(df, ["Realized P&L", "Realized PnL", "Realized"])
     realized_pct_col = _find_column(df, ["Realized P&L Pct.", "Realized P&L Pct", "Realized PnL Pct", "Realized %"])
-
     if not symbol_col:
         warnings.append("Missing Symbol column in the CSV.")
         return pd.DataFrame(), warnings
