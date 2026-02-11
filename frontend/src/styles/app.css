@@ -120,22 +120,14 @@
 
 .ticker-item {
   font-size: 0.8rem;
-  color: var(--gs-muted);
+  color: var(--gs-silver);
   display: inline-flex;
   align-items: center;
   gap: 10px;
 }
 
-.ticker-item.good {
-  color: var(--gs-success);
-}
-
-.ticker-item.bad {
-  color: var(--gs-danger);
-}
-
 .ticker-sep {
-  color: rgba(148, 163, 184, 0.6);
+  color: var(--gs-silver);
 }
 
 @keyframes ticker-scroll {
@@ -528,7 +520,7 @@
   background: transparent;
   border: 1px solid var(--gs-border);
   border-radius: 14px;
-  padding: 8px;
+  padding: 12px;
 }
 
 .chart-panel h4 {

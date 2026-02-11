@@ -69,7 +69,7 @@ export default function LiveTicker() {
     <div className="ticker">
       <div className="ticker-track">
         {items.map((item, idx) => (
-          <span key={`${item.text}-${idx}`} className={`ticker-item ${item.tone || "neutral"}`}>
+          <span key={`${item.text}-${idx}`} className="ticker-item">
             {item.text}
             {idx < items.length - 1 ? <span className="ticker-sep">•</span> : null}
           </span>

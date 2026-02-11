@@ -1603,6 +1603,7 @@ def simulate_forward_pnl(
     summary = {
         "mean": float(np.mean(pnl_tn)),
         "median": float(np.median(pnl_tn)),
+        "p95": float(np.percentile(pnl_tn, 95)),
         "p5": float(np.percentile(pnl_tn, 5)),
         "p1": float(np.percentile(pnl_tn, 1)),
         "prob_loss": float(np.mean(pnl_tn < 0)),

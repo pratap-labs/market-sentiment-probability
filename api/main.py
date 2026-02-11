@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
-from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -28,6 +28,7 @@ from scripts.utils import (
 from scripts.data import NSEDataFetcher
 from scripts.utils.greeks import calculate_implied_volatility
 from scripts.utils.stress_testing import compute_var_es_metrics, get_weighted_scenarios, classify_bucket
+from scripts.utils.forward_risk import run_advanced_forward_risk
 from views.tabs.overview_tab import (
     get_alignment_status,
     get_market_signal,
@@ -107,6 +108,101 @@ class RiskBucketSettingsPayload(BaseModel):
     settings: Dict[str, Any]
 
 
+def _log_advanced_simulation_snapshot(
+    advanced_sim: Optional[Dict[str, Any]],
+    current_spot: float,
+    positions_count: int,
+) -> None:
+    if not isinstance(advanced_sim, dict):
+        return
+    cfg = advanced_sim.get("config") or {}
+    logger.info(
+        (
+            "[ADV_SIM] version=%s spot=%.2f positions=%d horizon_days=%s n_paths=%s dt=%s seed=%s "
+            "r=%s q=%s repricing_anchor=%s engines=%s pnl_modes=%s evt=%s surface=%s"
+        ),
+        str(advanced_sim.get("model_version", "unknown")),
+        float(current_spot or 0.0),
+        int(positions_count),
+        cfg.get("horizon_days"),
+        cfg.get("n_paths"),
+        cfg.get("dt"),
+        cfg.get("seed"),
+        cfg.get("risk_free_rate"),
+        cfg.get("dividend_yield"),
+        cfg.get("repricing_anchor"),
+        cfg.get("engines"),
+        cfg.get("pnl_modes"),
+        cfg.get("use_evt_overlay"),
+        cfg.get("simulate_surface"),
+    )
+
+    engines = advanced_sim.get("engines") or {}
+    if not isinstance(engines, dict):
+        return
+    for engine_name, engine_block in engines.items():
+        if str(engine_name) == "gbm":
+            continue
+        modes = (engine_block or {}).get("modes") if isinstance(engine_block, dict) else None
+        if not isinstance(modes, dict):
+            continue
+        for mode_name, mode_block in modes.items():
+            if str(mode_name) != "repricing":
+                continue
+            kpis = (mode_block or {}).get("kpis") if isinstance(mode_block, dict) else None
+            sample = (mode_block or {}).get("terminal_pnl_sample") if isinstance(mode_block, dict) else None
+            if not isinstance(kpis, dict):
+                continue
+            quantiles = kpis.get("quantiles") or {}
+            logger.info(
+                (
+                    "[ADV_SIM][PNL] engine=%s mode=%s mean=%s median=%s p95=%s p5=%s p1=%s "
+                    "var95=%s var99=%s es95=%s es99=%s prob_loss=%s prob_breach_total=%s worst=%s"
+                ),
+                str(engine_name),
+                str(mode_name),
+                kpis.get("mean"),
+                kpis.get("median"),
+                quantiles.get("p95") if isinstance(quantiles, dict) else None,
+                quantiles.get("p5") if isinstance(quantiles, dict) else None,
+                quantiles.get("p1") if isinstance(quantiles, dict) else None,
+                kpis.get("var95"),
+                kpis.get("var99"),
+                kpis.get("es95"),
+                kpis.get("es99"),
+                kpis.get("prob_loss"),
+                kpis.get("prob_breach_total"),
+                kpis.get("worst_path_pnl"),
+            )
+            if isinstance(sample, list) and sample:
+                try:
+                    arr = np.asarray(sample, dtype=float)
+                    neg_count = int(np.sum(arr < 0))
+                    logger.info(
+                        (
+                            "[ADV_SIM][SAMPLE] engine=%s mode=%s n=%d neg_count=%d neg_pct=%.6f "
+                            "min=%s p1=%s p5=%s median=%s p95=%s max=%s"
+                        ),
+                        str(engine_name),
+                        str(mode_name),
+                        int(arr.size),
+                        neg_count,
+                        float(neg_count / arr.size) if arr.size else 0.0,
+                        float(np.min(arr)),
+                        float(np.percentile(arr, 1)),
+                        float(np.percentile(arr, 5)),
+                        float(np.percentile(arr, 50)),
+                        float(np.percentile(arr, 95)),
+                        float(np.max(arr)),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[ADV_SIM][SAMPLE] Failed to summarize terminal_pnl_sample for engine=%s mode=%s",
+                        str(engine_name),
+                        str(mode_name),
+                    )
+
+
 def _read_csv(path: Path) -> pd.DataFrame:
     if not path.exists():
         return pd.DataFrame()
@@ -119,6 +215,18 @@ def _read_csv(path: Path) -> pd.DataFrame:
 def _load_cache(name: str) -> pd.DataFrame:
     print(f"Loading cache for {name} from {CACHE_DIR / f'{name}.csv'}")
     return _read_csv(CACHE_DIR / f"{name}.csv")
+
+
+def _filter_latest_snapshot(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
+    if df.empty or date_col not in df.columns:
+        return df
+    out = df.copy()
+    out[date_col] = pd.to_datetime(out[date_col], errors="coerce")
+    out = out.dropna(subset=[date_col])
+    if out.empty:
+        return df
+    latest = out[date_col].max()
+    return out[out[date_col] == latest].copy()
 
 
 def _df_to_records(df: pd.DataFrame, limit: int) -> List[Dict[str, Any]]:
@@ -1155,6 +1263,7 @@ def risk_buckets_portfolio(request: Request):
     pe_df = _load_cache("nifty_options_pe")
     if not pe_df.empty:
         options_df = pd.concat([options_df, pe_df], ignore_index=True)
+    options_df = _filter_latest_snapshot(options_df, "date")
     nifty_df = _load_cache("nifty_ohlcv")
     if options_df.empty or nifty_df.empty:
         raise HTTPException(status_code=404, detail="Options/NIFTY cache missing")
@@ -1193,14 +1302,32 @@ def risk_buckets_portfolio(request: Request):
 
     agg = aggregate_portfolio(trades_df)
 
-    sim_cfg = SimulationConfig(
-        horizon_days=int(settings.get("sim_days", 10)),
-        paths=int(settings.get("sim_paths", 2000)),
-        iv_mode=settings.get("iv_mode", "IV Flat"),
-        iv_shock=float(settings.get("iv_shock", 2.0)),
-        include_spot_shocks=True,
+    advanced_sim = run_advanced_forward_risk(
+        positions=positions,
+        options_df=options_df,
+        spot_history_df=nifty_df,
+        spot=current_spot,
+        config={
+            "horizon_days": int(settings.get("sim_days", 10)),
+            "n_paths": int(settings.get("sim_paths", 2000)),
+            "dt": 1.0 / 252.0,
+            "seed": 42,
+            "risk_free_rate": 0.0,
+            "dividend_yield": 0.0,
+            "daily_loss_limit": None,
+            "total_loss_limit": (4.0 / 100.0) * float(total_capital) if total_capital else None,
+            "engines": ("fhs", "garch", "egarch", "gjr", "heston", "bates"),
+            "pnl_modes": ("greeks", "repricing"),
+            "use_evt_overlay": True,
+            "simulate_surface": True,
+            "repricing_anchor": "market_t0",
+        },
     )
-    sim = simulate_forward_pnl(enriched, sim_cfg, limit_pct=4.0, limit_base=total_capital)
+    _log_advanced_simulation_snapshot(
+        advanced_sim=advanced_sim,
+        current_spot=current_spot,
+        positions_count=len(positions),
+    )
 
     iv_percentile = 35
     iv_regime, _ = ra_tab.get_iv_regime(iv_percentile)
@@ -1227,14 +1354,54 @@ def risk_buckets_portfolio(request: Request):
         .reset_index()
     )
 
+    # Backward-compat summary payloads are now sourced from advanced simulation defaults.
+    engines_block = (advanced_sim or {}).get("engines", {}) if isinstance(advanced_sim, dict) else {}
+    engine_name = "gbm" if "gbm" in engines_block else (next(iter(engines_block), None))
+    mode_name = "repricing"
+    if engine_name and mode_name not in (engines_block.get(engine_name, {}).get("modes", {}) or {}):
+        mode_name = next(iter((engines_block.get(engine_name, {}).get("modes", {}) or {}), "greeks"))
+    selected_mode = (
+        (engines_block.get(engine_name, {}).get("modes", {}) or {}).get(mode_name, {})
+        if engine_name
+        else {}
+    )
+    selected_kpis = (selected_mode or {}).get("kpis", {}) if isinstance(selected_mode, dict) else {}
+    selected_fan = (selected_kpis.get("fan", {}) or {}) if isinstance(selected_kpis, dict) else {}
+    terminal_sample = (selected_mode.get("terminal_pnl_sample", []) or []) if isinstance(selected_mode, dict) else []
+
     fan_rows = []
-    if isinstance(sim, dict):
-        fan = sim.get("fan")
-        if isinstance(fan, pd.DataFrame) and not fan.empty:
-            fan_rows = fan.to_dict(orient="records")
+    p50 = selected_fan.get("p50", []) if isinstance(selected_fan, dict) else []
+    p10 = selected_fan.get("p10", []) if isinstance(selected_fan, dict) else []
+    p1 = selected_fan.get("p1", []) if isinstance(selected_fan, dict) else []
+    for i in range(min(len(p50), len(p10), len(p1))):
+        fan_rows.append({"Day": i + 1, "P50": float(p50[i]), "P10": float(p10[i]), "P1": float(p1[i])})
+    distribution = None
+    if terminal_sample:
+        final_pnl = np.asarray(terminal_sample, dtype=float)
+        distribution = {
+            "final_pnl": final_pnl.tolist(),
+            "mean": float(np.mean(final_pnl)),
+            "median": float(np.median(final_pnl)),
+            "p5": float(np.percentile(final_pnl, 5)),
+            "p1": float(np.percentile(final_pnl, 1)),
+        }
+    sim_summary = None
+    if selected_kpis:
+        quantiles = selected_kpis.get("quantiles", {}) if isinstance(selected_kpis, dict) else {}
+        sim_summary = {
+            "mean": float(selected_kpis.get("mean", 0.0)),
+            "median": float(selected_kpis.get("median", 0.0)),
+            "p95": float(quantiles.get("p95", np.percentile(np.asarray(terminal_sample, dtype=float), 95) if terminal_sample else 0.0)),
+            "p5": float(quantiles.get("p5", 0.0)),
+            "p1": float(quantiles.get("p1", 0.0)),
+            "prob_loss": float(selected_kpis.get("prob_loss", 0.0)),
+            "prob_breach": float(selected_kpis.get("prob_breach_total", 0.0)),
+        }
     return {
-        "sim_summary": sim["summary"] if sim else None,
+        "sim_summary": sim_summary,
         "sim_fan": fan_rows,
+        "sim_distribution": distribution,
+        "advanced_simulation": advanced_sim,
         "portfolio_es99_inr": float(agg["portfolio_es99_inr"]),
         "portfolio_es99_pct": (float(agg["portfolio_es99_inr"]) / total_capital * 100) if total_capital else 0.0,
         "margin_used_pct": None,
@@ -1252,6 +1419,17 @@ def risk_buckets_portfolio(request: Request):
             "zone_color": zone_color,
         },
     }
+
+
+@app.get("/risk-buckets/artifact/{name}")
+def risk_buckets_artifact(name: str):
+    allowed = {"overlay_cdf.png", "overlay_tail.png"}
+    if name not in allowed:
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    path = ROOT / "artifacts" / name
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact not available")
+    return FileResponse(path)
 
 
 @app.get("/risk-buckets/buckets")
