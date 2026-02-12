@@ -57,14 +57,47 @@ export default function RiskBucketsPortfolio() {
   const advanced = data?.advanced_simulation || null;
   const overlayPlots = advanced?.overlay_plots || {};
   const rows = (advanced?.summary_rows || []) as Record<string, unknown>[];
+  const engineSortKey = (raw: string): { ivOrder: number; base: string } => {
+    const parts = String(raw || "").split("|");
+    const base = String(parts[0] || raw || "");
+    const iv = String(parts[1] || "").toLowerCase();
+    const ivOrder = iv === "flat" ? 0 : (iv === "surface" ? 1 : 2);
+    return { ivOrder, base };
+  };
+  const sortedRows = [...rows].sort((a, b) => {
+    const ea = engineSortKey(String(a.engine || ""));
+    const eb = engineSortKey(String(b.engine || ""));
+    if (ea.ivOrder !== eb.ivOrder) return ea.ivOrder - eb.ivOrder;
+    const baseCmp = ea.base.localeCompare(eb.base);
+    if (baseCmp !== 0) return baseCmp;
+    const ma = String(a.mode_variant || a.mode || "");
+    const mb = String(b.mode_variant || b.mode || "");
+    return ma.localeCompare(mb);
+  });
+  const pickPreferredModeKey = (modes: Record<string, ModePayload>, base: "repricing" | "greeks"): string => {
+    const keys = Object.keys(modes || {});
+    if (!keys.length) return "";
+    if (base === "repricing") {
+      if (keys.includes("repricing_bs")) return "repricing_bs";
+      const repricingKeys = keys.filter((k) => k.startsWith("repricing"));
+      return repricingKeys[0] || keys[0];
+    }
+    if (keys.includes("greeks")) return "greeks";
+    return keys[0];
+  };
   const repricingMedianByEngine = new Map(
-    rows
+    sortedRows
       .filter((r) => String(r.mode || "") === "repricing")
-      .map((r) => [String(r.engine || ""), Number(r.median)])
+      .map((r) => [String(r.engine || ""), Number(r.median)] as [string, number])
       .filter(([, v]) => Number.isFinite(v))
   );
   const engines = (advanced?.engines || {}) as Record<string, EnginePayload>;
-  const engineOptions = Object.keys(engines);
+  const engineOptions = Object.keys(engines).sort((a, b) => {
+    const ea = engineSortKey(a);
+    const eb = engineSortKey(b);
+    if (ea.ivOrder !== eb.ivOrder) return ea.ivOrder - eb.ivOrder;
+    return ea.base.localeCompare(eb.base);
+  });
   const [selectedEngine, setSelectedEngine] = useState<string>("");
   const effectiveEngine = engineOptions.includes(selectedEngine) ? selectedEngine : (engineOptions[0] || "");
   const modeOptions = Object.keys(engines[effectiveEngine]?.modes || {});
@@ -93,9 +126,9 @@ export default function RiskBucketsPortfolio() {
   }
   const barX = counts.map((_, i) => minX + width * (i + 0.5));
   const barText = counts.map((c) => (c > 0 ? String(c) : ""));
-  const allModes = Array.from(new Set(rows.map((r) => String(r.mode || "")).filter(Boolean)));
+  const allModes = Array.from(new Set(sortedRows.map((r) => String(r.mode || "")).filter(Boolean)));
   const effectiveAggMode = allModes.includes("repricing") ? "repricing" : (allModes[0] || "");
-  const aggRows = rows.filter((r) => String(r.mode || "") === effectiveAggMode);
+  const aggRows = sortedRows.filter((r) => String(r.mode || "") === effectiveAggMode);
   const var99Arr = aggRows.map((r) => Number(r.var99)).filter((v) => Number.isFinite(v));
   const es99Arr = aggRows.map((r) => Number(r.es99)).filter((v) => Number.isFinite(v));
   const probLossArr = aggRows.map((r) => Number(r.prob_loss)).filter((v) => Number.isFinite(v));
@@ -116,8 +149,8 @@ export default function RiskBucketsPortfolio() {
   const var99Iqr = pct(var99Arr, 75) - pct(var99Arr, 25);
   const var99Range = (var99Arr.length ? Math.max(...var99Arr) : NaN) - (var99Arr.length ? Math.min(...var99Arr) : NaN);
   const meanRange = (meanArr.length ? Math.max(...meanArr) : NaN) - (meanArr.length ? Math.min(...meanArr) : NaN);
-  const reprRows = rows.filter((r) => String(r.mode || "") === "repricing");
-  const greeksByEngine = new Map(rows.filter((r) => String(r.mode || "") === "greeks").map((r) => [String(r.engine || ""), r]));
+  const reprRows = sortedRows.filter((r) => String(r.mode || "") === "repricing");
+  const greeksByEngine = new Map(sortedRows.filter((r) => String(r.mode || "") === "greeks").map((r) => [String(r.engine || ""), r]));
   const paired = reprRows
     .map((r) => {
       const g = greeksByEngine.get(String(r.engine || ""));
@@ -134,7 +167,11 @@ export default function RiskBucketsPortfolio() {
   const buildOverlayDist = (modeName: string, stackId: string) => {
     const samplesByEngine = Object.entries(engines).map(([engine, payload]) => {
       const modes = payload?.modes || {};
-      const sample = (modes[modeName]?.terminal_pnl_sample || []) as number[];
+      const key =
+        modeName === "repricing"
+          ? pickPreferredModeKey(modes, "repricing")
+          : pickPreferredModeKey(modes, "greeks");
+      const sample = ((modes[key] || {}).terminal_pnl_sample || []) as number[];
       return { engine, sample: sample.map((v) => toLac(v)).filter((v) => Number.isFinite(v)) };
     });
     const allVals = samplesByEngine.flatMap((r) => r.sample);
@@ -339,11 +376,14 @@ export default function RiskBucketsPortfolio() {
               Advanced model version: <strong>{advanced?.model_version || "unknown"}</strong>
             </div>
             <DataTable
-              rows={rows}
+              rows={sortedRows}
               maxHeight={380}
               columns={[
                 { key: "engine", label: "Engine" },
                 { key: "mode", label: "P&L Mode" },
+                { key: "mode_variant", label: "Mode Variant" },
+                { key: "iv_rule", label: "IV Rule" },
+                { key: "pricing_model", label: "Pricing" },
                 { key: "mean", label: "Mean (₹ Lacs)", format: formatInrLac },
                 { key: "median", label: "Median (₹ Lacs)", format: formatInrLac },
                 { key: "var95", label: "VaR95 (P5, ₹ Lacs)", format: formatInrLac },

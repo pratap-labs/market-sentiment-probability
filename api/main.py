@@ -119,7 +119,7 @@ def _log_advanced_simulation_snapshot(
     logger.info(
         (
             "[ADV_SIM] version=%s spot=%.2f positions=%d horizon_days=%s n_paths=%s dt=%s seed=%s "
-            "r=%s q=%s repricing_anchor=%s engines=%s pnl_modes=%s evt=%s surface=%s"
+            "r=%s q=%s repricing_anchor=%s engines=%s pnl_modes=%s iv_rules=%s repricing_models=%s evt=%s surface=%s"
         ),
         str(advanced_sim.get("model_version", "unknown")),
         float(current_spot or 0.0),
@@ -133,6 +133,8 @@ def _log_advanced_simulation_snapshot(
         cfg.get("repricing_anchor"),
         cfg.get("engines"),
         cfg.get("pnl_modes"),
+        cfg.get("iv_rules"),
+        cfg.get("repricing_models"),
         cfg.get("use_evt_overlay"),
         cfg.get("simulate_surface"),
     )
@@ -147,7 +149,8 @@ def _log_advanced_simulation_snapshot(
         if not isinstance(modes, dict):
             continue
         for mode_name, mode_block in modes.items():
-            if str(mode_name) != "repricing":
+            mode_base = str((mode_block or {}).get("mode_base", mode_name))
+            if mode_base != "repricing":
                 continue
             kpis = (mode_block or {}).get("kpis") if isinstance(mode_block, dict) else None
             sample = (mode_block or {}).get("terminal_pnl_sample") if isinstance(mode_block, dict) else None
@@ -160,7 +163,7 @@ def _log_advanced_simulation_snapshot(
                     "var95=%s var99=%s es95=%s es99=%s prob_loss=%s prob_breach_total=%s worst=%s"
                 ),
                 str(engine_name),
-                str(mode_name),
+                f"{mode_name}[iv={str((mode_block or {}).get('iv_rule', ''))},pricing={str((mode_block or {}).get('pricing_model', ''))}]",
                 kpis.get("mean"),
                 kpis.get("median"),
                 quantiles.get("p95") if isinstance(quantiles, dict) else None,
@@ -184,7 +187,7 @@ def _log_advanced_simulation_snapshot(
                             "min=%s p1=%s p5=%s median=%s p95=%s max=%s"
                         ),
                         str(engine_name),
-                        str(mode_name),
+                        f"{mode_name}[iv={str((mode_block or {}).get('iv_rule', ''))},pricing={str((mode_block or {}).get('pricing_model', ''))}]",
                         int(arr.size),
                         neg_count,
                         float(neg_count / arr.size) if arr.size else 0.0,
@@ -1312,12 +1315,14 @@ def risk_buckets_portfolio(request: Request):
             "n_paths": int(settings.get("sim_paths", 2000)),
             "dt": 1.0 / 252.0,
             "seed": 42,
-            "risk_free_rate": 0.0,
-            "dividend_yield": 0.0,
+            "risk_free_rate": 0.06,
+            "dividend_yield": 0.01,
             "daily_loss_limit": None,
             "total_loss_limit": (4.0 / 100.0) * float(total_capital) if total_capital else None,
             "engines": ("fhs", "garch", "egarch", "gjr", "heston", "bates"),
             "pnl_modes": ("greeks", "repricing"),
+            "iv_rules": ("flat", "surface"),
+            "repricing_models": ("bs76",),
             "use_evt_overlay": True,
             "simulate_surface": True,
             "repricing_anchor": "market_t0",
@@ -1356,10 +1361,20 @@ def risk_buckets_portfolio(request: Request):
 
     # Backward-compat summary payloads are now sourced from advanced simulation defaults.
     engines_block = (advanced_sim or {}).get("engines", {}) if isinstance(advanced_sim, dict) else {}
-    engine_name = "gbm" if "gbm" in engines_block else (next(iter(engines_block), None))
-    mode_name = "repricing"
-    if engine_name and mode_name not in (engines_block.get(engine_name, {}).get("modes", {}) or {}):
-        mode_name = next(iter((engines_block.get(engine_name, {}).get("modes", {}) or {}), "greeks"))
+    engine_candidates = list(engines_block.keys()) if isinstance(engines_block, dict) else []
+    engine_name = next((k for k in engine_candidates if str(k).startswith("gbm|flat")), None)
+    if not engine_name:
+        engine_name = next((k for k in engine_candidates if str(k).startswith("gbm|surface")), None)
+    if not engine_name:
+        engine_name = next((k for k in engine_candidates if str(k).startswith("gbm|")), None)
+    if not engine_name:
+        engine_name = next(iter(engines_block), None)
+    mode_candidates = (engines_block.get(engine_name, {}).get("modes", {}) or {}) if engine_name else {}
+    mode_name = "repricing_bs"
+    if mode_name not in mode_candidates:
+        mode_name = next((m for m in mode_candidates.keys() if str(m).startswith("repricing")), None)
+    if not mode_name:
+        mode_name = next(iter(mode_candidates), "greeks")
     selected_mode = (
         (engines_block.get(engine_name, {}).get("modes", {}) or {}).get(mode_name, {})
         if engine_name

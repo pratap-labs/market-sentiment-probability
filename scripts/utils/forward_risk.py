@@ -40,6 +40,8 @@ class AdvancedForwardConfig:
     total_loss_limit: Optional[float] = None
     engines: Tuple[str, ...] = ("fhs", "garch", "egarch", "gjr", "heston", "bates")
     pnl_modes: Tuple[str, ...] = ("greeks", "repricing")
+    iv_rules: Tuple[str, ...] = ("surface", "flat")
+    repricing_models: Tuple[str, ...] = ("bs", "bs76")
     use_evt_overlay: bool = True
     simulate_surface: bool = True
     heston_kappa: float = 2.0
@@ -673,6 +675,22 @@ def _bs_price_vec(flag: str, s: np.ndarray, k: float, t: float, r: float, sigma:
     return k * disc * _norm_cdf(-d2) - s * _norm_cdf(-d1)
 
 
+def _b76_price_vec(flag: str, fwd: np.ndarray, k: float, t: float, r: float, sigma: np.ndarray) -> np.ndarray:
+    fwd = np.maximum(fwd, 1e-8)
+    k = max(k, 1e-8)
+    t = max(t, 1e-8)
+    sigma = np.maximum(sigma, 1e-6)
+    sqrt_t = math.sqrt(t)
+    d1 = (np.log(fwd / k) + 0.5 * sigma * sigma * t) / (sigma * sqrt_t)
+    d2 = d1 - sigma * sqrt_t
+    nd1 = _norm_cdf(d1)
+    nd2 = _norm_cdf(d2)
+    disc = math.exp(-r * t)
+    if flag == "c":
+        return disc * (fwd * nd1 - k * nd2)
+    return disc * (k * _norm_cdf(-d2) - fwd * _norm_cdf(-d1))
+
+
 def _bs_greeks_vec(flag: str, s: np.ndarray, k: float, t: float, r: float, sigma: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     s = np.maximum(s, 1e-8)
     k = max(k, 1e-8)
@@ -720,6 +738,7 @@ def _simulate_mode_repricing(
     factor_shocks: Optional[np.ndarray],
     cfg: AdvancedForwardConfig,
     engine_name: Optional[str] = None,
+    pricing_model: str = "bs",
 ) -> np.ndarray:
     paths, horizon = spot_paths.shape
     pnl = np.zeros((paths, horizon), dtype=float)
@@ -743,36 +762,62 @@ def _simulate_mode_repricing(
             dte0 = max((expiry - today).days if isinstance(expiry, date) else 30, 0)
             tte0 = max(dte0 / 365.0, 1.0 / 365.0)
             iv0 = float(np.clip(float(leg.get("iv0", 0.0)), MIN_VOL, MAX_VOL))
-            px_iv0 = float(
-                _bs_price_vec(
-                    leg["flag"],
-                    np.asarray([spot0], dtype=float),
-                    float(leg["strike"]),
-                    tte0,
-                    cfg.risk_free_rate,
-                    np.asarray([iv0], dtype=float),
-                )[0]
-            )
+            spot_vec = np.asarray([spot0], dtype=float)
+            if pricing_model == "bs76":
+                fwd0 = spot_vec * math.exp((cfg.risk_free_rate - cfg.dividend_yield) * tte0)
+                px_iv0 = float(
+                    _b76_price_vec(
+                        leg["flag"],
+                        fwd0,
+                        float(leg["strike"]),
+                        tte0,
+                        cfg.risk_free_rate,
+                        np.asarray([iv0], dtype=float),
+                    )[0]
+                )
+            else:
+                px_iv0 = float(
+                    _bs_price_vec(
+                        leg["flag"],
+                        spot_vec,
+                        float(leg["strike"]),
+                        tte0,
+                        cfg.risk_free_rate,
+                        np.asarray([iv0], dtype=float),
+                    )[0]
+                )
             iv_surface = float(
                 _effective_iv_for_leg(
                     leg,
-                    np.asarray([spot0], dtype=float),
+                    spot_vec,
                     tte0,
                     surface_base,
                     None,
                     0,
                 )[0]
             )
-            px_surface = float(
-                _bs_price_vec(
-                    leg["flag"],
-                    np.asarray([spot0], dtype=float),
-                    float(leg["strike"]),
-                    tte0,
-                    cfg.risk_free_rate,
-                    np.asarray([iv_surface], dtype=float),
-                )[0]
-            )
+            if pricing_model == "bs76":
+                px_surface = float(
+                    _b76_price_vec(
+                        leg["flag"],
+                        fwd0,
+                        float(leg["strike"]),
+                        tte0,
+                        cfg.risk_free_rate,
+                        np.asarray([iv_surface], dtype=float),
+                    )[0]
+                )
+            else:
+                px_surface = float(
+                    _bs_price_vec(
+                        leg["flag"],
+                        spot_vec,
+                        float(leg["strike"]),
+                        tte0,
+                        cfg.risk_free_rate,
+                        np.asarray([iv_surface], dtype=float),
+                    )[0]
+                )
             initial_value += qty * px_market
         initial_market += qty * px_market
         initial_model_iv0 += qty * px_iv0
@@ -783,7 +828,7 @@ def _simulate_mode_repricing(
             logger.info(
                 (
                     "[ADV_SIM][REPRICE_INPUT] engine=%s leg=%d kind=%s symbol=%s qty=%.6f "
-                    "strike=%s expiry=%s price0=%.8f iv0=%s px_iv0=%.8f px_surface_t0=%.8f "
+                    "pricing_model=%s strike=%s expiry=%s price0=%.8f iv0=%s px_iv0=%.8f px_surface_t0=%.8f "
                     "contrib_market=%.8f contrib_iv0=%.8f contrib_surface=%.8f"
                 ),
                 engine,
@@ -791,6 +836,7 @@ def _simulate_mode_repricing(
                 str(leg.get("kind")),
                 str(leg.get("symbol", "")),
                 qty,
+                pricing_model,
                 str(leg.get("strike")),
                 str(leg.get("expiry")),
                 px_market,
@@ -805,13 +851,14 @@ def _simulate_mode_repricing(
         logger.info(
             (
                 "[ADV_SIM][REPRICE_BASE] engine=%s anchor=%s baseline_market=%.8f baseline_model_iv0=%.8f "
-                "baseline_model_surface=%.8f gap_model_iv0_minus_market=%.8f gap_model_surface_minus_market=%.8f"
+                "baseline_model_surface=%.8f pricing_model=%s gap_model_iv0_minus_market=%.8f gap_model_surface_minus_market=%.8f"
             ),
             str(engine_name or "unknown"),
             str(cfg.repricing_anchor),
             initial_market,
             initial_model_iv0,
             initial_model_surface,
+            pricing_model,
             initial_model_iv0 - initial_market,
             initial_model_surface - initial_market,
         )
@@ -827,7 +874,11 @@ def _simulate_mode_repricing(
             dte = max((expiry - today).days if isinstance(expiry, date) else 30, 0)
             tte = max(dte / 365.0 - ((t + 1) / TRADING_DAYS_PER_YEAR), 1.0 / 365.0)
             iv = _effective_iv_for_leg(leg, s_t, tte, surface_base, factor_shocks, t)
-            px = _bs_price_vec(leg["flag"], s_t, float(leg["strike"]), tte, cfg.risk_free_rate, iv)
+            if pricing_model == "bs76":
+                fwd_t = s_t * np.exp((cfg.risk_free_rate - cfg.dividend_yield) * tte)
+                px = _b76_price_vec(leg["flag"], fwd_t, float(leg["strike"]), tte, cfg.risk_free_rate, iv)
+            else:
+                px = _bs_price_vec(leg["flag"], s_t, float(leg["strike"]), tte, cfg.risk_free_rate, iv)
             value += leg["qty"] * px
         pnl[:, t] = value - initial_value
         if (
@@ -1196,143 +1247,183 @@ def run_advanced_forward_risk(
         if cfg.debug_logging and cfg.debug_mode_filter in (None, "all") and eng not in set(cfg.debug_skip_engines or ()):
             _log_engine_inputs(eng, spot_paths, returns_paths, factor_shocks, cfg)
 
-        mode_results: Dict[str, Any] = {}
-        pnl_repricing = None
-        pnl_greeks = None
-        for mode in cfg.pnl_modes:
-            if mode == "repricing":
-                pnl_repricing = _simulate_mode_repricing(legs, spot_paths, spot, base_surface, factor_shocks, cfg, engine_name=eng)
-                k = _distribution_kpis(pnl_repricing, cfg.daily_loss_limit, cfg.total_loss_limit)
-                term = pnl_repricing[:, -1]
+        for iv_rule in cfg.iv_rules:
+            use_surface = str(iv_rule).lower() == "surface"
+            factor_shocks_eff = factor_shocks if use_surface else None
+            mode_results: Dict[str, Any] = {}
+            pnl_repricing_bs = None
+            pnl_greeks = None
+            scenario_engine = f"{eng}|{iv_rule}"
+
+            for mode in cfg.pnl_modes:
+                if mode == "repricing":
+                    for model_name in cfg.repricing_models:
+                        mode_key = f"repricing_{model_name}"
+                        pnl_repricing = _simulate_mode_repricing(
+                            legs,
+                            spot_paths,
+                            spot,
+                            base_surface,
+                            factor_shocks_eff,
+                            cfg,
+                            engine_name=scenario_engine,
+                            pricing_model=model_name,
+                        )
+                        if model_name == "bs":
+                            pnl_repricing_bs = pnl_repricing
+                        k = _distribution_kpis(pnl_repricing, cfg.daily_loss_limit, cfg.total_loss_limit)
+                        term = pnl_repricing[:, -1]
+                        if (
+                            cfg.debug_logging
+                            and (cfg.debug_mode_filter in (None, "repricing"))
+                            and eng not in set(cfg.debug_skip_engines or ())
+                        ):
+                            sorted_term = np.sort(term)
+                            n = sorted_term.size
+                            lo = sorted_term[: min(5, n)].tolist() if n else []
+                            hi = sorted_term[max(0, n - 5):].tolist() if n else []
+                            neg_count = int(np.sum(term < 0))
+                            logger.info(
+                                (
+                                    "[ADV_SIM][TERM_DEBUG] engine=%s iv_rule=%s mode=%s n=%d neg_count=%d neg_pct=%.6f "
+                                    "min=%.8f p1=%.8f p5=%.8f median=%.8f p95=%.8f p99=%.8f max=%.8f "
+                                    "sample_low=%s sample_high=%s"
+                                ),
+                                eng,
+                                iv_rule,
+                                mode_key,
+                                n,
+                                neg_count,
+                                (neg_count / n) if n else 0.0,
+                                float(np.min(term)) if n else float("nan"),
+                                float(np.percentile(term, 1)) if n else float("nan"),
+                                float(np.percentile(term, 5)) if n else float("nan"),
+                                float(np.percentile(term, 50)) if n else float("nan"),
+                                float(np.percentile(term, 95)) if n else float("nan"),
+                                float(np.percentile(term, 99)) if n else float("nan"),
+                                float(np.max(term)) if n else float("nan"),
+                                lo,
+                                hi,
+                            )
+                        if term.size > 3000:
+                            pick = np.linspace(0, term.size - 1, 3000, dtype=int)
+                            term_sample = term[pick]
+                        else:
+                            term_sample = term
+                        mode_results[mode_key] = {
+                            "kpis": k,
+                            "terminal_pnl_sample": term_sample.astype(float).tolist(),
+                            "mode_base": "repricing",
+                            "pricing_model": model_name,
+                            "iv_rule": iv_rule,
+                        }
+                else:
+                    mode_key = "greeks"
+                    pnl_greeks = _simulate_mode_greeks(legs, spot_paths, spot, base_surface, factor_shocks_eff, cfg)
+                    k = _distribution_kpis(pnl_greeks, cfg.daily_loss_limit, cfg.total_loss_limit)
+                    term = pnl_greeks[:, -1]
+                    if term.size > 3000:
+                        pick = np.linspace(0, term.size - 1, 3000, dtype=int)
+                        term_sample = term[pick]
+                    else:
+                        term_sample = term
+                    mode_results[mode_key] = {
+                        "kpis": k,
+                        "terminal_pnl_sample": term_sample.astype(float).tolist(),
+                        "mode_base": "greeks",
+                        "pricing_model": "bs",
+                        "iv_rule": iv_rule,
+                    }
+
+            approx_error = None
+            if pnl_repricing_bs is not None and pnl_greeks is not None:
+                approx_error = _approx_error_kpis(pnl_greeks[:, -1], pnl_repricing_bs[:, -1])
+                if "greeks" in mode_results:
+                    mode_results["greeks"]["kpis"]["approx_error_vs_repricing"] = approx_error
+
+            fit_block = dict(engine_sim.get("fit") or {})
+            fit_block["surface_iv_rmse"] = surface_fit.get("rmse")
+            fit_block["surface_points"] = surface_fit.get("points")
+            fit_block["iv_rule"] = iv_rule
+            if factor_shocks_eff is not None:
+                fit_block["surface_factor_stability"] = {
+                    "level_std": float(np.std(factor_shocks_eff[:, :, 0])),
+                    "skew_std": float(np.std(factor_shocks_eff[:, :, 1])),
+                    "curvature_std": float(np.std(factor_shocks_eff[:, :, 2])),
+                }
             else:
-                pnl_greeks = _simulate_mode_greeks(legs, spot_paths, spot, base_surface, factor_shocks, cfg)
-                k = _distribution_kpis(pnl_greeks, cfg.daily_loss_limit, cfg.total_loss_limit)
-                term = pnl_greeks[:, -1]
-            if (
-                cfg.debug_logging
-                and mode == "repricing"
-                and (cfg.debug_mode_filter in (None, "repricing"))
-                and eng not in set(cfg.debug_skip_engines or ())
-            ):
-                sorted_term = np.sort(term)
-                n = sorted_term.size
-                lo = sorted_term[: min(5, n)].tolist() if n else []
-                hi = sorted_term[max(0, n - 5):].tolist() if n else []
-                neg_count = int(np.sum(term < 0))
-                logger.info(
-                    (
-                        "[ADV_SIM][TERM_DEBUG] engine=%s mode=%s n=%d neg_count=%d neg_pct=%.6f "
-                        "min=%.8f p1=%.8f p5=%.8f median=%.8f p95=%.8f p99=%.8f max=%.8f "
-                        "sample_low=%s sample_high=%s"
-                    ),
-                    eng,
-                    mode,
-                    n,
-                    neg_count,
-                    (neg_count / n) if n else 0.0,
-                    float(np.min(term)) if n else float("nan"),
-                    float(np.percentile(term, 1)) if n else float("nan"),
-                    float(np.percentile(term, 5)) if n else float("nan"),
-                    float(np.percentile(term, 50)) if n else float("nan"),
-                    float(np.percentile(term, 95)) if n else float("nan"),
-                    float(np.percentile(term, 99)) if n else float("nan"),
-                    float(np.max(term)) if n else float("nan"),
-                    lo,
-                    hi,
-                )
-            if term.size > 3000:
-                pick = np.linspace(0, term.size - 1, 3000, dtype=int)
-                term_sample = term[pick]
-            else:
-                term_sample = term
-            mode_results[mode] = {"kpis": k, "terminal_pnl_sample": term_sample.astype(float).tolist()}
+                fit_block["surface_factor_stability"] = None
 
-        approx_error = None
-        if pnl_repricing is not None and pnl_greeks is not None:
-            approx_error = _approx_error_kpis(pnl_greeks[:, -1], pnl_repricing[:, -1])
-            mode_results["greeks"]["kpis"]["approx_error_vs_repricing"] = approx_error
-
-        fit_block = dict(engine_sim.get("fit") or {})
-        fit_block["surface_iv_rmse"] = surface_fit.get("rmse")
-        fit_block["surface_points"] = surface_fit.get("points")
-        if factor_shocks is not None:
-            fit_block["surface_factor_stability"] = {
-                "level_std": float(np.std(factor_shocks[:, :, 0])),
-                "skew_std": float(np.std(factor_shocks[:, :, 1])),
-                "curvature_std": float(np.std(factor_shocks[:, :, 2])),
-            }
-        else:
-            fit_block["surface_factor_stability"] = None
-
-        engines_out[eng] = {
-            "fit_kpis": fit_block,
-            "modes": mode_results,
-        }
-
-        # For overlay plots: prefer repricing terminal distribution, fallback to greeks.
-        if pnl_repricing is not None:
-            term = pnl_repricing[:, -1]
-            k_sel = mode_results["repricing"]["kpis"]
-        elif pnl_greeks is not None:
-            term = pnl_greeks[:, -1]
-            k_sel = mode_results["greeks"]["kpis"]
-        else:
-            term = np.array([], dtype=float)
-            k_sel = {}
-        if term.size:
-            engine_plot_data[eng] = {
-                "terminal": term.astype(float),
-                "var95": float(k_sel.get("var95")),
-                "var99": float(k_sel.get("var99")),
-                "es99": float(k_sel.get("es99")),
-                "p10": float((k_sel.get("quantiles") or {}).get("p10", np.percentile(term, 10))),
-            }
-        if "repricing" in mode_results:
-            kr = mode_results["repricing"]["kpis"]
-            repricing_sanity[eng] = {
-                "p5": float((kr.get("quantiles") or {}).get("p5", kr.get("var95", np.nan))),
-                "p1": float((kr.get("quantiles") or {}).get("p1", kr.get("var99", np.nan))),
-                "prob_loss": float(kr.get("prob_loss", np.nan)),
-                "worst_path_pnl": float(kr.get("worst_path_pnl", np.nan)),
-                "mean": float(kr.get("mean", np.nan)),
+            engines_out[scenario_engine] = {
+                "engine_base": eng,
+                "iv_rule": iv_rule,
+                "fit_kpis": fit_block,
+                "modes": mode_results,
             }
 
-        for mode, payload in mode_results.items():
-            k = payload["kpis"]
-            row = {
-                "engine": eng,
-                "mode": mode,
-                "mean": k["mean"],
-                "median": k["median"],
-                "stdev": k["stdev"],
-                "var95": k["var95"],
-                "var99": k["var99"],
-                "es95": k["es95"],
-                "es99": k["es99"],
-                "p50": k["quantiles"]["p50"],
-                "p10": k["quantiles"]["p10"],
-                "p5": k["quantiles"]["p5"],
-                "p1": k["quantiles"]["p1"],
-                "p0_5": k["quantiles"]["p0_5"],
-                "prob_loss": k["prob_loss"],
-                "prob_breach_daily": k["prob_breach_daily"],
-                "prob_breach_total": k["prob_breach_total"],
-                "worst_path_pnl": k["worst_path_pnl"],
-                "maxdd_p50": k["max_drawdown"]["p50"],
-                "maxdd_p5": k["max_drawdown"]["p5"],
-                "maxdd_p1": k["max_drawdown"]["p1"],
-                "breach_t_p50": k["breach_time"]["p50"],
-                "breach_t_p10": k["breach_time"]["p10"],
-                "breach_t_p1": k["breach_time"]["p1"],
-                "vol_mae": fit_block.get("vol_mae"),
-                "vol_rmse": fit_block.get("vol_rmse"),
-                "surface_iv_rmse": fit_block.get("surface_iv_rmse"),
-            }
-            if approx_error and mode == "greeks":
-                row["greeks_err_mae"] = approx_error["mae"]
-                row["greeks_err_rmse"] = approx_error["rmse"]
-                row["greeks_err_p95_abs"] = approx_error["p95_abs_error"]
-            summary_rows.append(row)
+            # Overlay default: repricing BS if present, then repricing BS76, then greeks.
+            overlay_key = "repricing_bs" if "repricing_bs" in mode_results else ("repricing_bs76" if "repricing_bs76" in mode_results else "greeks")
+            overlay_payload = mode_results.get(overlay_key) or {}
+            term = np.asarray(overlay_payload.get("terminal_pnl_sample") or [], dtype=float)
+            k_sel = overlay_payload.get("kpis") or {}
+            if term.size:
+                engine_plot_data[scenario_engine] = {
+                    "terminal": term.astype(float),
+                    "var95": float(k_sel.get("var95")),
+                    "var99": float(k_sel.get("var99")),
+                    "es99": float(k_sel.get("es99")),
+                    "p10": float((k_sel.get("quantiles") or {}).get("p10", np.percentile(term, 10))),
+                }
+            if "repricing_bs" in mode_results:
+                kr = mode_results["repricing_bs"]["kpis"]
+                repricing_sanity[scenario_engine] = {
+                    "p5": float((kr.get("quantiles") or {}).get("p5", kr.get("var95", np.nan))),
+                    "p1": float((kr.get("quantiles") or {}).get("p1", kr.get("var99", np.nan))),
+                    "prob_loss": float(kr.get("prob_loss", np.nan)),
+                    "worst_path_pnl": float(kr.get("worst_path_pnl", np.nan)),
+                    "mean": float(kr.get("mean", np.nan)),
+                }
+
+            for mode_key, payload in mode_results.items():
+                k = payload["kpis"]
+                row = {
+                    "engine": scenario_engine,
+                    "engine_base": eng,
+                    "mode": payload.get("mode_base", mode_key),
+                    "mode_variant": mode_key,
+                    "iv_rule": iv_rule,
+                    "pricing_model": payload.get("pricing_model", "bs"),
+                    "mean": k["mean"],
+                    "median": k["median"],
+                    "stdev": k["stdev"],
+                    "var95": k["var95"],
+                    "var99": k["var99"],
+                    "es95": k["es95"],
+                    "es99": k["es99"],
+                    "p50": k["quantiles"]["p50"],
+                    "p10": k["quantiles"]["p10"],
+                    "p5": k["quantiles"]["p5"],
+                    "p1": k["quantiles"]["p1"],
+                    "p0_5": k["quantiles"]["p0_5"],
+                    "prob_loss": k["prob_loss"],
+                    "prob_breach_daily": k["prob_breach_daily"],
+                    "prob_breach_total": k["prob_breach_total"],
+                    "worst_path_pnl": k["worst_path_pnl"],
+                    "maxdd_p50": k["max_drawdown"]["p50"],
+                    "maxdd_p5": k["max_drawdown"]["p5"],
+                    "maxdd_p1": k["max_drawdown"]["p1"],
+                    "breach_t_p50": k["breach_time"]["p50"],
+                    "breach_t_p10": k["breach_time"]["p10"],
+                    "breach_t_p1": k["breach_time"]["p1"],
+                    "vol_mae": fit_block.get("vol_mae"),
+                    "vol_rmse": fit_block.get("vol_rmse"),
+                    "surface_iv_rmse": fit_block.get("surface_iv_rmse"),
+                }
+                if approx_error and mode_key == "greeks":
+                    row["greeks_err_mae"] = approx_error["mae"]
+                    row["greeks_err_rmse"] = approx_error["rmse"]
+                    row["greeks_err_p95_abs"] = approx_error["p95_abs_error"]
+                summary_rows.append(row)
 
     artifacts = _save_overlay_plots(engine_plot_data)
     overlay_plots = _build_overlay_plot_payload(engine_plot_data)
