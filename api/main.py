@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi.responses import FileResponse
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -69,6 +70,7 @@ POSITIONS_CACHE_FILE = CACHE_DIR / "positions_cache.json"
 EQUITIES_CACHE_FILE = CACHE_DIR / "equities_holdings.json"
 MANUAL_BUCKET_FILE = ROOT / "database" / "manual_bucket_overrides.json"
 RISK_BUCKET_SETTINGS_FILE = ROOT / "database" / "risk_bucket_settings.json"
+FRONTEND_DIST = ROOT / "frontend" / "dist"
 KITE_TOKEN_TTL = timedelta(hours=12)
 DEFAULT_REDIRECT_URL = "http://localhost:8000/auth/callback"
 DEFAULT_FRONTEND_URL = "http://localhost:5173/login?auth=success"
@@ -2553,3 +2555,16 @@ def data_source_refresh(name: str, request: Request):
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     df.to_csv(CACHE_DIR / f"{name}.csv", index=False)
     return {"status": "ok", "rows": len(df)}
+
+
+if FRONTEND_DIST.exists():
+    @app.get("/")
+    def frontend_index():
+        return FileResponse(FRONTEND_DIST / "index.html")
+
+    @app.get("/{full_path:path}")
+    def frontend_spa(full_path: str):
+        candidate = FRONTEND_DIST / full_path
+        if candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(FRONTEND_DIST / "index.html")

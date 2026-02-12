@@ -23,6 +23,7 @@ type PreTrade = {
   bucket_rows: Record<string, unknown>[];
   threshold_rows: Record<string, unknown>[];
   repriced_rows: Record<string, unknown>[];
+  scenario_table: Record<string, unknown>[];
 };
 
 export default function PreTradeStress() {

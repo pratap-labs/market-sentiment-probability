@@ -6,7 +6,7 @@ import DataTable from "../components/DataTable";
 import MetricGrid from "../components/MetricGrid";
 import MetricCard from "../components/MetricCard";
 import Plot from "../components/Plot";
-import { formatInr } from "../components/format";
+import { formatInr, formatNumber } from "../components/format";
 import { useCachedApi } from "../hooks/useCachedApi";
 
 type Ohlcv = { rows: Record<string, unknown>[]; summary: Record<string, unknown> };
@@ -99,7 +99,7 @@ export default function DerivativesData() {
             <MetricCard label="Latest Close" value={formatInr(ohlcv.data.summary.latest_close)} />
             <MetricCard label="2Y High" value={formatInr(ohlcv.data.summary.high_2y)} />
             <MetricCard label="2Y Low" value={formatInr(ohlcv.data.summary.low_2y)} />
-            <MetricCard label="Avg Volume" value={ohlcv.data.summary.avg_volume} />
+            <MetricCard label="Avg Volume" value={formatNumber(ohlcv.data.summary.avg_volume)} />
           </MetricGrid>
         )}
       </SectionCard>

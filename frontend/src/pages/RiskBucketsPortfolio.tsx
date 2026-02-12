@@ -214,6 +214,7 @@ export default function RiskBucketsPortfolio() {
   };
   const repricingOverlay = buildOverlayDist("repricing", "repricing");
   const greeksOverlay = buildOverlayDist("greeks", "greeks");
+  const sharedXRange = [-3, 3];
   const breachMed = probBreachMed;
   const baseRiskHigh = Number.isFinite(var99Median) && var99Median <= -300000;
   const baseRiskMed = Number.isFinite(var99Median) && var99Median > -300000 && var99Median <= -150000;
@@ -306,9 +307,15 @@ export default function RiskBucketsPortfolio() {
               paper_bgcolor: "rgba(0,0,0,0)",
               plot_bgcolor: "rgba(0,0,0,0)",
               margin: { l: 56, r: 20, t: 20, b: 48 },
-              xaxis: { title: "Terminal P&L (₹ Lacs)", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
+              xaxis: {
+                title: "Terminal P&L (₹ Lacs)",
+                automargin: true,
+                tickfont: { color: axisColor, size: 10 },
+                titlefont: { color: axisColor, size: 11 },
+                range: sharedXRange
+              },
               yaxis: { title: "CDF", automargin: true, range: [0, 1], tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
-              legend: { font: { color: axisColor, size: 10 } }
+              showlegend: false
             }}
             config={{ displayModeBar: false, responsive: true }}
             style={{ width: "100%", height: "100%" }}
@@ -331,10 +338,10 @@ export default function RiskBucketsPortfolio() {
                 automargin: true,
                 tickfont: { color: axisColor, size: 10 },
                 titlefont: { color: axisColor, size: 11 },
-                range: [repricingOverlay.minV, repricingOverlay.maxV]
+                range: sharedXRange || [repricingOverlay.minV, repricingOverlay.maxV]
               },
               yaxis: { title: "Count", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
-              legend: { font: { color: axisColor, size: 10 } }
+              showlegend: false
             }}
             config={{ displayModeBar: false, responsive: true }}
             style={{ width: "100%", height: "100%" }}
@@ -357,10 +364,10 @@ export default function RiskBucketsPortfolio() {
                 automargin: true,
                 tickfont: { color: axisColor, size: 10 },
                 titlefont: { color: axisColor, size: 11 },
-                range: [greeksOverlay.minV, greeksOverlay.maxV]
+                range: sharedXRange || [greeksOverlay.minV, greeksOverlay.maxV]
               },
               yaxis: { title: "Count", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
-              legend: { font: { color: axisColor, size: 10 } }
+              showlegend: false
             }}
             config={{ displayModeBar: false, responsive: true }}
             style={{ width: "100%", height: "100%" }}
@@ -383,7 +390,16 @@ export default function RiskBucketsPortfolio() {
                 { key: "mode", label: "P&L Mode" },
                 { key: "mode_variant", label: "Mode Variant" },
                 { key: "iv_rule", label: "IV Rule" },
-                { key: "pricing_model", label: "Pricing" },
+                {
+                  key: "pricing_model",
+                  label: "Pricing",
+                  render: (row) => {
+                    const mode = String(row.mode || "");
+                    if (mode === "greeks") return "-";
+                    const raw = row.pricing_model;
+                    return String(raw ?? "—");
+                  }
+                },
                 { key: "mean", label: "Mean (₹ Lacs)", format: formatInrLac },
                 { key: "median", label: "Median (₹ Lacs)", format: formatInrLac },
                 { key: "var95", label: "VaR95 (P5, ₹ Lacs)", format: formatInrLac },

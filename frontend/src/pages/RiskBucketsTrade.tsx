@@ -129,6 +129,8 @@ export default function RiskBucketsTrade() {
     const bePoints = breakevens.map((b) => ({ x: b, y: 0 }));
     return { x, y, yPos, yNeg, expiryX, expiryY, beLow, beHigh, greenFill, redFill, bePoints, hasPositiveExpiry: expiryY.some((v) => v > 0) };
   }, [detail]);
+  const beLow = payoff.beLow ?? NaN;
+  const beHigh = payoff.beHigh ?? NaN;
 
   const convexity = useMemo(() => {
     const x = payoff.x;
@@ -345,19 +347,19 @@ export default function RiskBucketsTrade() {
                       y1: 0,
                       line: { color: "rgba(148,163,184,0.6)", width: 1 }
                     },
-                    ...(Number.isFinite(payoff.beLow) && Number.isFinite(payoff.beHigh) && payoff.beLow <= payoff.beHigh ? [
+                    ...(Number.isFinite(beLow) && Number.isFinite(beHigh) && beLow <= beHigh ? [
                       {
                         type: "line",
-                        x0: payoff.beLow,
-                        x1: payoff.beLow,
+                        x0: beLow,
+                        x1: beLow,
                         y0: Math.min(...(payoff.expiryY as number[]), -1),
                         y1: Math.max(...(payoff.expiryY as number[]), 1),
                         line: { color: "rgba(125, 140, 160, 0.5)", width: 1, dash: "dot" }
                       },
                       {
                         type: "line",
-                        x0: payoff.beHigh,
-                        x1: payoff.beHigh,
+                        x0: beHigh,
+                        x1: beHigh,
                         y0: Math.min(...(payoff.expiryY as number[]), -1),
                         y1: Math.max(...(payoff.expiryY as number[]), 1),
                         line: { color: "rgba(125, 140, 160, 0.5)", width: 1, dash: "dot" }
@@ -424,19 +426,19 @@ export default function RiskBucketsTrade() {
                       y1: 0,
                       line: { color: "rgba(148,163,184,0.6)", width: 1 }
                     },
-                    ...(Number.isFinite(payoff.beLow) && Number.isFinite(payoff.beHigh) && payoff.beLow <= payoff.beHigh ? [
+                    ...(Number.isFinite(beLow) && Number.isFinite(beHigh) && beLow <= beHigh ? [
                       {
                         type: "line",
-                        x0: payoff.beLow,
-                        x1: payoff.beLow,
+                        x0: beLow,
+                        x1: beLow,
                         y0: Math.min(...(payoff.expiryY as number[]), -1),
                         y1: Math.max(...(payoff.expiryY as number[]), 1),
                         line: { color: "rgba(125, 140, 160, 0.5)", width: 1, dash: "dot" }
                       },
                       {
                         type: "line",
-                        x0: payoff.beHigh,
-                        x1: payoff.beHigh,
+                        x0: beHigh,
+                        x1: beHigh,
                         y0: Math.min(...(payoff.expiryY as number[]), -1),
                         y1: Math.max(...(payoff.expiryY as number[]), 1),
                         line: { color: "rgba(125, 140, 160, 0.5)", width: 1, dash: "dot" }
