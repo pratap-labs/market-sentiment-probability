@@ -10,6 +10,8 @@ import { useCachedApi } from "../hooks/useCachedApi";
 import { formatInr, formatPct, formatNumber } from "../components/format";
 import { useControls } from "../state/ControlsContext";
 import { usePortfolio } from "../state/PortfolioContext";
+import { apiFetch } from "../api/client";
+import RiskBucketsPortfolio, { type PortfolioRB } from "./RiskBucketsPortfolio";
 
 type PreTrade = {
   spot: number;
@@ -26,11 +28,58 @@ type PreTrade = {
   scenario_table: Record<string, unknown>[];
 };
 
+type OptionsChainRow = {
+  strike: number;
+  call_ltp: number | null;
+  call_oi: number | null;
+  call_symbol: string;
+  call_token?: number | null;
+  put_ltp: number | null;
+  put_oi: number | null;
+  put_symbol: string;
+  put_token?: number | null;
+};
+
+type OptionsChain = {
+  expiry: string | null;
+  expiry_list: string[];
+  spot: number | null;
+  date: string | null;
+  rows: OptionsChainRow[];
+};
+
+type VirtualLeg = {
+  id: string;
+  tradingsymbol: string;
+  expiry: string;
+  strike: number | string;
+  type: string;
+  qty: number;
+  price: number;
+  source: "position" | "chain";
+  instrument_token?: number | null;
+  enabled: boolean;
+};
+
+type VirtualGreeksResponse = {
+  greeks: Record<string, number>;
+  current_spot: number;
+};
+
 export default function PreTradeStress() {
   const { summary, positions } = usePortfolio();
   const { setControls } = useControls();
   const [draft, setDraft] = useState<Record<string, number>>({});
   const [applied, setApplied] = useState<Record<string, number>>({});
+  const [simData, setSimData] = useState<PortfolioRB | null>(null);
+  const [simLoading, setSimLoading] = useState(false);
+  const [simError, setSimError] = useState<string | null>(null);
+  const [virtualLegs, setVirtualLegs] = useState<VirtualLeg[]>([]);
+  const [virtualInit, setVirtualInit] = useState(false);
+  const [selectedExpiry, setSelectedExpiry] = useState<string>("");
+  const [virtualGreeks, setVirtualGreeks] = useState<Record<string, number> | null>(null);
+  const [virtualGreeksLoading, setVirtualGreeksLoading] = useState(false);
+  const chainDefaultQty = 65;
 
   const defaults = useMemo(() => {
     const s = summary as any;
@@ -59,6 +108,223 @@ export default function PreTradeStress() {
     const v = Number(value);
     if (!Number.isFinite(v)) return value;
     return v > 1000 ? v / 100000 : v;
+  };
+
+  const positionId = (p: Record<string, unknown>) => {
+    const token = p.instrument_token ?? p.token;
+    if (token != null) return String(token);
+    const sym = p.tradingsymbol ?? p.trading_symbol ?? p.symbol ?? "";
+    const expiry = p.expiry ?? p.expiry_date ?? "";
+    const strike = p.strike ?? p.strike_price ?? "";
+    const opt = p.option_type ?? p.instrument_type ?? "";
+    return `${sym}|${expiry}|${strike}|${opt}`;
+  };
+
+  useEffect(() => {
+    if (virtualInit) return;
+    const rows = positions?.positions || [];
+    if (!rows.length) return;
+    const initial = rows
+      .filter((p) => Number(p.quantity ?? p.qty ?? 0) !== 0)
+      .map((p) => {
+        const qty = Number(p.quantity ?? p.qty ?? 0);
+        const price = Number(
+          p.last_price ??
+          p.price ??
+          p.average_price ??
+          p.avg_price ??
+          p.buy_price ??
+          p.sell_price ??
+          0
+        );
+        return {
+          id: positionId(p),
+          tradingsymbol: String(p.tradingsymbol ?? p.trading_symbol ?? p.symbol ?? "—"),
+          expiry: p.expiry ? String(p.expiry).slice(0, 10) : "—",
+          strike: p.strike ?? p.strike_price ?? "—",
+          type: String(p.option_type ?? p.instrument_type ?? "—"),
+          qty,
+          price,
+          source: "position" as const,
+          instrument_token: (p.instrument_token ?? p.token) as number | null,
+          enabled: true
+        };
+      });
+    setVirtualLegs(initial);
+    setVirtualInit(true);
+  }, [positions, virtualInit]);
+
+  const optionsChain = useCachedApi<OptionsChain>(
+    `options_chain_v2_${selectedExpiry || "default"}`,
+    `/derivatives/options-chain${selectedExpiry ? `?expiry=${encodeURIComponent(selectedExpiry)}&v=2` : "?v=2"}`,
+    60_000
+  );
+
+  const maxCallOi = useMemo(() => {
+    const rows = optionsChain.data?.rows || [];
+    return rows.reduce((acc, r) => Math.max(acc, Number(r.call_oi || 0)), 0) || 1;
+  }, [optionsChain.data]);
+
+  const maxPutOi = useMemo(() => {
+    const rows = optionsChain.data?.rows || [];
+    return rows.reduce((acc, r) => Math.max(acc, Number(r.put_oi || 0)), 0) || 1;
+  }, [optionsChain.data]);
+
+  useEffect(() => {
+    if (!selectedExpiry && optionsChain.data?.expiry) {
+      setSelectedExpiry(optionsChain.data.expiry);
+    }
+  }, [optionsChain.data, selectedExpiry]);
+
+  const addVirtualLeg = (row: OptionsChainRow, side: "CE" | "PE", action: "BUY" | "SELL") => {
+    const isCall = side === "CE";
+    const tradingsymbol = isCall ? row.call_symbol : row.put_symbol;
+    if (!tradingsymbol) return;
+    const price = Number(isCall ? row.call_ltp : row.put_ltp) || 0;
+    const qty = action === "SELL" ? -Math.abs(chainDefaultQty) : Math.abs(chainDefaultQty);
+    const legId = `${tradingsymbol}:${side}`;
+    setVirtualLegs((prev) => {
+      const existing = prev.find((l) => l.tradingsymbol === tradingsymbol);
+      if (!existing) {
+        return [
+          ...prev,
+          {
+            id: legId,
+            tradingsymbol,
+            expiry: selectedExpiry || "",
+            strike: row.strike,
+            type: side,
+            qty,
+            price,
+            source: "chain",
+            instrument_token: isCall ? row.call_token ?? null : row.put_token ?? null,
+            enabled: true
+          }
+        ];
+      }
+      const nextQty = existing.qty + qty;
+      if (nextQty === 0) {
+        return prev.filter((l) => l.tradingsymbol !== tradingsymbol);
+      }
+      return prev.map((l) =>
+        l.tradingsymbol === tradingsymbol ? { ...l, qty: nextQty, price, enabled: true } : l
+      );
+    });
+  };
+
+  const updateVirtualQty = (id: string, qty: number) => {
+    setVirtualLegs((prev) => prev.map((l) => (l.id === id ? { ...l, qty } : l)));
+  };
+
+  const toggleVirtualLeg = (id: string, enabled: boolean) => {
+    setVirtualLegs((prev) => prev.map((l) => (l.id === id ? { ...l, enabled } : l)));
+  };
+
+  const selectedMap = useMemo(() => {
+    const map = new Map<string, VirtualLeg>();
+    virtualLegs.filter((l) => l.enabled).forEach((l) => {
+      map.set(`${l.tradingsymbol}:${l.type}`, l);
+    });
+    return map;
+  }, [virtualLegs]);
+
+  const resetVirtual = () => {
+    setVirtualInit(false);
+  };
+
+  const virtualPayload = useMemo(
+    () => ({
+      virtual_positions: virtualLegs.filter((l) => l.enabled).map((l) => ({
+        tradingsymbol: l.tradingsymbol,
+        quantity: l.qty,
+        last_price: l.price,
+        instrument_token: l.instrument_token ?? undefined
+      }))
+    }),
+    [virtualLegs]
+  );
+
+  const sortedVirtualLegs = useMemo(() => {
+    return [...virtualLegs].sort((a, b) => {
+      const expCmp = String(a.expiry || "").localeCompare(String(b.expiry || ""));
+      if (expCmp !== 0) return expCmp;
+      const strikeA = Number(a.strike || 0);
+      const strikeB = Number(b.strike || 0);
+      if (strikeA !== strikeB) return strikeA - strikeB;
+      const typeCmp = String(a.type || "").localeCompare(String(b.type || ""));
+      if (typeCmp !== 0) return typeCmp;
+      return String(a.tradingsymbol || "").localeCompare(String(b.tradingsymbol || ""));
+    });
+  }, [virtualLegs]);
+
+  const currentVirtualLegs = useMemo(
+    () => sortedVirtualLegs.filter((l) => l.source === "position"),
+    [sortedVirtualLegs]
+  );
+
+  const newVirtualLegs = useMemo(
+    () => sortedVirtualLegs.filter((l) => l.source === "chain"),
+    [sortedVirtualLegs]
+  );
+
+  const currentVirtualLegs = useMemo(
+    () => sortedVirtualLegs.filter((l) => l.source === "position"),
+    [sortedVirtualLegs]
+  );
+  const newVirtualLegs = useMemo(
+    () => sortedVirtualLegs.filter((l) => l.source === "chain"),
+    [sortedVirtualLegs]
+  );
+
+  useEffect(() => {
+    if (!virtualLegs.some((l) => l.enabled)) {
+      setVirtualGreeks(null);
+      return;
+    }
+    let active = true;
+    setVirtualGreeksLoading(true);
+    const timer = window.setTimeout(() => {
+      apiFetch<VirtualGreeksResponse>("/portfolio/virtual-greeks", {
+        method: "POST",
+        body: virtualPayload
+      })
+        .then((res) => {
+          if (!active) return;
+          setVirtualGreeks(res.greeks || null);
+        })
+        .catch(() => {
+          if (!active) return;
+          setVirtualGreeks(null);
+        })
+        .finally(() => {
+          if (!active) return;
+          setVirtualGreeksLoading(false);
+        });
+    }, 250);
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+    };
+  }, [virtualPayload, virtualLegs.length]);
+
+  const runPortfolioSimulation = async () => {
+    if (!virtualLegs.some((l) => l.enabled)) {
+      setSimError("Add at least one leg to the virtual portfolio.");
+      return;
+    }
+    setSimLoading(true);
+    setSimError(null);
+    try {
+      const response = await apiFetch<PortfolioRB>("/risk-buckets/portfolio/simulate", {
+        method: "POST",
+        body: virtualPayload
+      });
+      setSimData(response);
+    } catch (err) {
+      setSimError(String(err));
+    } finally {
+      setSimLoading(false);
+    }
   };
 
   const query = useMemo(() => {
@@ -241,6 +507,230 @@ export default function PreTradeStress() {
   return (
     <>
       {error ? <ErrorState message={error} /> : null}
+      <SectionCard title="Virtual Portfolio Builder">
+        <div className="pretrade-builder">
+          <div className="pretrade-chain">
+            <div className="chain-toolbar">
+              <div className="chain-spot">
+                NIFTY {optionsChain.data?.spot ? Number(optionsChain.data.spot).toFixed(2) : "—"}
+                {optionsChain.data?.date ? <span className="chain-date">{optionsChain.data.date}</span> : null}
+              </div>
+              <div className="chain-controls">
+                <label className="chain-field">
+                  <span>Expiry</span>
+                  <select value={selectedExpiry} onChange={(e) => setSelectedExpiry(e.target.value)}>
+                    {(optionsChain.data?.expiry_list || []).map((opt) => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            </div>
+            {optionsChain.loading ? (
+              <LoadingState />
+            ) : optionsChain.error ? (
+              <ErrorState message={optionsChain.error} />
+            ) : (
+              <div className="chain-table-wrap">
+                <table className="options-chain">
+                  <thead>
+                    <tr>
+                      <th className="call-col">Call LTP</th>
+                      <th className="call-col">Call OI</th>
+                      <th className="chain-strike-head">Strike</th>
+                      <th className="put-col">Put OI</th>
+                      <th className="put-col">Put LTP</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(optionsChain.data?.rows || []).map((row) => {
+                      const callSelected = selectedMap.get(`${row.call_symbol}:CE`);
+                      const putSelected = selectedMap.get(`${row.put_symbol}:PE`);
+                      return (
+                      <tr key={row.strike}>
+                        <td className={`chain-ltp-cell call-col ${callSelected ? "is-selected" : ""}`}>
+                          <div className="chain-ltp-wrap">
+                            <span className="chain-ltp">{row.call_ltp != null ? row.call_ltp.toFixed(2) : "—"}</span>
+                            <div className="chain-actions fixed">
+                              <button className="chain-action buy" onClick={() => addVirtualLeg(row, "CE", "BUY")}>B</button>
+                              <button className="chain-action sell" onClick={() => addVirtualLeg(row, "CE", "SELL")}>S</button>
+                            </div>
+                          </div>
+                        </td>
+                        <td className="chain-oi call-col">
+                          <div className="chain-oi-wrap">
+                            <span className="chain-oi-value">{row.call_oi != null ? row.call_oi.toFixed(0) : "—"}</span>
+                            <span className="chain-oi-bar call-bar" style={{ width: `${Math.min(100, ((row.call_oi || 0) / maxCallOi) * 100)}%` }} />
+                            {callSelected ? (
+                              <span className={`chain-pill ${callSelected.qty < 0 ? "sell" : "buy"}`}>
+                                {callSelected.qty < 0 ? "S" : "B"} {Math.abs(callSelected.qty)}
+                              </span>
+                            ) : null}
+                          </div>
+                        </td>
+                        <td className="chain-strike">
+                          <div className="chain-strike-text">{row.strike.toFixed(0)}</div>
+                          <div className="chain-strike-symbol">{row.call_symbol || row.put_symbol || "—"}</div>
+                        </td>
+                        <td className="chain-oi put-col">
+                          <div className="chain-oi-wrap">
+                            <span className="chain-oi-value">{row.put_oi != null ? row.put_oi.toFixed(0) : "—"}</span>
+                            <span className="chain-oi-bar put-bar" style={{ width: `${Math.min(100, ((row.put_oi || 0) / maxPutOi) * 100)}%` }} />
+                            {putSelected ? (
+                              <span className={`chain-pill ${putSelected.qty < 0 ? "sell" : "buy"}`}>
+                                {putSelected.qty < 0 ? "S" : "B"} {Math.abs(putSelected.qty)}
+                              </span>
+                            ) : null}
+                          </div>
+                        </td>
+                        <td className={`chain-ltp-cell put-col ${putSelected ? "is-selected" : ""}`}>
+                          <div className="chain-ltp-wrap">
+                            <span className="chain-ltp">{row.put_ltp != null ? row.put_ltp.toFixed(2) : "—"}</span>
+                            <div className="chain-actions fixed">
+                              <button className="chain-action buy" onClick={() => addVirtualLeg(row, "PE", "BUY")}>B</button>
+                              <button className="chain-action sell" onClick={() => addVirtualLeg(row, "PE", "SELL")}>S</button>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+          <div className="pretrade-portfolio">
+            <div className="portfolio-header">
+              <div>Virtual Portfolio ({virtualLegs.filter((l) => l.enabled).length})</div>
+              <button className="control-input" onClick={resetVirtual}>Reset to Current</button>
+            </div>
+            <div className="virtual-greeks">
+              {virtualGreeksLoading ? (
+                <span>Net Greeks: Loading...</span>
+              ) : virtualGreeks ? (
+                <span>
+                  Net Greeks: Δ {formatNumber(virtualGreeks.net_delta, 2)} | Γ {formatNumber(virtualGreeks.net_gamma, 4)} | Θ {formatNumber(virtualGreeks.net_theta, 0)} | Vega {formatNumber(virtualGreeks.net_vega, 0)}
+                </span>
+              ) : (
+                <span>Net Greeks: —</span>
+              )}
+            </div>
+            {virtualLegs.length ? (
+              <>
+                <div className="virtual-section-title">Current Positions</div>
+                <DataTable
+                  columns={[
+                    {
+                      key: "enabled",
+                      label: "",
+                      render: (row) => (
+                        <input
+                          className="table-check"
+                          type="checkbox"
+                          checked={Boolean(row.enabled)}
+                          onChange={(e) => toggleVirtualLeg(String(row.id || ""), e.target.checked)}
+                        />
+                      )
+                    },
+                    { key: "tradingsymbol", label: "Symbol" },
+                    { key: "expiry", label: "Expiry" },
+                    { key: "strike", label: "Strike" },
+                    { key: "type", label: "Type" },
+                    {
+                      key: "qty",
+                      label: "Qty",
+                      render: (row) => (
+                        <input
+                          className="table-input"
+                          type="number"
+                          step="1"
+                          value={Number(row.qty || 0)}
+                          onChange={(e) => updateVirtualQty(String(row.id || ""), Number(e.target.value))}
+                        />
+                      )
+                    },
+                    {
+                      key: "price",
+                      label: "Price",
+                      format: (value) => formatInr(value as number)
+                    }
+                  ]}
+                  rows={currentVirtualLegs as unknown as Record<string, unknown>[]}
+                  maxHeight={220}
+                />
+                <div className="virtual-section-title">New Trades</div>
+                <DataTable
+                  columns={[
+                    {
+                      key: "enabled",
+                      label: "",
+                      render: (row) => (
+                        <input
+                          className="table-check"
+                          type="checkbox"
+                          checked={Boolean(row.enabled)}
+                          onChange={(e) => toggleVirtualLeg(String(row.id || ""), e.target.checked)}
+                        />
+                      )
+                    },
+                    { key: "tradingsymbol", label: "Symbol" },
+                    { key: "expiry", label: "Expiry" },
+                    { key: "strike", label: "Strike" },
+                    { key: "type", label: "Type" },
+                    {
+                      key: "qty",
+                      label: "Qty",
+                      render: (row) => (
+                        <input
+                          className="table-input"
+                          type="number"
+                          step="1"
+                          value={Number(row.qty || 0)}
+                          onChange={(e) => updateVirtualQty(String(row.id || ""), Number(e.target.value))}
+                        />
+                      )
+                    },
+                    {
+                      key: "price",
+                      label: "Price",
+                      format: (value) => formatInr(value as number)
+                    }
+                  ]}
+                  rows={newVirtualLegs as unknown as Record<string, unknown>[]}
+                  maxHeight={220}
+                />
+              </>
+            ) : (
+              <div>No legs selected.</div>
+            )}
+            <div className="controls-row" style={{ marginTop: 12, display: "flex", gap: 12, alignItems: "center" }}>
+              <button
+                className="control-input"
+                style={{ background: "linear-gradient(135deg, var(--gs-accent), var(--gs-accent2))", border: "none", color: "#fff" }}
+                onClick={runPortfolioSimulation}
+              >
+                {simData ? "Simulate Again" : "Run Portfolio Simulation"}
+              </button>
+              {simError ? <span className="negative">{simError}</span> : null}
+            </div>
+          </div>
+        </div>
+      </SectionCard>
+
+      {!simData && !simLoading && !simError ? (
+        <SectionCard title="Risk Buckets Portfolio Simulation">
+          <div>Select positions and run a simulation to view portfolio risk buckets.</div>
+        </SectionCard>
+      ) : (
+        <RiskBucketsPortfolio
+          dataOverride={simData ?? undefined}
+          loadingOverride={simLoading}
+          errorOverride={simError}
+          showControlsBar={false}
+        />
+      )}
+
       <SectionCard title="Stress Testing">
         {loading || !data ? <LoadingState /> : (
           <MetricGrid>

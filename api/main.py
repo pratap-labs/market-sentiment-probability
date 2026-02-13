@@ -110,6 +110,15 @@ class RiskBucketSettingsPayload(BaseModel):
     settings: Dict[str, Any]
 
 
+class PortfolioSimPayload(BaseModel):
+    position_ids: List[str] = []
+    virtual_positions: Optional[List[Dict[str, Any]]] = None
+
+
+class VirtualPositionsPayload(BaseModel):
+    virtual_positions: List[Dict[str, Any]]
+
+
 def _log_advanced_simulation_snapshot(
     advanced_sim: Optional[Dict[str, Any]],
     current_spot: float,
@@ -342,6 +351,17 @@ def _fetch_positions_with_cache(kite: KiteConnect) -> List[Dict[str, Any]]:
         _save_positions_cache(positions)
         return positions
     return _load_positions_cache()
+
+
+def _position_id(p: Dict[str, Any]) -> str:
+    token = p.get("instrument_token") or p.get("token")
+    if token is not None:
+        return str(token)
+    sym = p.get("tradingsymbol") or p.get("trading_symbol") or p.get("symbol") or ""
+    expiry = p.get("expiry") or p.get("expiry_date") or ""
+    strike = p.get("strike") or p.get("strike_price") or ""
+    opt = p.get("option_type") or p.get("instrument_type") or ""
+    return f"{sym}|{expiry}|{strike}|{opt}"
 
 
 def _load_equities_cache() -> List[Dict[str, Any]]:
@@ -784,6 +804,112 @@ def options_data(limit: int = 1000):
     }
 
 
+@app.get("/derivatives/options-chain")
+def options_chain(expiry: Optional[str] = None):
+    options_df = _load_cache("nifty_options_ce")
+    pe_df = _load_cache("nifty_options_pe")
+    if not pe_df.empty:
+        options_df = pd.concat([options_df, pe_df], ignore_index=True)
+    options_df = _filter_latest_snapshot(options_df, "date")
+    if options_df.empty:
+        raise HTTPException(status_code=404, detail="Options cache missing")
+
+    expiry_col = "expiry" if "expiry" in options_df.columns else "expiry_date"
+    if expiry_col not in options_df.columns:
+        raise HTTPException(status_code=404, detail="Expiry column missing")
+    options_df[expiry_col] = pd.to_datetime(options_df[expiry_col], errors="coerce")
+    options_df = options_df.dropna(subset=[expiry_col])
+    options_df["expiry_str"] = options_df[expiry_col].dt.date.astype(str)
+    expiry_list = sorted([e for e in options_df["expiry_str"].unique().tolist() if e])
+    selected_expiry = expiry if expiry in expiry_list else (expiry_list[0] if expiry_list else None)
+    if selected_expiry:
+        options_df = options_df[options_df["expiry_str"] == selected_expiry]
+
+    oi_col = "open_int" if "open_int" in options_df.columns else "open_interest"
+    ltp_col = "ltp" if "ltp" in options_df.columns else ("last_price" if "last_price" in options_df.columns else "close")
+    expiry_dt = None
+    if selected_expiry:
+        try:
+            expiry_dt = pd.to_datetime(selected_expiry).to_pydatetime()
+        except Exception:
+            expiry_dt = None
+
+    def _month_code(dt: datetime) -> str:
+        if dt.month <= 9:
+            return str(dt.month)
+        return {10: "O", 11: "N", 12: "D"}.get(dt.month, str(dt.month))
+
+    def _is_monthly_expiry(expiry_date: datetime) -> bool:
+        last_day = datetime(expiry_date.year, expiry_date.month, calendar.monthrange(expiry_date.year, expiry_date.month)[1])
+        while last_day.weekday() != 1:
+            last_day -= timedelta(days=1)
+        if last_day.month == 3 and last_day.day == 31:
+            last_day -= timedelta(days=1)
+        return expiry_date.date() == last_day.date()
+
+    def _build_symbol(expiry_date: datetime, strike: float, opt_type: str) -> str:
+        yy = str(expiry_date.year)[-2:]
+        strike_str = f"{int(round(strike))}"
+        if _is_monthly_expiry(expiry_date):
+            mon = expiry_date.strftime("%b").upper()
+            return f"NIFTY{yy}{mon}{strike_str}{opt_type}"
+        mm = _month_code(expiry_date)
+        dd = f"{expiry_date.day:02d}"
+        return f"NIFTY{yy}{mm}{dd}{strike_str}{opt_type}"
+
+    rows = []
+    if not options_df.empty:
+        strikes = sorted(options_df["strike_price"].dropna().unique().tolist())
+        for strike in strikes:
+            strike_df = options_df[options_df["strike_price"] == strike]
+            ce_row = strike_df[strike_df["option_type"] == "CE"].head(1)
+            pe_row = strike_df[strike_df["option_type"] == "PE"].head(1)
+            ce = ce_row.iloc[0] if not ce_row.empty else None
+            pe = pe_row.iloc[0] if not pe_row.empty else None
+            row_expiry = expiry_dt
+            try:
+                if ce is not None and expiry_col in ce:
+                    row_expiry = pd.to_datetime(ce[expiry_col]).to_pydatetime()
+                elif pe is not None and expiry_col in pe:
+                    row_expiry = pd.to_datetime(pe[expiry_col]).to_pydatetime()
+            except Exception:
+                pass
+            if row_expiry is None:
+                continue
+            rows.append(
+                {
+                    "strike": float(strike),
+                    "call_ltp": float(ce[ltp_col]) if ce is not None and ltp_col in ce else None,
+                    "call_oi": float(ce[oi_col]) if ce is not None and oi_col in ce else None,
+                    "call_symbol": _build_symbol(row_expiry, float(strike), "CE"),
+                    "call_token": None,
+                    "put_ltp": float(pe[ltp_col]) if pe is not None and ltp_col in pe else None,
+                    "put_oi": float(pe[oi_col]) if pe is not None and oi_col in pe else None,
+                    "put_symbol": _build_symbol(row_expiry, float(strike), "PE"),
+                    "put_token": None,
+                }
+            )
+
+    spot = None
+    try:
+        spot = float(options_df["underlying_value"].iloc[0])
+    except Exception:
+        spot = None
+    date_str = None
+    try:
+        date_str = pd.to_datetime(options_df["date"].iloc[0]).date().isoformat()
+    except Exception:
+        date_str = None
+
+    return {
+        "expiry": selected_expiry,
+        "expiry_list": expiry_list,
+        "spot": spot,
+        "date": date_str,
+        "rows": rows,
+    }
+
+
 @app.get("/market-regime")
 def market_regime(expiry: Optional[str] = None):
     options_df = _load_cache("nifty_options_ce")
@@ -1055,6 +1181,27 @@ def portfolio_summary(request: Request, spot: Optional[float] = None):
         },
         "recommendations": recommendations,
     }
+
+
+@app.post("/portfolio/virtual-greeks")
+def portfolio_virtual_greeks(payload: VirtualPositionsPayload, request: Request):
+    creds = _get_credentials(request)
+    kite = _get_kite_client(creds.api_key, creds.access_token)
+    options_df = _load_cache("nifty_options_ce")
+    pe_df = _load_cache("nifty_options_pe")
+    if not pe_df.empty:
+        options_df = pd.concat([options_df, pe_df], ignore_index=True)
+    if options_df.empty:
+        raise HTTPException(status_code=404, detail="Options cache missing")
+
+    nifty_df = _load_cache("nifty_ohlcv")
+    regime = calculate_market_regime(options_df, nifty_df)
+    current_spot = float(regime.get("current_spot", 25000)) if regime else 25000
+
+    positions = payload.virtual_positions or []
+    enriched = [enrich_position_with_greeks(p, options_df, current_spot) for p in positions]
+    greeks = calculate_portfolio_greeks(enriched)
+    return {"greeks": greeks, "current_spot": current_spot}
 
 
 @app.get("/equities/holdings")
@@ -1364,6 +1511,194 @@ def risk_buckets_portfolio(request: Request):
     )
 
     # Backward-compat summary payloads are now sourced from advanced simulation defaults.
+    engines_block = (advanced_sim or {}).get("engines", {}) if isinstance(advanced_sim, dict) else {}
+    engine_candidates = list(engines_block.keys()) if isinstance(engines_block, dict) else []
+    engine_name = next((k for k in engine_candidates if str(k).startswith("gbm|flat")), None)
+    if not engine_name:
+        engine_name = next((k for k in engine_candidates if str(k).startswith("gbm|surface")), None)
+    if not engine_name:
+        engine_name = next((k for k in engine_candidates if str(k).startswith("gbm|")), None)
+    if not engine_name:
+        engine_name = next(iter(engines_block), None)
+    mode_candidates = (engines_block.get(engine_name, {}).get("modes", {}) or {}) if engine_name else {}
+    mode_name = "repricing_bs"
+    if mode_name not in mode_candidates:
+        mode_name = next((m for m in mode_candidates.keys() if str(m).startswith("repricing")), None)
+    if not mode_name:
+        mode_name = next(iter(mode_candidates), "greeks")
+    selected_mode = (
+        (engines_block.get(engine_name, {}).get("modes", {}) or {}).get(mode_name, {})
+        if engine_name
+        else {}
+    )
+    selected_kpis = (selected_mode or {}).get("kpis", {}) if isinstance(selected_mode, dict) else {}
+    selected_fan = (selected_kpis.get("fan", {}) or {}) if isinstance(selected_kpis, dict) else {}
+    terminal_sample = (selected_mode.get("terminal_pnl_sample", []) or []) if isinstance(selected_mode, dict) else []
+
+    fan_rows = []
+    p50 = selected_fan.get("p50", []) if isinstance(selected_fan, dict) else []
+    p10 = selected_fan.get("p10", []) if isinstance(selected_fan, dict) else []
+    p1 = selected_fan.get("p1", []) if isinstance(selected_fan, dict) else []
+    for i in range(min(len(p50), len(p10), len(p1))):
+        fan_rows.append({"Day": i + 1, "P50": float(p50[i]), "P10": float(p10[i]), "P1": float(p1[i])})
+    distribution = None
+    if terminal_sample:
+        final_pnl = np.asarray(terminal_sample, dtype=float)
+        distribution = {
+            "final_pnl": final_pnl.tolist(),
+            "mean": float(np.mean(final_pnl)),
+            "median": float(np.median(final_pnl)),
+            "p5": float(np.percentile(final_pnl, 5)),
+            "p1": float(np.percentile(final_pnl, 1)),
+        }
+    sim_summary = None
+    if selected_kpis:
+        quantiles = selected_kpis.get("quantiles", {}) if isinstance(selected_kpis, dict) else {}
+        sim_summary = {
+            "mean": float(selected_kpis.get("mean", 0.0)),
+            "median": float(selected_kpis.get("median", 0.0)),
+            "p95": float(quantiles.get("p95", np.percentile(np.asarray(terminal_sample, dtype=float), 95) if terminal_sample else 0.0)),
+            "p5": float(quantiles.get("p5", 0.0)),
+            "p1": float(quantiles.get("p1", 0.0)),
+            "prob_loss": float(selected_kpis.get("prob_loss", 0.0)),
+            "prob_breach": float(selected_kpis.get("prob_breach_total", 0.0)),
+        }
+    return {
+        "sim_summary": sim_summary,
+        "sim_fan": fan_rows,
+        "sim_distribution": distribution,
+        "advanced_simulation": advanced_sim,
+        "account_size": total_capital,
+        "margin_used": margin_used,
+        "portfolio_es99_inr": float(agg["portfolio_es99_inr"]),
+        "portfolio_es99_pct": (float(agg["portfolio_es99_inr"]) / total_capital * 100) if total_capital else 0.0,
+        "margin_used_pct": margin_used_pct,
+        "top_underlying": top_underlying.to_dict(orient="records"),
+        "by_bucket": by_bucket.to_dict(orient="records"),
+        "by_week": by_week.to_dict(orient="records"),
+        "zone": {
+            "iv_regime": iv_regime,
+            "theta_norm": theta_norm,
+            "gamma_norm": gamma_norm,
+            "vega_norm": vega_norm,
+            "zone_num": zone_num,
+            "zone_name": zone_name,
+            "zone_message": zone_message,
+            "zone_color": zone_color,
+        },
+    }
+
+
+@app.post("/risk-buckets/portfolio/simulate")
+def risk_buckets_portfolio_simulate(payload: PortfolioSimPayload, request: Request):
+    creds = _get_credentials(request)
+    kite = _get_kite_client(creds.api_key, creds.access_token)
+    options_df = _load_cache("nifty_options_ce")
+    pe_df = _load_cache("nifty_options_pe")
+    if not pe_df.empty:
+        options_df = pd.concat([options_df, pe_df], ignore_index=True)
+    options_df = _filter_latest_snapshot(options_df, "date")
+    nifty_df = _load_cache("nifty_ohlcv")
+    if options_df.empty or nifty_df.empty:
+        raise HTTPException(status_code=404, detail="Options/NIFTY cache missing")
+
+    _prepare_rb_state(options_df, nifty_df)
+
+    positions = _fetch_positions_with_cache(kite)
+    if payload.virtual_positions:
+        positions = payload.virtual_positions
+    else:
+        ids = {str(i) for i in (payload.position_ids or [])}
+        if ids:
+            positions = [p for p in positions if _position_id(p) in ids]
+
+    regime = calculate_market_regime(options_df, nifty_df)
+    current_spot = float(regime.get("current_spot", 25000)) if regime else 25000
+    enriched = [enrich_position_with_greeks(p, options_df, current_spot) for p in positions]
+
+    margins = kite.margins()
+    equity = margins.get("equity", {})
+    margin_available = float(equity.get("available", {}).get("live_balance", 0.0))
+    margin_used = float(equity.get("utilised", {}).get("debits", 0.0))
+    total_capital = float(margin_available + margin_used)
+    if total_capital <= 0:
+        total_capital = 1_750_000.0
+    margin_used_pct = (margin_used / total_capital * 100.0) if total_capital > 0 else None
+
+    trades = build_trades_using_existing_grouping(enriched)
+    saved_groups = _load_saved_groups()
+    if saved_groups:
+        trades = build_trades_using_existing_grouping(enriched)
+        trades += build_trades_from_saved_groups(enriched, saved_groups)
+
+    trades_df, _ = compute_trade_risk(
+        trades,
+        total_capital,
+        lookback_days=504,
+        spot_override=current_spot,
+    )
+    settings = _load_risk_bucket_settings()
+    allocations = {"low": settings["alloc_low"], "med": settings["alloc_med"], "high": settings["alloc_high"]}
+    thresholds = {"low": settings["trade_low_max"], "med": settings["trade_med_max"]}
+    manual_bucket_map = _load_manual_bucket_overrides()
+    trades_df = assign_buckets(trades_df, total_capital, allocations, thresholds, zone_map={}, manual_bucket_map=manual_bucket_map)
+
+    agg = aggregate_portfolio(trades_df)
+
+    advanced_sim = run_advanced_forward_risk(
+        positions=positions,
+        options_df=options_df,
+        spot_history_df=nifty_df,
+        spot=current_spot,
+        config={
+            "horizon_days": int(settings.get("sim_days", 10)),
+            "n_paths": int(settings.get("sim_paths", 2000)),
+            "dt": 1.0 / 252.0,
+            "seed": 42,
+            "risk_free_rate": 0.06,
+            "dividend_yield": 0.01,
+            "daily_loss_limit": None,
+            "total_loss_limit": (float(settings.get("portfolio_es_limit", 4.0)) / 100.0) * float(total_capital) if total_capital else None,
+            "engines": ("fhs", "garch", "egarch", "gjr", "heston", "bates"),
+            "pnl_modes": ("greeks", "repricing"),
+            "iv_rules": ("flat", "surface"),
+            "repricing_models": ("bs76",),
+            "use_evt_overlay": True,
+            "simulate_surface": True,
+            "repricing_anchor": "market_t0",
+        },
+    )
+    _log_advanced_simulation_snapshot(
+        advanced_sim=advanced_sim,
+        current_spot=current_spot,
+        positions_count=len(positions),
+    )
+
+    iv_percentile = 35
+    iv_regime, _ = ra_tab.get_iv_regime(iv_percentile)
+    greeks = calculate_portfolio_greeks(enriched)
+    capital_lakhs = total_capital / 100000.0 if total_capital else 0.0
+    theta_norm = abs(greeks.get("net_theta", 0.0)) / capital_lakhs if capital_lakhs else 0.0
+    gamma_norm = greeks.get("net_gamma", 0.0) / capital_lakhs if capital_lakhs else 0.0
+    vega_norm = greeks.get("net_vega", 0.0) / capital_lakhs if capital_lakhs else 0.0
+    zone_num, zone_name, zone_color, zone_message = ra_tab.classify_zone(
+        theta_norm, gamma_norm, vega_norm, iv_regime
+    )
+
+    top_underlying = (
+        agg["by_underlying"].head(10).reset_index().rename(columns={"index": "underlying", "trade_es99_inr": "es99"})
+        if not agg["by_underlying"].empty
+        else pd.DataFrame(columns=["underlying", "es99"])
+    )
+    by_bucket = agg["by_bucket"].reset_index().rename(columns={"bucket": "bucket", "trade_es99_inr": "es99"})
+    by_week = (
+        trades_df.groupby(["underlying", "week_id", "option_side"])["trade_es99_inr"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(10)
+        .reset_index()
+    )
+
     engines_block = (advanced_sim or {}).get("engines", {}) if isinstance(advanced_sim, dict) else {}
     engine_candidates = list(engines_block.keys()) if isinstance(engines_block, dict) else []
     engine_name = next((k for k in engine_candidates if str(k).startswith("gbm|flat")), None)

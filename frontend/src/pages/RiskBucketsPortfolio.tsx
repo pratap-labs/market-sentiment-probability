@@ -57,7 +57,7 @@ type EnginePayload = {
   spot_paths_worst_mode?: string;
 };
 
-type PortfolioRB = {
+export type PortfolioRB = {
   advanced_simulation?: {
     model_version?: string;
     summary_rows?: Record<string, unknown>[];
@@ -73,6 +73,7 @@ type PortfolioRB = {
   margin_used?: number;
   margin_used_pct?: number | null;
   zone?: {
+    theta_norm?: number;
     gamma_norm?: number;
     vega_norm?: number;
   };
@@ -80,15 +81,25 @@ type PortfolioRB = {
 type Ohlcv = { rows?: Record<string, unknown>[] };
 type SettingsConfig = { portfolio_es_limit: number };
 
-export default function RiskBucketsPortfolio() {
+type RiskBucketsPortfolioProps = {
+  dataOverride?: PortfolioRB | null;
+  loadingOverride?: boolean;
+  errorOverride?: string | null;
+  showControlsBar?: boolean;
+};
+
+export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, errorOverride, showControlsBar = true }: RiskBucketsPortfolioProps = {}) {
   const { notify } = useNotifications();
   const { setControls } = useControls();
   const [refreshTick, setRefreshTick] = useState<number>(0);
-  const { data, error, loading } = useCachedApi<PortfolioRB>(
+  const rb = useCachedApi<PortfolioRB>(
     `risk_buckets_portfolio_v3_${refreshTick}`,
     "/risk-buckets/portfolio?advanced_v=3",
     60_000
   );
+  const data = dataOverride ?? rb.data;
+  const loading = loadingOverride ?? rb.loading;
+  const error = errorOverride ?? rb.error;
   const ohlcv = useCachedApi<Ohlcv>("nifty_ohlcv_30", "/derivatives/nifty-ohlcv?limit=40", 60_000);
   const settingsCfg = useCachedApi<{ settings: SettingsConfig }>("risk_buckets_settings_config_portfolio", "/risk-buckets/settings/config", 60_000);
   const [breachLimitPct, setBreachLimitPct] = useState<number | null>(null);
@@ -100,6 +111,9 @@ export default function RiskBucketsPortfolio() {
   }, [settingsCfg.data, breachLimitPct]);
 
   useEffect(() => {
+    if (!showControlsBar) {
+      return () => {};
+    }
     const content = (
       <div className="control-grid">
         <label className="control-field">
@@ -131,7 +145,7 @@ export default function RiskBucketsPortfolio() {
       content
     });
     return () => setControls(null);
-  }, [setControls, breachLimitPct]);
+  }, [setControls, breachLimitPct, showControlsBar]);
 
   const saveBreachLimit = async () => {
     if (!settingsCfg.data?.settings || breachLimitPct == null) return;
@@ -265,6 +279,7 @@ export default function RiskBucketsPortfolio() {
   const medianMax = medianArr.length ? Math.max(...medianArr) : NaN;
   const accountSize = Number(data?.account_size || 0);
   const marginUsed = Number(data?.margin_used || 0);
+  const thetaNorm = Number(data?.zone?.theta_norm || 0);
   const gammaNorm = Number(data?.zone?.gamma_norm || 0);
   const vegaNorm = Number(data?.zone?.vega_norm || 0);
   const horizonDays = Number(advanced?.config?.horizon_days || 10);
@@ -275,6 +290,9 @@ export default function RiskBucketsPortfolio() {
   const annualMedianPct = accountSize > 0 ? (annualMedianPnl / accountSize) * 100 : NaN;
   const annualTailLoss = es99Median * expectedBreachesPerYear;
   const annualTailLossPct = accountSize > 0 ? (annualTailLoss / accountSize) * 100 : NaN;
+  const annualThetaPerLac = thetaNorm * 252;
+  const annualThetaInr = (annualThetaPerLac / 100000) * (accountSize || 0);
+  const annualThetaPct = accountSize > 0 ? (annualThetaInr / accountSize) * 100 : NaN;
   const marginStressProbs = Object.entries(engines).map(([engine, payload]) => {
     const modes = payload?.modes || {};
     const key = pickPreferredModeKey(modes, "repricing");
@@ -404,13 +422,13 @@ export default function RiskBucketsPortfolio() {
               <div style={{ display: "grid", gap: 6 }}>
                 <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                   <span className="seller-metric-label">
-                    Median P&L
+                    Mean of Med | Med of Med
                     <span className="metric-help seller-metric-help">
                       ?
-                      <span className="metric-popover">Median terminal P&amp;L across engines (P50 for each engine, then median across engines for robustness).</span>
+                      <span className="metric-popover">Mean of per-engine median P&amp;L | Median of per-engine median P&amp;L.</span>
                     </span>
                   </span>
-                  <span className={`seller-metric-value${medianMed < 0 ? " negative" : ""}`}>{formatInrLac(medianMed)}</span>
+                  <span className={`seller-metric-value${avg(medianArr) < 0 ? " negative" : " positive"}`}>{`${formatInrLac(avg(medianArr))} | ${formatInrLac(medianMed)}`}</span>
                 </div>
                 <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                   <span className="seller-metric-label">
@@ -520,7 +538,7 @@ export default function RiskBucketsPortfolio() {
                 </div>
                 <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
                   <span className="seller-metric-label">
-                    Margin Util (P1 | P5 | P50)
+                    Margin (P1 | P5 | P50)
                     <span className="metric-help seller-metric-help">
                       ?
                       <span className="metric-popover">Margin utilization computed at P1 (VaR99), P5, and P50 terminal P&amp;L levels.</span>
@@ -582,6 +600,16 @@ export default function RiskBucketsPortfolio() {
                     </span>
                   </span>
                   <span className={`seller-metric-value${annualMedianPnl < 0 ? " negative" : " positive"}`}>{`${formatInrLac(annualMedianPnl)} | ${formatPct(annualMedianPct)}`}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Annual Theta
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Annualized theta based on ₹1L per day × 252 days, scaled to account size.</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{`${formatInrLac(annualThetaInr)} | ${formatPct(annualThetaPct)}`}</span>
                 </div>
               </div>
             </div>
