@@ -1280,12 +1280,14 @@ def risk_buckets_portfolio(request: Request):
     current_spot = float(regime.get("current_spot", 25000)) if regime else 25000
     enriched = [enrich_position_with_greeks(p, options_df, current_spot) for p in positions]
 
-    total_capital = float(
-        (kite.margins().get("equity", {}).get("available", {}).get("live_balance", 0.0))
-        + (kite.margins().get("equity", {}).get("utilised", {}).get("debits", 0.0))
-    )
+    margins = kite.margins()
+    equity = margins.get("equity", {})
+    margin_available = float(equity.get("available", {}).get("live_balance", 0.0))
+    margin_used = float(equity.get("utilised", {}).get("debits", 0.0))
+    total_capital = float(margin_available + margin_used)
     if total_capital <= 0:
         total_capital = 1_750_000.0
+    margin_used_pct = (margin_used / total_capital * 100.0) if total_capital > 0 else None
 
     trades = build_trades_using_existing_grouping(enriched)
     saved_groups = _load_saved_groups()
@@ -1320,7 +1322,7 @@ def risk_buckets_portfolio(request: Request):
             "risk_free_rate": 0.06,
             "dividend_yield": 0.01,
             "daily_loss_limit": None,
-            "total_loss_limit": (4.0 / 100.0) * float(total_capital) if total_capital else None,
+            "total_loss_limit": (float(settings.get("portfolio_es_limit", 4.0)) / 100.0) * float(total_capital) if total_capital else None,
             "engines": ("fhs", "garch", "egarch", "gjr", "heston", "bates"),
             "pnl_modes": ("greeks", "repricing"),
             "iv_rules": ("flat", "surface"),
@@ -1419,9 +1421,11 @@ def risk_buckets_portfolio(request: Request):
         "sim_fan": fan_rows,
         "sim_distribution": distribution,
         "advanced_simulation": advanced_sim,
+        "account_size": total_capital,
+        "margin_used": margin_used,
         "portfolio_es99_inr": float(agg["portfolio_es99_inr"]),
         "portfolio_es99_pct": (float(agg["portfolio_es99_inr"]) / total_capital * 100) if total_capital else 0.0,
-        "margin_used_pct": None,
+        "margin_used_pct": margin_used_pct,
         "top_underlying": top_underlying.to_dict(orient="records"),
         "by_bucket": by_bucket.to_dict(orient="records"),
         "by_week": by_week.to_dict(orient="records"),

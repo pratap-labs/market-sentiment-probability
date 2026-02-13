@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import SectionCard from "../components/SectionCard";
 import LoadingState from "../components/LoadingState";
 import ErrorState from "../components/ErrorState";
@@ -6,8 +6,11 @@ import MetricGrid from "../components/MetricGrid";
 import MetricCard from "../components/MetricCard";
 import DataTable from "../components/DataTable";
 import Plot from "../components/Plot";
+import { apiFetch } from "../api/client";
 import { useCachedApi } from "../hooks/useCachedApi";
 import { formatPct, formatNumber } from "../components/format";
+import { useNotifications } from "../state/NotificationContext";
+import { useControls } from "../state/ControlsContext";
 
 function formatInrLac(value: unknown): string {
   const num = Number(value);
@@ -28,30 +31,121 @@ function pct(arr: number[], p: number): number {
   return s[idx];
 }
 
+function avg(arr: number[]): number {
+  if (!arr.length) return NaN;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
 type OverlayCdfRow = { engine?: string; x?: number[]; cdf?: number[]; var99?: number };
 type OverlayTailRow = { engine?: string; x?: number[]; cdf?: number[]; ccdf?: number[]; es99?: number };
+type SpotPathsSample = {
+  days?: number[];
+  paths?: number[][];
+  path_idx?: number[];
+  terminal_pnl?: number[];
+  max_drawdown?: number[];
+  drawdown_series?: number[][];
+};
 type ModePayload = { kpis?: Record<string, unknown>; terminal_pnl_sample?: number[] };
-type EnginePayload = { fit_kpis?: Record<string, unknown>; modes?: Record<string, ModePayload> };
+type EnginePayload = {
+  fit_kpis?: Record<string, unknown>;
+  modes?: Record<string, ModePayload>;
+  spot_paths_sample?: SpotPathsSample;
+  spot_paths_worst?: SpotPathsSample | null;
+  spot_paths_worst_all?: SpotPathsSample | null;
+  spot_paths_worst_dd?: SpotPathsSample | null;
+  spot_paths_worst_mode?: string;
+};
 
 type PortfolioRB = {
   advanced_simulation?: {
     model_version?: string;
     summary_rows?: Record<string, unknown>[];
     engines?: Record<string, EnginePayload>;
+    config?: { horizon_days?: number };
     overlay_plots?: {
       cdf?: OverlayCdfRow[];
       tail?: OverlayTailRow[];
       tail_xlim?: number[] | null;
     };
   } | null;
+  account_size?: number;
+  margin_used?: number;
+  margin_used_pct?: number | null;
+  zone?: {
+    gamma_norm?: number;
+    vega_norm?: number;
+  };
 };
+type Ohlcv = { rows?: Record<string, unknown>[] };
+type SettingsConfig = { portfolio_es_limit: number };
 
 export default function RiskBucketsPortfolio() {
+  const { notify } = useNotifications();
+  const { setControls } = useControls();
+  const [refreshTick, setRefreshTick] = useState<number>(0);
   const { data, error, loading } = useCachedApi<PortfolioRB>(
-    "risk_buckets_portfolio_v3",
+    `risk_buckets_portfolio_v3_${refreshTick}`,
     "/risk-buckets/portfolio?advanced_v=3",
-    5_000
+    60_000
   );
+  const ohlcv = useCachedApi<Ohlcv>("nifty_ohlcv_30", "/derivatives/nifty-ohlcv?limit=40", 60_000);
+  const settingsCfg = useCachedApi<{ settings: SettingsConfig }>("risk_buckets_settings_config_portfolio", "/risk-buckets/settings/config", 60_000);
+  const [breachLimitPct, setBreachLimitPct] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (settingsCfg.data?.settings && breachLimitPct == null) {
+      setBreachLimitPct(Number(settingsCfg.data.settings.portfolio_es_limit));
+    }
+  }, [settingsCfg.data, breachLimitPct]);
+
+  useEffect(() => {
+    const content = (
+      <div className="control-grid">
+        <label className="control-field">
+          <span className="control-label">Breach Limit % (Total Loss)</span>
+          <input
+            className="control-input"
+            type="number"
+            value={breachLimitPct ?? ""}
+            onChange={(e) => setBreachLimitPct(Number(e.target.value))}
+          />
+        </label>
+        <button
+          className="control-input"
+          style={{ background: "linear-gradient(135deg, var(--gs-accent), var(--gs-accent2))", border: "none", color: "#fff" }}
+          onClick={saveBreachLimit}
+        >
+          Apply
+        </button>
+      </div>
+    );
+    setControls({
+      key: `risk-buckets-portfolio:${breachLimitPct ?? "na"}`,
+      title: "Controls",
+      summary: (
+        <span>
+          <span className="controls-summary-key">Breach</span> {breachLimitPct ?? "—"}%
+        </span>
+      ),
+      content
+    });
+    return () => setControls(null);
+  }, [setControls, breachLimitPct]);
+
+  const saveBreachLimit = async () => {
+    if (!settingsCfg.data?.settings || breachLimitPct == null) return;
+    try {
+      await apiFetch("/risk-buckets/settings/config", {
+        method: "POST",
+        body: { settings: { ...settingsCfg.data.settings, portfolio_es_limit: Number(breachLimitPct) } }
+      });
+      notify({ type: "success", message: "Breach limit updated." });
+      setRefreshTick((v) => v + 1);
+    } catch (err) {
+      notify({ type: "error", message: String(err) });
+    }
+  };
 
   const axisColor = "#b9c4d6";
   const advanced = data?.advanced_simulation || null;
@@ -103,6 +197,19 @@ export default function RiskBucketsPortfolio() {
   const modeOptions = Object.keys(engines[effectiveEngine]?.modes || {});
   const [selectedMode, setSelectedMode] = useState<string>("");
   const effectiveMode = modeOptions.includes(selectedMode) ? selectedMode : (modeOptions[0] || "");
+  const [selectedPathEngine, setSelectedPathEngine] = useState<string>("");
+  const [ddView, setDdView] = useState<"terminal" | "drawdown" | "both">("both");
+  const effectivePathEngine = engineOptions.includes(selectedPathEngine) ? selectedPathEngine : (engineOptions[0] || "");
+  const spotSample = (engines[effectivePathEngine]?.spot_paths_worst || engines[effectivePathEngine]?.spot_paths_sample || {}) as SpotPathsSample;
+  const spotWorstAll = (engines[effectivePathEngine]?.spot_paths_worst_all || {}) as SpotPathsSample;
+  const spotWorstDD = (engines[effectivePathEngine]?.spot_paths_worst_dd || {}) as SpotPathsSample;
+  const pathDays = (spotSample.days || []) as number[];
+  const pathSeries = (spotSample.paths || []) as number[][];
+  const worstAllSeries = (spotWorstAll.paths || []) as number[][];
+  const worstAllPnL = (spotWorstAll.terminal_pnl || []) as number[];
+  const worstAllDD = (spotWorstAll.max_drawdown || []) as number[];
+  const worstAllDDSeries = (spotWorstAll.drawdown_series || []) as number[][];
+  const worstDDSeries = (spotWorstDD.drawdown_series || []) as number[][];
   const modePayload = ((engines[effectiveEngine]?.modes || {})[effectiveMode] || {}) as ModePayload;
   const selectedKpis = (modePayload.kpis || {}) as Record<string, unknown>;
   const selectedFan = (selectedKpis.fan || {}) as Record<string, number[]>;
@@ -131,6 +238,9 @@ export default function RiskBucketsPortfolio() {
   const aggRows = sortedRows.filter((r) => String(r.mode || "") === effectiveAggMode);
   const var99Arr = aggRows.map((r) => Number(r.var99)).filter((v) => Number.isFinite(v));
   const es99Arr = aggRows.map((r) => Number(r.es99)).filter((v) => Number.isFinite(v));
+  const p5Arr = aggRows.map((r) => Number(r.p5)).filter((v) => Number.isFinite(v));
+  const maxddArr = aggRows.map((r) => Number(r.maxdd_p50)).filter((v) => Number.isFinite(v));
+  const maxddP1Arr = aggRows.map((r) => Number(r.maxdd_p1)).filter((v) => Number.isFinite(v));
   const probLossArr = aggRows.map((r) => Number(r.prob_loss)).filter((v) => Number.isFinite(v));
   const probBreachArr = aggRows.map((r) => Number(r.prob_breach_total)).filter((v) => Number.isFinite(v));
   const meanArr = aggRows.map((r) => Number(r.mean)).filter((v) => Number.isFinite(v));
@@ -140,12 +250,65 @@ export default function RiskBucketsPortfolio() {
   const es99Median = pct(es99Arr, 50);
   const es99Min = es99Arr.length ? Math.min(...es99Arr) : NaN;
   const es99Max = es99Arr.length ? Math.max(...es99Arr) : NaN;
+  const p5Median = pct(p5Arr, 50);
+  const maxddMedian = pct(maxddArr, 50);
+  const maxddP1 = pct(maxddP1Arr, 50);
   const probLossMin = probLossArr.length ? Math.min(...probLossArr) : NaN;
   const probLossMed = pct(probLossArr, 50);
   const probLossMax = probLossArr.length ? Math.max(...probLossArr) : NaN;
   const probBreachMin = probBreachArr.length ? Math.min(...probBreachArr) : NaN;
   const probBreachMed = pct(probBreachArr, 50);
   const probBreachMax = probBreachArr.length ? Math.max(...probBreachArr) : NaN;
+  const medianArr = aggRows.map((r) => Number(r.median)).filter((v) => Number.isFinite(v));
+  const medianMed = pct(medianArr, 50);
+  const medianMin = medianArr.length ? Math.min(...medianArr) : NaN;
+  const medianMax = medianArr.length ? Math.max(...medianArr) : NaN;
+  const accountSize = Number(data?.account_size || 0);
+  const marginUsed = Number(data?.margin_used || 0);
+  const gammaNorm = Number(data?.zone?.gamma_norm || 0);
+  const vegaNorm = Number(data?.zone?.vega_norm || 0);
+  const horizonDays = Number(advanced?.config?.horizon_days || 10);
+  const windowsPerYear = horizonDays > 0 ? (252 / horizonDays) : 0;
+  const expectedBreachesPerYear = probBreachMed * windowsPerYear;
+  const expectedLossDaysPerYear = probLossMed * windowsPerYear;
+  const annualMedianPnl = medianMed * windowsPerYear;
+  const annualMedianPct = accountSize > 0 ? (annualMedianPnl / accountSize) * 100 : NaN;
+  const annualTailLoss = es99Median * expectedBreachesPerYear;
+  const annualTailLossPct = accountSize > 0 ? (annualTailLoss / accountSize) * 100 : NaN;
+  const marginStressProbs = Object.entries(engines).map(([engine, payload]) => {
+    const modes = payload?.modes || {};
+    const key = pickPreferredModeKey(modes, "repricing");
+    const sample = ((modes[key] || {}).terminal_pnl_sample || []) as number[];
+    if (!accountSize || !Number.isFinite(marginUsed) || !sample.length) return NaN;
+    const stressed = sample.filter((pnl) => {
+      const denom = accountSize + Number(pnl);
+      if (!Number.isFinite(denom) || denom <= 0) return false;
+      return (marginUsed / denom) > 0.8;
+    });
+    return sample.length ? (stressed.length / sample.length) : NaN;
+  }).filter((v) => Number.isFinite(v));
+  const probMarginStressMed = pct(marginStressProbs, 50);
+  const p99UtilArr = var99Arr.map((v) => {
+    const denom = accountSize + v;
+    if (!Number.isFinite(denom) || denom <= 0) return NaN;
+    return marginUsed / denom;
+  }).filter((v) => Number.isFinite(v));
+  const p99UtilMed = pct(p99UtilArr, 50);
+  const p1Util = (() => {
+    const denom = accountSize + var99Median;
+    if (!Number.isFinite(denom) || denom <= 0) return NaN;
+    return marginUsed / denom;
+  })();
+  const p5Util = (() => {
+    const denom = accountSize + p5Median;
+    if (!Number.isFinite(denom) || denom <= 0) return NaN;
+    return marginUsed / denom;
+  })();
+  const p50Util = (() => {
+    const denom = accountSize + medianMed;
+    if (!Number.isFinite(denom) || denom <= 0) return NaN;
+    return marginUsed / denom;
+  })();
   const var99Iqr = pct(var99Arr, 75) - pct(var99Arr, 25);
   const var99Range = (var99Arr.length ? Math.max(...var99Arr) : NaN) - (var99Arr.length ? Math.min(...var99Arr) : NaN);
   const meanRange = (meanArr.length ? Math.max(...meanArr) : NaN) - (meanArr.length ? Math.min(...meanArr) : NaN);
@@ -233,35 +396,234 @@ export default function RiskBucketsPortfolio() {
     <>
       {error ? <ErrorState message={error} /> : null}
 
+      <SectionCard title="Seller Health">
+        {loading || !data ? <LoadingState /> : (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
+            <div className="metric-card">
+              <div className="seller-health-label">Expectation</div>
+              <div style={{ display: "grid", gap: 6 }}>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Median P&L
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Median terminal P&amp;L across engines (P50 for each engine, then median across engines for robustness).</span>
+                    </span>
+                  </span>
+                  <span className={`seller-metric-value${medianMed < 0 ? " negative" : ""}`}>{formatInrLac(medianMed)}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Median P&L Range
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Min to max of per-engine median P&amp;L values (range across engines).</span>
+                    </span>
+                  </span>
+                  <span className={`seller-metric-value${medianMed < 0 ? " negative" : " positive"}`}>{`${formatInrLac(medianMin)} - ${formatInrLac(medianMax)}`}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Probability of Profit
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Probability of profit = 1 - prob_loss; median of per-engine chance that terminal P&amp;L is negative.</span>
+                    </span>
+                  </span>
+                  <span className={`seller-metric-value${(1 - probLossMed) * 100 < 50 ? " negative" : ""}`}>{formatPct((1 - probLossMed) * 100)}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    DD P50
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Median of per-engine max drawdown P50 (typical worst dip per path over the horizon).</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{formatInrLac(maxddMedian)}</span>
+                </div>
+              </div>
+            </div>
+            <div className="metric-card">
+              <div className="seller-health-label">Risk</div>
+              <div style={{ display: "grid", gap: 6 }}>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    VaR (99%)
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Median of per-engine 1st percentile terminal P&amp;L (VaR99 threshold).</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{formatInrLac(var99Median)}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Expected Shortfall
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Median of per-engine ES99: average loss of the worst 1% terminal P&amp;L paths.</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{formatInrLac(es99Median)}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    P5 Outcome
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Median of per-engine 5th percentile terminal P&amp;L (P5 outcome).</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{formatInrLac(p5Median)}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Breach Odds
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Median probability that total loss limit is breached at any point in the horizon.</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{formatPct(probBreachMed * 100)}</span>
+                </div>
+              </div>
+            </div>
+            <div className="metric-card">
+              <div className="seller-health-label">Exposure</div>
+              <div style={{ display: "grid", gap: 6 }}>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    DD P1
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Median of per-engine max drawdown P1 (worst 1% drawdown).</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{formatInrLac(maxddP1)}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Margin Stress (&gt;80%)
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Median probability that margin_used / (account_size + terminal P&amp;L) exceeds 80%, plus current utilization.</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">
+                    {formatPct(probMarginStressMed * 100)}
+                    {" | "}
+                    <span className={(marginUsed / (accountSize || 1)) < 0.8 ? "positive" : "negative"}>
+                      {formatPct((marginUsed / (accountSize || 1)) * 100)}
+                    </span>
+                  </span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Margin Util (P1 | P5 | P50)
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Margin utilization computed at P1 (VaR99), P5, and P50 terminal P&amp;L levels.</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{`${formatPct(p1Util * 100)} | ${formatPct(p5Util * 100)} | ${formatPct(p50Util * 100)}`}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Convexity | Vega
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Portfolio gamma and vega normalized per ₹1L capital (convexity and volatility exposure).</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{`${formatNumber(gammaNorm, 4)} | ${formatNumber(vegaNorm, 0)}`}</span>
+                </div>
+              </div>
+            </div>
+            <div className="metric-card">
+              <div className="seller-health-label">Annualized Policy</div>
+              <div style={{ display: "grid", gap: 6 }}>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Breaches / Year
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Expected breaches per year assuming independent rolling windows: prob_breach × (252 / horizon_days).</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{formatNumber(expectedBreachesPerYear, 2)}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Loss Windows / Year
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Expected loss windows per year: prob_loss × (252 / horizon_days).</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{formatNumber(expectedLossDaysPerYear, 2)}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Annual Tail Loss Budget
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Heuristic: ES99 × expected breaches/year. Assumes independent rolling windows.</span>
+                    </span>
+                  </span>
+                  <span className="seller-metric-value">{`${formatInrLac(annualTailLoss)} | ${formatPct(annualTailLossPct)}`}</span>
+                </div>
+                <div className="seller-metric-row" style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+                  <span className="seller-metric-label">
+                    Annual Median Return
+                    <span className="metric-help seller-metric-help">
+                      ?
+                      <span className="metric-popover">Annualized median P&amp;L using rolling windows: median P&amp;L × (252 / horizon_days).</span>
+                    </span>
+                  </span>
+                  <span className={`seller-metric-value${annualMedianPnl < 0 ? " negative" : " positive"}`}>{`${formatInrLac(annualMedianPnl)} | ${formatPct(annualMedianPct)}`}</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </SectionCard>
+
       <SectionCard title="Cross-Engine Risk Consensus">
         {loading || !data ? <LoadingState /> : (
           <>
-            <MetricGrid>
-              <MetricCard
-                label={`Base Risk (${baseRiskLabel})`}
-                value={`${formatInrLac(var99Median)} | P(loss) ${formatPct(probLossMed * 100)}`}
-              />
-              <MetricCard
-                label={`Stress Floor (${stressLabel})`}
-                value={`${formatInrLac(var99Min)} | ES99 ${formatInrLac(es99Median)}`}
-              />
-              <MetricCard
-                label={`Breach Odds (${breachLabel})`}
-                value={`${formatPct(probBreachMed * 100)} | Range ${formatPct(probBreachMin * 100)}-${formatPct(probBreachMax * 100)}`}
-              />
-              <MetricCard
-                label={`Model Confidence (${confidenceLabel})`}
-                value={`Dispersion ${formatInrLac(var99Range)} | ModeGap ${formatInrLac(modeGapVar99Med)}`}
-              />
-              <MetricCard
-                label="Consensus Mean P&L"
-                value={`${formatInrLac(meanArr.length ? (meanArr.reduce((a, b) => a + b, 0) / meanArr.length) : NaN)} | Band ${formatInrLac(meanArr.length ? Math.min(...meanArr) : NaN)}-${formatInrLac(meanArr.length ? Math.max(...meanArr) : NaN)}`}
-              />
-              <MetricCard
-                label="Consensus Median P&L"
-                value={`${formatInrLac(pct(meanArr, 50))} | Band ${formatInrLac(meanArr.length ? Math.min(...meanArr) : NaN)}-${formatInrLac(meanArr.length ? Math.max(...meanArr) : NaN)}`}
-              />
-            </MetricGrid>
+            <div className="metric-grid-row">
+              <MetricGrid>
+                <MetricCard
+                  label={`VaR99 (${baseRiskLabel})`}
+                  value={`${formatInrLac(var99Median)} | ${formatInrLac(avg(var99Arr))} | ${formatInrLac(var99Min)} - ${formatInrLac(var99Max)}`}
+                />
+                <MetricCard
+                  label={`ES99 (${stressLabel})`}
+                  value={`${formatInrLac(es99Median)} | ${formatInrLac(avg(es99Arr))} | ${formatInrLac(es99Min)} - ${formatInrLac(es99Max)}`}
+                />
+                <MetricCard
+                  label="P&L (Engine Aggregate)"
+                  value={`${formatInrLac(medianMed)} | ${formatInrLac(avg(meanArr))} | ${formatInrLac(medianMin)} - ${formatInrLac(medianMax)}`}
+                />
+              </MetricGrid>
+            </div>
+            <div className="metric-grid-row">
+              <MetricGrid>
+                <MetricCard
+                  label={`Prob Loss (Median)`}
+                  value={`${formatPct(probLossMed * 100)} | Range ${formatPct(probLossMin * 100)}-${formatPct(probLossMax * 100)}`}
+                />
+                <MetricCard
+                  label={`Breach Odds (Median)`}
+                  value={`${formatPct(probBreachMed * 100)} | Range ${formatPct(probBreachMin * 100)}-${formatPct(probBreachMax * 100)}`}
+                />
+                <MetricCard
+                  label={`Model Confidence (${confidenceLabel})`}
+                  value={`Dispersion ${formatInrLac(var99Range)} | ModeGap ${formatInrLac(modeGapVar99Med)}`}
+                />
+              </MetricGrid>
+            </div>
           </>
         )}
       </SectionCard>
@@ -518,6 +880,171 @@ export default function RiskBucketsPortfolio() {
               />
             </div>
           </>
+        )}
+      </SectionCard>
+
+      <SectionCard title="NIFTY Last 30 Days + Simulated Paths">
+        {loading || !data || ohlcv.loading || !ohlcv.data ? <LoadingState /> : (
+          (() => {
+            const last10 = (ohlcv.data.rows || [])
+              .filter((r) => Boolean(String(r.date || "")))
+              .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
+              .slice(-10);
+            const histDates = last10.map((r) => String(r.date || ""));
+            const histClose = last10.map((r) => Number(r.close || 0));
+            const histOpen = last10.map((r) => Number(r.open || 0));
+            const histHigh = last10.map((r) => Number(r.high || 0));
+            const histLow = last10.map((r) => Number(r.low || 0));
+            const lastDateStr = histDates[histDates.length - 1] || "";
+            const lastClose = histClose[histClose.length - 1] || 0;
+            const baseDate = lastDateStr ? new Date(lastDateStr) : null;
+            const simDays = Math.min(pathDays.length, 10);
+            const simDates = baseDate && simDays
+              ? [baseDate.toISOString().slice(0, 10), ...pathDays.slice(0, simDays).map((_, i) => {
+                  const d = new Date(baseDate.getTime());
+                  d.setDate(d.getDate() + i + 1);
+                  return d.toISOString().slice(0, 10);
+                })]
+              : [];
+            const simSeries = pathSeries.map((series) => [lastClose, ...series.slice(0, simDays)]);
+            const worstAllSeriesAdj = worstAllSeries.map((series) => [lastClose, ...series.slice(0, simDays)]);
+            const worstAllDDAdj = worstAllDDSeries.map((series) => [0, ...series.slice(0, simDays)]);
+            const worstDDAdj = worstDDSeries.map((series) => [0, ...series.slice(0, simDays)]);
+            const ddBars = worstAllDD.map((v, idx) => ({ id: idx + 1, dd: v }));
+            return (
+              <>
+                <div style={{ display: "flex", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+                  <label className="control-field" style={{ minWidth: 200 }}>
+                    <span className="control-label">Engine</span>
+                    <select className="control-input" value={effectivePathEngine} onChange={(e) => setSelectedPathEngine(e.target.value)}>
+                      {engineOptions.map((e) => (
+                        <option key={e} value={e}>{e.toUpperCase()}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <Plot
+                  data={[
+                    {
+                      type: "candlestick",
+                      x: histDates,
+                      open: histOpen,
+                      high: histHigh,
+                      low: histLow,
+                      close: histClose,
+                      name: "NIFTY OHLC",
+                      increasing: { line: { color: "#2ecc71" } },
+                      decreasing: { line: { color: "#ff4d4d" } }
+                    },
+                    ...simSeries.map((series) => ({
+                      type: "scatter",
+                      mode: "lines",
+                      x: simDates,
+                      y: series,
+                      line: { width: 1, color: "rgba(108,192,255,0.35)" },
+                      hoverinfo: "skip",
+                      showlegend: false
+                    })),
+                    ...worstAllSeriesAdj.map((series, idx) => ({
+                      type: "scatter",
+                      mode: "lines",
+                      x: simDates,
+                      y: series,
+                      line: { width: 2, color: "rgba(255,77,77,0.75)" },
+                      hovertemplate: `Terminal P&L: ₹${formatNumber(worstAllPnL[idx], 0)}<br>Max DD: ₹${formatNumber(worstAllDD[idx], 0)}<extra></extra>`,
+                      showlegend: false
+                    }))
+                  ]}
+                  layout={{
+                    height: 380,
+                    paper_bgcolor: "rgba(0,0,0,0)",
+                    plot_bgcolor: "rgba(0,0,0,0)",
+                    margin: { l: 56, r: 20, t: 20, b: 48 },
+                    xaxis: { title: "Date", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 }, rangeslider: { visible: false } },
+                    yaxis: { title: "NIFTY Spot", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } }
+                  }}
+                  config={{ displayModeBar: false, responsive: true }}
+                  style={{ width: "100%", height: "100%" }}
+                  useResizeHandler
+                />
+                <div style={{ marginTop: 14 }}>
+                  <Plot
+                    data={[
+                      {
+                        type: "bar",
+                        x: ddBars.map((d) => `Path ${d.id}`),
+                        y: ddBars.map((d) => d.dd),
+                        marker: { color: "#ff4d4d" },
+                        name: "Max Drawdown"
+                      }
+                    ]}
+                    layout={{
+                      height: 220,
+                      paper_bgcolor: "rgba(0,0,0,0)",
+                      plot_bgcolor: "rgba(0,0,0,0)",
+                      margin: { l: 56, r: 20, t: 12, b: 48 },
+                      xaxis: { title: "Worst 20 Paths", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
+                      yaxis: { title: "Max Drawdown (₹)", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
+                      showlegend: false
+                    }}
+                    config={{ displayModeBar: false, responsive: true }}
+                    style={{ width: "100%", height: "100%" }}
+                    useResizeHandler
+                  />
+                </div>
+                <div style={{ display: "flex", gap: 12, marginBottom: 8, flexWrap: "wrap" }}>
+                  <label className="control-field" style={{ minWidth: 220 }}>
+                    <span className="control-label">Drawdown Paths</span>
+                    <select className="control-input" value={ddView} onChange={(e) => setDdView(e.target.value as "terminal" | "drawdown" | "both")}>
+                      <option value="both">Worst Terminal + Worst DD</option>
+                      <option value="terminal">Worst Terminal Only</option>
+                      <option value="drawdown">Worst DD Only</option>
+                    </select>
+                  </label>
+                </div>
+                <div style={{ marginTop: 4 }}>
+                  <Plot
+                    data={[
+                      ...(ddView !== "drawdown"
+                        ? worstAllDDAdj.map((series) => ({
+                            type: "scatter",
+                            mode: "lines",
+                            x: simDates,
+                            y: series,
+                            line: { width: 1.4, color: "rgba(255,77,77,0.6)" },
+                            hoverinfo: "skip",
+                            showlegend: false
+                          }))
+                        : []),
+                      ...(ddView !== "terminal"
+                        ? worstDDAdj.map((series) => ({
+                            type: "scatter",
+                            mode: "lines",
+                            x: simDates,
+                            y: series,
+                            line: { width: 1.4, color: "rgba(46,204,113,0.6)" },
+                            hoverinfo: "skip",
+                            showlegend: false
+                          }))
+                        : []),
+                    ]}
+                    layout={{
+                      height: 240,
+                      paper_bgcolor: "rgba(0,0,0,0)",
+                      plot_bgcolor: "rgba(0,0,0,0)",
+                      margin: { l: 56, r: 20, t: 12, b: 48 },
+                      xaxis: { title: "Date", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
+                      yaxis: { title: "Drawdown (₹)", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
+                      showlegend: false
+                    }}
+                    config={{ displayModeBar: false, responsive: true }}
+                    style={{ width: "100%", height: "100%" }}
+                    useResizeHandler
+                  />
+                </div>
+              </>
+            );
+          })()
         )}
       </SectionCard>
     </>

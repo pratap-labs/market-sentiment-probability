@@ -1073,6 +1073,66 @@ def _downsample_xy(x: np.ndarray, y: np.ndarray, max_points: int = 700) -> Tuple
     return x[idx], y[idx]
 
 
+def _sample_spot_paths(
+    spot_paths: np.ndarray,
+    max_paths: int = 50,
+    max_steps: int = 60,
+    path_idx: Optional[np.ndarray] = None,
+    terminal_pnl: Optional[np.ndarray] = None,
+    pnl_paths: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    if spot_paths is None or spot_paths.size == 0:
+        return {"days": [], "paths": [], "path_idx": [], "terminal_pnl": [], "max_drawdown": [], "drawdown_series": []}
+    total_paths, total_steps = spot_paths.shape
+    step_count = int(min(total_steps, max_steps))
+    if step_count <= 0:
+        return {"days": [], "paths": [], "path_idx": [], "terminal_pnl": [], "max_drawdown": [], "drawdown_series": []}
+    if total_steps == step_count:
+        step_idx = np.arange(total_steps, dtype=int)
+    else:
+        step_idx = np.linspace(0, total_steps - 1, step_count, dtype=int)
+    if path_idx is None:
+        path_count = int(min(total_paths, max_paths))
+        if total_paths == path_count:
+            path_idx = np.arange(total_paths, dtype=int)
+        else:
+            path_idx = np.linspace(0, total_paths - 1, path_count, dtype=int)
+    sampled = spot_paths[np.ix_(path_idx, step_idx)]
+    pnl_sample = []
+    if terminal_pnl is not None and path_idx is not None:
+        try:
+            pnl_sample = terminal_pnl[path_idx].astype(float).tolist()
+        except Exception:
+            pnl_sample = []
+    dd_sample = []
+    dd_series_sample: List[List[float]] = []
+    if pnl_paths is not None and path_idx is not None:
+        try:
+            for idx in path_idx:
+                curve = np.asarray(pnl_paths[int(idx)], dtype=float)
+                if curve.size:
+                    curve = np.concatenate([np.zeros(1, dtype=float), curve])
+                    run_max = np.maximum.accumulate(curve)
+                    dd = curve - run_max
+                    dd_sample.append(float(np.min(dd)))
+                    take_idx = np.asarray(step_idx, dtype=int) + 1
+                    dd_series_sample.append(dd[take_idx].astype(float).tolist())
+                else:
+                    dd_sample.append(0.0)
+                    dd_series_sample.append([0.0] * step_count)
+        except Exception:
+            dd_sample = []
+            dd_series_sample = []
+    return {
+        "days": (step_idx + 1).astype(int).tolist(),
+        "paths": sampled.astype(float).tolist(),
+        "path_idx": path_idx.astype(int).tolist(),
+        "terminal_pnl": pnl_sample,
+        "max_drawdown": dd_sample,
+        "drawdown_series": dd_series_sample,
+    }
+
+
 def _build_overlay_plot_payload(engine_plot_data: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     if not engine_plot_data:
         return {"cdf": [], "tail": [], "tail_xlim": None}
@@ -1241,6 +1301,7 @@ def run_advanced_forward_risk(
 
         spot_paths = engine_sim["spot_paths"]
         returns_paths = engine_sim["returns_paths"]
+        spot_paths_sample = _sample_spot_paths(spot_paths)
         factor_shocks = None
         if cfg.simulate_surface:
             factor_shocks = _simulate_surface_factor_shocks(returns_paths, cfg, rng)
@@ -1253,6 +1314,7 @@ def run_advanced_forward_risk(
             mode_results: Dict[str, Any] = {}
             pnl_repricing_bs = None
             pnl_greeks = None
+            pnl_by_mode: Dict[str, np.ndarray] = {}
             scenario_engine = f"{eng}|{iv_rule}"
 
             for mode in cfg.pnl_modes:
@@ -1269,6 +1331,7 @@ def run_advanced_forward_risk(
                             engine_name=scenario_engine,
                             pricing_model=model_name,
                         )
+                        pnl_by_mode[mode_key] = pnl_repricing
                         if model_name == "bs":
                             pnl_repricing_bs = pnl_repricing
                         k = _distribution_kpis(pnl_repricing, cfg.daily_loss_limit, cfg.total_loss_limit)
@@ -1320,6 +1383,7 @@ def run_advanced_forward_risk(
                 else:
                     mode_key = "greeks"
                     pnl_greeks = _simulate_mode_greeks(legs, spot_paths, spot, base_surface, factor_shocks_eff, cfg)
+                    pnl_by_mode[mode_key] = pnl_greeks
                     k = _distribution_kpis(pnl_greeks, cfg.daily_loss_limit, cfg.total_loss_limit)
                     term = pnl_greeks[:, -1]
                     if term.size > 3000:
@@ -1354,15 +1418,66 @@ def run_advanced_forward_risk(
             else:
                 fit_block["surface_factor_stability"] = None
 
+            overlay_key = "repricing_bs" if "repricing_bs" in mode_results else ("repricing_bs76" if "repricing_bs76" in mode_results else "greeks")
+            pnl_for_worst = pnl_by_mode.get(overlay_key)
+            spot_paths_worst = None
+            spot_paths_worst_all = None
+            spot_paths_worst_dd = None
+            if isinstance(pnl_for_worst, np.ndarray) and pnl_for_worst.size:
+                terminal = pnl_for_worst[:, -1]
+                st = spot_paths[:, -1] if spot_paths.shape[1] else np.asarray([], dtype=float)
+                down_mask = st <= spot
+                up_mask = st > spot
+                down_idx = np.where(down_mask)[0]
+                up_idx = np.where(up_mask)[0]
+                worst_down = down_idx[np.argsort(terminal[down_idx])[: min(10, down_idx.size)]] if down_idx.size else np.array([], dtype=int)
+                worst_up = up_idx[np.argsort(terminal[up_idx])[: min(10, up_idx.size)]] if up_idx.size else np.array([], dtype=int)
+                worst_idx = np.concatenate([worst_down, worst_up]).astype(int)
+                if worst_idx.size:
+                    spot_paths_worst = _sample_spot_paths(
+                        spot_paths,
+                        max_steps=10,
+                        path_idx=worst_idx,
+                        terminal_pnl=terminal,
+                        pnl_paths=pnl_for_worst,
+                    )
+                worst_all_count = int(min(20, terminal.size))
+                worst_all_idx = np.argsort(terminal)[:worst_all_count]
+                spot_paths_worst_all = _sample_spot_paths(
+                    spot_paths,
+                    max_steps=10,
+                    path_idx=worst_all_idx,
+                    terminal_pnl=terminal,
+                    pnl_paths=pnl_for_worst,
+                )
+                # Worst by max drawdown across the full path
+                curve = np.concatenate([np.zeros((pnl_for_worst.shape[0], 1), dtype=float), pnl_for_worst], axis=1)
+                run_max = np.maximum.accumulate(curve, axis=1)
+                dd = curve - run_max
+                dd_min = np.min(dd, axis=1)
+                dd_worst_count = int(min(20, dd_min.size))
+                dd_worst_idx = np.argsort(dd_min)[:dd_worst_count]
+                spot_paths_worst_dd = _sample_spot_paths(
+                    spot_paths,
+                    max_steps=10,
+                    path_idx=dd_worst_idx,
+                    terminal_pnl=terminal,
+                    pnl_paths=pnl_for_worst,
+                )
+
             engines_out[scenario_engine] = {
                 "engine_base": eng,
                 "iv_rule": iv_rule,
                 "fit_kpis": fit_block,
                 "modes": mode_results,
+                "spot_paths_sample": spot_paths_sample,
+                "spot_paths_worst": spot_paths_worst,
+                "spot_paths_worst_all": spot_paths_worst_all,
+                "spot_paths_worst_dd": spot_paths_worst_dd,
+                "spot_paths_worst_mode": overlay_key,
             }
 
             # Overlay default: repricing BS if present, then repricing BS76, then greeks.
-            overlay_key = "repricing_bs" if "repricing_bs" in mode_results else ("repricing_bs76" if "repricing_bs76" in mode_results else "greeks")
             overlay_payload = mode_results.get(overlay_key) or {}
             term = np.asarray(overlay_payload.get("terminal_pnl_sample") or [], dtype=float)
             k_sel = overlay_payload.get("kpis") or {}

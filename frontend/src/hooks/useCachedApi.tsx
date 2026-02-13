@@ -4,9 +4,11 @@ import { getCacheEntry, setCache } from "../api/cache";
 
 type State<T> = { data: T | null; error: string | null; loading: boolean };
 const inflight = new Map<string, Promise<unknown>>();
+const DAY_MS = 86_400_000;
 
 export function useCachedApi<T>(key: string, path: string, ttlMs = 60_000): State<T> {
   const [state, setState] = useState<State<T>>({ data: null, error: null, loading: true });
+  const effectiveTtl = DAY_MS;
 
   useEffect(() => {
     const cacheKey = `${key}::${path}`;
@@ -32,7 +34,7 @@ export function useCachedApi<T>(key: string, path: string, ttlMs = 60_000): Stat
     inflight.set(cacheKey, promise);
     promise
       .then((data) => {
-        setCache(cacheKey, data, ttlMs);
+        setCache(cacheKey, data, effectiveTtl);
         setState({ data, error: null, loading: false });
       })
       .catch((err) => {
@@ -41,7 +43,7 @@ export function useCachedApi<T>(key: string, path: string, ttlMs = 60_000): Stat
       .finally(() => {
         inflight.delete(cacheKey);
       });
-  }, [key, path, ttlMs]);
+  }, [key, path, effectiveTtl]);
 
   return state;
 }
