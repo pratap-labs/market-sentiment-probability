@@ -38,6 +38,23 @@ function avg(arr: number[]): number {
 
 type OverlayCdfRow = { engine?: string; x?: number[]; cdf?: number[]; var99?: number };
 type OverlayTailRow = { engine?: string; x?: number[]; cdf?: number[]; ccdf?: number[]; es99?: number };
+type BucketedLossHist = {
+  bins?: number[];
+  weights?: number[];
+  total_weight?: number;
+  bucket_window?: number;
+  bucket_edges?: number[];
+  bucket_probs?: number[];
+  path_bucket_counts?: number[];
+  weighted_kpis?: {
+    mean?: number;
+    var95?: number;
+    var99?: number;
+    es99?: number;
+    total_weight?: number;
+  };
+  debug?: Record<string, unknown>;
+};
 type SpotPathsSample = {
   days?: number[];
   paths?: number[][];
@@ -46,14 +63,16 @@ type SpotPathsSample = {
   max_drawdown?: number[];
   drawdown_series?: number[][];
 };
-type ModePayload = { kpis?: Record<string, unknown>; terminal_pnl_sample?: number[] };
+type ModePayload = { kpis?: Record<string, unknown>; terminal_pnl_sample?: number[]; bucketed_loss_hist?: BucketedLossHist | null };
 type EnginePayload = {
   fit_kpis?: Record<string, unknown>;
   modes?: Record<string, ModePayload>;
   spot_paths_sample?: SpotPathsSample;
+  spot_paths_all?: SpotPathsSample;
   spot_paths_worst?: SpotPathsSample | null;
   spot_paths_worst_all?: SpotPathsSample | null;
   spot_paths_worst_dd?: SpotPathsSample | null;
+  spot_paths_worst_pct1?: SpotPathsSample | null;
   spot_paths_worst_mode?: string;
 };
 
@@ -100,7 +119,7 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
   const data = dataOverride ?? rb.data;
   const loading = loadingOverride ?? rb.loading;
   const error = errorOverride ?? rb.error;
-  const ohlcv = useCachedApi<Ohlcv>("nifty_ohlcv_30", "/derivatives/nifty-ohlcv?limit=40", 60_000);
+  const ohlcv = useCachedApi<Ohlcv>("nifty_ohlcv_all", "/derivatives/nifty-ohlcv?limit=0", 60_000);
   const settingsCfg = useCachedApi<{ settings: SettingsConfig }>("risk_buckets_settings_config_portfolio", "/risk-buckets/settings/config", 60_000);
   const [breachLimitPct, setBreachLimitPct] = useState<number | null>(null);
 
@@ -163,6 +182,7 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
 
   const axisColor = "#b9c4d6";
   const advanced = data?.advanced_simulation || null;
+  const spot0 = Number((advanced?.config as Record<string, unknown> | undefined)?.spot0);
   const overlayPlots = advanced?.overlay_plots || {};
   const rows = (advanced?.summary_rows || []) as Record<string, unknown>[];
   const engineSortKey = (raw: string): { ivOrder: number; base: string } => {
@@ -212,11 +232,15 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
   const [selectedMode, setSelectedMode] = useState<string>("");
   const effectiveMode = modeOptions.includes(selectedMode) ? selectedMode : (modeOptions[0] || "");
   const [selectedPathEngine, setSelectedPathEngine] = useState<string>("");
+  const [selectedBucketEngine, setSelectedBucketEngine] = useState<string>("");
   const [ddView, setDdView] = useState<"terminal" | "drawdown" | "both">("both");
+  const [combinedEngineFilter, setCombinedEngineFilter] = useState<"all" | "surface" | "greeks">("all");
   const effectivePathEngine = engineOptions.includes(selectedPathEngine) ? selectedPathEngine : (engineOptions[0] || "");
+  const effectiveBucketEngine = engineOptions.includes(selectedBucketEngine) ? selectedBucketEngine : (engineOptions[0] || "");
   const spotSample = (engines[effectivePathEngine]?.spot_paths_worst || engines[effectivePathEngine]?.spot_paths_sample || {}) as SpotPathsSample;
   const spotWorstAll = (engines[effectivePathEngine]?.spot_paths_worst_all || {}) as SpotPathsSample;
   const spotWorstDD = (engines[effectivePathEngine]?.spot_paths_worst_dd || {}) as SpotPathsSample;
+  const spotAllBucket = (engines[effectiveBucketEngine]?.spot_paths_worst_all || {}) as SpotPathsSample;
   const pathDays = (spotSample.days || []) as number[];
   const pathSeries = (spotSample.paths || []) as number[][];
   const worstAllSeries = (spotWorstAll.paths || []) as number[][];
@@ -225,6 +249,7 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
   const worstAllDDSeries = (spotWorstAll.drawdown_series || []) as number[][];
   const worstDDSeries = (spotWorstDD.drawdown_series || []) as number[][];
   const modePayload = ((engines[effectiveEngine]?.modes || {})[effectiveMode] || {}) as ModePayload;
+  const bucketModePayload = ((engines[effectiveBucketEngine]?.modes || {})[effectiveMode] || {}) as ModePayload;
   const selectedKpis = (modePayload.kpis || {}) as Record<string, unknown>;
   const selectedFan = (selectedKpis.fan || {}) as Record<string, number[]>;
   const termSample = (modePayload.terminal_pnl_sample || []) as number[];
@@ -247,6 +272,19 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
   }
   const barX = counts.map((_, i) => minX + width * (i + 0.5));
   const barText = counts.map((c) => (c > 0 ? String(c) : ""));
+  const bucketedHist = bucketModePayload.bucketed_loss_hist || null;
+  const bucketBins = (bucketedHist?.bins || []).map((v) => toLac(v));
+  const bucketWeightsRaw = (bucketedHist?.weights || []).map((v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  });
+  const bucketTotal = Number.isFinite(Number(bucketedHist?.total_weight))
+    ? Number(bucketedHist?.total_weight)
+    : bucketWeightsRaw.reduce((a, b) => (Number.isFinite(b) ? a + b : a), 0);
+  const bucketText = bucketWeightsRaw.map((w) => {
+    if (!Number.isFinite(w) || w <= 0 || bucketTotal <= 0) return "";
+    return `${(w / bucketTotal * 100).toFixed(2)}%`;
+  });
   const allModes = Array.from(new Set(sortedRows.map((r) => String(r.mode || "")).filter(Boolean)));
   const effectiveAggMode = allModes.includes("repricing") ? "repricing" : (allModes[0] || "");
   const aggRows = sortedRows.filter((r) => String(r.mode || "") === effectiveAggMode);
@@ -914,10 +952,22 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
       <SectionCard title="NIFTY Last 30 Days + Simulated Paths">
         {loading || !data || ohlcv.loading || !ohlcv.data ? <LoadingState /> : (
           (() => {
+            const last30 = (ohlcv.data.rows || [])
+              .filter((r) => Boolean(String(r.date || "")))
+              .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
+              .slice(-30);
             const last10 = (ohlcv.data.rows || [])
               .filter((r) => Boolean(String(r.date || "")))
               .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
               .slice(-10);
+            const histRows = (ohlcv.data.rows || [])
+              .filter((r) => Number.isFinite(Number(r.close)))
+              .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")));
+            const hist30Dates = last30.map((r) => String(r.date || ""));
+            const hist30Close = last30.map((r) => Number(r.close || 0));
+            const hist30Open = last30.map((r) => Number(r.open || 0));
+            const hist30High = last30.map((r) => Number(r.high || 0));
+            const hist30Low = last30.map((r) => Number(r.low || 0));
             const histDates = last10.map((r) => String(r.date || ""));
             const histClose = last10.map((r) => Number(r.close || 0));
             const histOpen = last10.map((r) => Number(r.open || 0));
@@ -939,8 +989,166 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
             const worstAllDDAdj = worstAllDDSeries.map((series) => [0, ...series.slice(0, simDays)]);
             const worstDDAdj = worstDDSeries.map((series) => [0, ...series.slice(0, simDays)]);
             const ddBars = worstAllDD.map((v, idx) => ({ id: idx + 1, dd: v }));
+            const rollWindow = 10;
+            const closes = histRows.map((r) => Number(r.close || 0)).filter((v) => Number.isFinite(v));
+            const rollReturns: number[] = [];
+            for (let i = rollWindow; i < closes.length; i += 1) {
+              const prev = closes[i - rollWindow];
+              const curr = closes[i];
+              if (prev > 0 && Number.isFinite(curr)) {
+                rollReturns.push((curr / prev - 1) * 100);
+              }
+            }
+            const rrStep = 1;
+            const rrMin = rollReturns.length ? Math.min(...rollReturns) : -10;
+            const rrMax = rollReturns.length ? Math.max(...rollReturns) : 10;
+            const rrMinEdge = Math.floor(rrMin / rrStep) * rrStep;
+            const rrMaxEdge = Math.ceil(rrMax / rrStep) * rrStep;
+            const rrEdges: number[] = [];
+            for (let v = rrMinEdge; v <= rrMaxEdge + 1e-6; v += rrStep) {
+              rrEdges.push(Number(v.toFixed(6)));
+            }
+            if (rrEdges.length < 2) {
+              rrEdges.push(rrMinEdge + rrStep);
+            }
+            const rrCounts = new Array<number>(rrEdges.length - 1).fill(0);
+            for (const v of rollReturns) {
+              const idx = Math.min(rrCounts.length - 1, Math.max(0, Math.floor((v - rrEdges[0]) / rrStep)));
+              rrCounts[idx] += 1;
+            }
+            const rrX = rrCounts.map((_, i) => rrEdges[i] + rrStep * 0.5);
+            const rrText = rrCounts.map((c) => (c > 0 ? String(c) : ""));
+            const bucketEdgesPct = (bucketedHist?.bucket_edges || []).map((v) => Number(v) * 100);
+            const bucketLabels = bucketEdgesPct.length >= 2
+              ? bucketEdgesPct.slice(0, -1).map((v, i) => `${v.toFixed(0)}% to ${bucketEdgesPct[i + 1].toFixed(0)}%`)
+              : [];
+            const bucketProbs = (bucketedHist?.bucket_probs || []).map((v) => Number(v));
+            const bucketProbPct = bucketProbs.map((v) => (Number.isFinite(v) ? v * 100 : 0));
+            const allSeries = (spotAllBucket.paths || []) as number[][];
+            const allDays = (spotAllBucket.days || []) as number[];
+            const allBaseLen = allDays.length || (allSeries[0]?.length ?? 0);
+            const allSimLen = Math.min(allBaseLen, 10);
+            const allDates = baseDate && allSimLen
+              ? [baseDate.toISOString().slice(0, 10), ...Array.from({ length: allSimLen }, (_, i) => {
+                  const d = new Date(baseDate.getTime());
+                  d.setDate(d.getDate() + i + 1);
+                  return d.toISOString().slice(0, 10);
+                })]
+              : [];
+            const pct1Palette = ["#FF4D4D", "#2D7DFF", "#FFB020", "#2ECC71", "#9B59B6", "#00B8D9", "#E67E22", "#F1C40F", "#7DCEA0", "#F1948A"];
+            const allTraces = allSeries.map((path, idx) => {
+              const end = allSimLen > 0 ? path[allSimLen - 1] : path[path.length - 1];
+              const retPct = lastClose > 0 && Number.isFinite(end) ? ((end / lastClose) - 1) * 100 : NaN;
+              let bucketIdx = -1;
+              if (bucketEdgesPct.length >= 2 && Number.isFinite(retPct)) {
+                const step = bucketEdgesPct[1] - bucketEdgesPct[0];
+                bucketIdx = Math.min(bucketEdgesPct.length - 2, Math.max(0, Math.floor((retPct - bucketEdgesPct[0]) / step)));
+              }
+              const color = bucketIdx >= 0 ? pct1Palette[bucketIdx % pct1Palette.length] : "rgba(255,77,77,0.7)";
+              return {
+                type: "scattergl",
+                mode: "lines",
+                x: allDates,
+                y: [lastClose, ...path.slice(0, allSimLen)],
+                line: { width: 1.6, color },
+                opacity: 0.25,
+                name: bucketIdx >= 0 ? bucketLabels[bucketIdx] : `Path ${idx + 1}`,
+                showlegend: false
+              };
+            });
+            const bucketProbTrace = bucketLabels.length && bucketProbs.length
+              ? {
+                  type: "bar",
+                  orientation: "h",
+                  x: bucketProbPct,
+                  y: bucketLabels,
+                  xaxis: "x2",
+                  yaxis: "y2",
+                  marker: { color: bucketLabels.map((_, i) => pct1Palette[i % pct1Palette.length]) },
+                  hovertemplate: "%{y}<br>Prob: %{x:.2f}%<extra></extra>",
+                  showlegend: false
+                }
+              : null;
+            const combinedPalette = ["#FF4D4D", "#2D7DFF", "#FFB020", "#2ECC71", "#9B59B6", "#00B8D9", "#E67E22", "#F1C40F"];
+            const combinedEngines = Object.entries(engines).filter(([engine]) => {
+              const key = engine.toLowerCase();
+              if (combinedEngineFilter === "surface") return key.includes("|surface");
+              if (combinedEngineFilter === "greeks") return key.includes("greeks");
+              return true;
+            });
+            const combinedTraces = combinedEngines.flatMap(([engine, payload], engineIdx) => {
+              const series = ((payload?.spot_paths_worst_all || {}) as SpotPathsSample).paths || [];
+              const pnlSeries = ((payload?.spot_paths_worst_all || {}) as SpotPathsSample).terminal_pnl || [];
+              if (!series.length || !baseDate || !lastClose) return [];
+              const days = (((payload?.spot_paths_worst_all || {}) as SpotPathsSample).days
+                || ((payload?.spot_paths_sample || {}) as SpotPathsSample).days
+                || []) as number[];
+              const simLen = Math.min(days.length, 10);
+              const simDatesCombined = [baseDate.toISOString().slice(0, 10), ...days.slice(0, simLen).map((_, i) => {
+                const d = new Date(baseDate.getTime());
+                d.setDate(d.getDate() + i + 1);
+                return d.toISOString().slice(0, 10);
+              })];
+              const color = combinedPalette[engineIdx % combinedPalette.length];
+              const legendPnl = Number(pnlSeries[0]);
+              const legendLabel = Number.isFinite(legendPnl)
+                ? `${engine.toUpperCase()} (${formatInrLac(legendPnl)})`
+                : engine.toUpperCase();
+              return series.slice(0, 5).map((path, idx) => ({
+                type: "scatter",
+                mode: "lines",
+                x: simDatesCombined,
+                y: [lastClose, ...path.slice(0, simLen)],
+                line: { width: 1.6, color },
+                opacity: 0.6,
+                name: legendLabel,
+                showlegend: idx === 0
+              }));
+            });
             return (
               <>
+                <div style={{ display: "flex", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
+                  <label className="control-field" style={{ minWidth: 220 }}>
+                    <span className="control-label">Combined Engine Filter</span>
+                    <select
+                      className="control-input"
+                      value={combinedEngineFilter}
+                      onChange={(e) => setCombinedEngineFilter(e.target.value as "all" | "surface" | "greeks")}
+                    >
+                      <option value="all">All Engines</option>
+                      <option value="surface">Surface Engines</option>
+                      <option value="greeks">Greeks Engines</option>
+                    </select>
+                  </label>
+                </div>
+                <Plot
+                  data={[
+                    {
+                      type: "candlestick",
+                      x: hist30Dates,
+                      open: hist30Open,
+                      high: hist30High,
+                      low: hist30Low,
+                      close: hist30Close,
+                      name: "NIFTY OHLC",
+                      increasing: { line: { color: "#2ecc71" } },
+                      decreasing: { line: { color: "#ff4d4d" } }
+                    },
+                    ...combinedTraces
+                  ]}
+                  layout={{
+                    height: 380,
+                    paper_bgcolor: "rgba(0,0,0,0)",
+                    plot_bgcolor: "rgba(0,0,0,0)",
+                    margin: { l: 56, r: 20, t: 20, b: 48 },
+                    xaxis: { title: "Date", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 }, rangeslider: { visible: false } },
+                    yaxis: { title: "NIFTY Spot", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
+                    legend: { font: { color: axisColor, size: 10 }, orientation: "h", x: 0, y: -0.2 }
+                  }}
+                  config={{ displayModeBar: false, responsive: true }}
+                  style={{ width: "100%", height: "100%" }}
+                  useResizeHandler
+                />
                 <div style={{ display: "flex", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
                   <label className="control-field" style={{ minWidth: 200 }}>
                     <span className="control-label">Engine</span>
@@ -1063,6 +1271,132 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
                       margin: { l: 56, r: 20, t: 12, b: 48 },
                       xaxis: { title: "Date", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
                       yaxis: { title: "Drawdown (₹)", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
+                      showlegend: false
+                    }}
+                    config={{ displayModeBar: false, responsive: true }}
+                    style={{ width: "100%", height: "100%" }}
+                    useResizeHandler
+                  />
+                </div>
+                {bucketBins.length > 0 && bucketWeightsRaw.length > 0 ? (
+                  <div className="chart-panel" style={{ marginTop: 16 }}>
+                    <h4>Bucket-Weighted Loss Distribution (10D Historical)</h4>
+                    <div style={{ display: "flex", gap: 12, marginBottom: 10, flexWrap: "wrap" }}>
+                      <label className="control-field" style={{ minWidth: 220 }}>
+                        <span className="control-label">Engine</span>
+                        <select className="control-input" value={effectiveBucketEngine} onChange={(e) => setSelectedBucketEngine(e.target.value)}>
+                          {engineOptions.map((e) => (
+                            <option key={e} value={e}>{e.toUpperCase()}</option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <Plot
+                      data={[
+                        {
+                          type: "bar",
+                          x: bucketBins,
+                          y: bucketWeightsRaw,
+                          name: "Weighted Prob",
+                          marker: { color: "rgba(255,176,32,0.55)", line: { width: 1, color: "rgba(255,176,32,0.95)" } },
+                          text: bucketText,
+                          textposition: "outside",
+                          cliponaxis: false,
+                          hovertemplate: "P&L bin center: ₹%{x:.2f}L<br>Weighted Prob: %{y:.4f}<extra></extra>"
+                        }
+                      ]}
+                      layout={{
+                        height: 340,
+                        paper_bgcolor: "rgba(0,0,0,0)",
+                        plot_bgcolor: "rgba(0,0,0,0)",
+                        margin: { l: 56, r: 20, t: 20, b: 48 },
+                        xaxis: { title: "Terminal P&L (₹ Lacs)", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
+                        yaxis: { title: "Weighted Probability", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
+                        showlegend: false
+                      }}
+                      config={{ displayModeBar: false, responsive: true }}
+                      style={{ width: "100%", height: "100%" }}
+                      useResizeHandler
+                    />
+                    <div style={{ marginTop: 6, color: axisColor, fontSize: 12 }}>
+                      Total weight: {bucketTotal > 0 ? bucketTotal.toFixed(3) : "—"} (sum of historical 10D bucket probabilities represented by simulated paths).
+                    </div>
+                    {bucketedHist?.weighted_kpis && (
+                      <div style={{ marginTop: 6, color: axisColor, fontSize: 12 }}>
+                        Expected P&L: {formatInrLac(bucketedHist.weighted_kpis.mean)} ·
+                        VaR99: {formatInrLac(bucketedHist.weighted_kpis.var99)} ·
+                        ES99: {formatInrLac(bucketedHist.weighted_kpis.es99)}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="chart-panel" style={{ marginTop: 16 }}>
+                    <h4>Bucket-Weighted Loss Distribution (10D Historical)</h4>
+                    <div style={{ display: "flex", gap: 12, marginBottom: 10, flexWrap: "wrap" }}>
+                      <label className="control-field" style={{ minWidth: 220 }}>
+                        <span className="control-label">Engine</span>
+                        <select className="control-input" value={effectiveBucketEngine} onChange={(e) => setSelectedBucketEngine(e.target.value)}>
+                          {engineOptions.map((e) => (
+                            <option key={e} value={e}>{e.toUpperCase()}</option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <div style={{ color: axisColor, fontSize: 12 }}>
+                      Bucket-weighted histogram unavailable.
+                      {bucketedHist?.debug ? (
+                        <span style={{ display: "block", marginTop: 6 }}>
+                          Debug: {JSON.stringify(bucketedHist.debug)}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                )}
+                <div className="chart-panel" style={{ marginTop: 16 }}>
+                  <h4>NIFTY Last 10 Days + Worst 20 Paths (Bucket Colored)</h4>
+                  <div style={{ color: axisColor, fontSize: 12, marginBottom: 6 }}>
+                    paths: {allSeries.length} | buckets: {bucketLabels.length}
+                  </div>
+                  <Plot
+                    data={[
+                      {
+                        type: "candlestick",
+                        x: histDates,
+                        open: histOpen,
+                        high: histHigh,
+                        low: histLow,
+                        close: histClose,
+                        name: "NIFTY OHLC",
+                        increasing: { line: { color: "#2ecc71" } },
+                        decreasing: { line: { color: "#ff4d4d" } }
+                      },
+                      ...allTraces,
+                      ...(bucketProbTrace ? [bucketProbTrace] : [])
+                    ]}
+                    layout={{
+                      height: 380,
+                      paper_bgcolor: "rgba(0,0,0,0)",
+                      plot_bgcolor: "rgba(0,0,0,0)",
+                      margin: { l: 56, r: 20, t: 20, b: 48 },
+                      xaxis: { title: "Date", automargin: true, domain: [0, 0.78], tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 }, rangeslider: { visible: false } },
+                      yaxis: { title: "NIFTY Spot", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
+                      xaxis2: bucketLabels.length ? {
+                        title: "Prob (%)",
+                        domain: [0.82, 0.98],
+                        anchor: "y2",
+                        tickfont: { color: axisColor, size: 9 },
+                        titlefont: { color: axisColor, size: 10 },
+                        showgrid: false
+                      } : undefined,
+                      yaxis2: bucketLabels.length ? {
+                        title: "Buckets",
+                        domain: [0, 1],
+                        anchor: "x2",
+                        tickfont: { color: axisColor, size: 8 },
+                        titlefont: { color: axisColor, size: 9 },
+                        showgrid: false,
+                        automargin: true
+                      } : undefined,
                       showlegend: false
                     }}
                     config={{ displayModeBar: false, responsive: true }}

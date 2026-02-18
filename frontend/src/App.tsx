@@ -1,6 +1,7 @@
 import { BrowserRouter, NavLink, Route, Routes, Navigate } from "react-router-dom";
 import Login from "./pages/Login";
 import PortfolioDashboard from "./pages/PortfolioDashboard";
+import LongTerm from "./pages/LongTerm";
 import Equities from "./pages/Equities";
 import RiskBuckets from "./pages/RiskBuckets";
 import RiskBucketsPortfolio from "./pages/RiskBucketsPortfolio";
@@ -25,6 +26,7 @@ import LiveTicker from "./components/LiveTicker";
 const navItems = [
   { label: "Login", to: "/login" },
   { label: "Portfolio", to: "/portfolio" },
+  { label: "Long-Term", to: "/long-term" },
   { label: "Equities", to: "/equities" },
   { label: "Spot Analysis", to: "/spot-analysis" },
   { label: "Risk Buckets", to: "/risk-buckets" },
@@ -68,6 +70,7 @@ export default function App() {
                       <Route path="/" element={<Login />} />
                       <Route path="/login" element={<Login />} />
                       <Route path="/portfolio" element={<PortfolioDashboard />} />
+                      <Route path="/long-term" element={<LongTerm />} />
                       <Route path="/equities" element={<Equities />} />
                       <Route path="/spot-analysis" element={<RiskBucketsSpotAnalysis />} />
                       <Route path="/risk-buckets" element={<RiskBuckets />}>

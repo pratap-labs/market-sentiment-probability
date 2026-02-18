@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import requests
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse
@@ -38,6 +39,7 @@ from views.tabs.overview_tab import (
 from views.tabs import risk_analysis_tab as ra_tab
 from views.tabs import stress_testing_tab as st_tab
 from views.tabs import trade_selector_tab as ts_tab
+
 from views.tabs import historical_performance_tab as hp_tab
 from views.tabs.risk_buckets_tab import (
     SimulationConfig,
@@ -68,6 +70,9 @@ CACHE_DIR = ROOT / "database" / "derivatives_cache"
 KITE_CREDS_FILE = CACHE_DIR / "kite_credentials.json"
 POSITIONS_CACHE_FILE = CACHE_DIR / "positions_cache.json"
 EQUITIES_CACHE_FILE = CACHE_DIR / "equities_holdings.json"
+INDIANAPI_CACHE_FILE = ROOT / "data" / "indianapi_stock_cache.json"
+EQUITY_HISTORY_CACHE_DIR = CACHE_DIR / "equity_history_cache"
+LONG_TERM_UNIVERSE_FILE = ROOT / "data" / "long_term_universe.json"
 MANUAL_BUCKET_FILE = ROOT / "database" / "manual_bucket_overrides.json"
 RISK_BUCKET_SETTINGS_FILE = ROOT / "database" / "risk_bucket_settings.json"
 FRONTEND_DIST = ROOT / "frontend" / "dist"
@@ -389,6 +394,295 @@ def _save_equities_cache(holdings: List[Dict[str, Any]]) -> None:
         return
 
 
+def _equity_history_cache_path(symbol: str) -> Path:
+    safe = "".join(c for c in symbol if c.isalnum() or c in ("_", "-")).strip("-_")
+    return EQUITY_HISTORY_CACHE_DIR / f"{safe}.csv"
+
+
+def _load_equity_history_cache(symbol: str, max_age_hours: int = 24) -> pd.DataFrame:
+    path = _equity_history_cache_path(symbol)
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+        if datetime.now(timezone.utc) - mtime > timedelta(hours=max_age_hours):
+            return pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _save_equity_history_cache(symbol: str, df: pd.DataFrame) -> None:
+    try:
+        EQUITY_HISTORY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        df.to_csv(_equity_history_cache_path(symbol), index=False)
+    except Exception:
+        return
+
+
+def _load_indianapi_cache(max_age_days: int = 30) -> Dict[str, Dict[str, Any]]:
+    if not INDIANAPI_CACHE_FILE.exists():
+        return {}
+    try:
+        import json
+
+        payload = json.loads(INDIANAPI_CACHE_FILE.read_text())
+        data = payload.get("data", {}) or {}
+        # Support both legacy {symbol: payload} and new {symbol: {saved_at, payload}} formats.
+        cleaned: Dict[str, Dict[str, Any]] = {}
+        now = datetime.now(timezone.utc)
+        for sym, entry in data.items():
+            if isinstance(entry, dict) and "payload" in entry and "saved_at" in entry:
+                try:
+                    ts = datetime.fromisoformat(str(entry.get("saved_at")))
+                    if now - ts > timedelta(days=max_age_days):
+                        continue
+                except Exception:
+                    continue
+                cleaned[str(sym).upper()] = entry.get("payload", {}) or {}
+            elif isinstance(entry, dict):
+                # Legacy entry without per-symbol timestamp; accept but treat as stale if file is old.
+                cleaned[str(sym).upper()] = entry
+        return cleaned
+    except Exception:
+        return {}
+
+
+def _save_indianapi_cache(cache: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        import json
+
+        payload = {"saved_at": datetime.now(timezone.utc).isoformat(), "data": cache}
+        INDIANAPI_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        INDIANAPI_CACHE_FILE.write_text(json.dumps(payload))
+    except Exception:
+        return
+
+
+def _indianapi_headers(debug: bool = False) -> Dict[str, str]:
+    token = os.getenv("INDIANAPI_KEY") or os.getenv("INDIAN_API_KEY") or os.getenv("INDIANAPI_TOKEN")
+    headers = {"accept": "application/json"}
+    if token:
+        headers["X-Api-Key"] = token
+    if debug:
+        masked = None
+        if token:
+            masked = f"{token[:4]}...{token[-4:]}" if len(token) > 8 else "***"
+        headers["X-Debug-Api-Key"] = masked or "MISSING"
+    return headers
+
+
+def _indianapi_base_url() -> str:
+    return os.getenv("INDIANAPI_BASE_URL", "https://stock.indianapi.in").rstrip("/")
+
+
+def _indianapi_get(path: str, params: Optional[Dict[str, Any]] = None, debug: bool = False) -> Dict[str, Any]:
+    url = f"{_indianapi_base_url()}/{path.lstrip('/')}"
+    try:
+        resp = requests.get(url, params=params or {}, headers=_indianapi_headers(debug=debug), timeout=20)
+        if resp.status_code >= 400:
+            return {"error": f"HTTP {resp.status_code}", "detail": resp.text}
+        return resp.json() if resp.content else {}
+    except Exception as exc:
+        return {"error": "request_failed", "detail": str(exc)}
+
+
+def _load_long_term_universe() -> Dict[str, List[str]]:
+    if not LONG_TERM_UNIVERSE_FILE.exists():
+        return {"nifty100": [], "midcap150": []}
+    try:
+        import json
+
+        payload = json.loads(LONG_TERM_UNIVERSE_FILE.read_text())
+        if isinstance(payload, dict):
+            return {
+                "nifty100": [str(x) for x in payload.get("nifty100", [])],
+                "midcap150": [str(x) for x in payload.get("midcap150", [])],
+            }
+    except Exception:
+        return {"nifty100": [], "midcap150": []}
+    return {"nifty100": [], "midcap150": []}
+
+
+def _json_safe(val: Any) -> Any:
+    if isinstance(val, (np.integer,)):
+        return int(val)
+    if isinstance(val, (np.floating,)):
+        return float(val)
+    if isinstance(val, (np.ndarray,)):
+        return val.tolist()
+    if isinstance(val, (pd.Timestamp, datetime, date)):
+        try:
+            return val.isoformat()
+        except Exception:
+            return str(val)
+    return val
+
+
+def _get_nested(d: Dict[str, Any], path: str) -> Any:
+    cur: Any = d
+    for part in path.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur.get(part)
+    return cur
+
+
+def _pick_first_num(d: Dict[str, Any], paths: List[str]) -> Optional[float]:
+    for p in paths:
+        val = _get_nested(d, p)
+        try:
+            num = float(val)
+            if math.isfinite(num):
+                return num
+        except Exception:
+            continue
+    return None
+
+
+def _normalize_key(s: str) -> str:
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
+def _pick_from_keymetrics(vendor: Dict[str, Any], keywords: List[str]) -> Optional[float]:
+    km = vendor.get("keyMetrics")
+    if not isinstance(km, dict):
+        return None
+    target = [_normalize_key(k) for k in keywords]
+    for _, items in km.items():
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            key = it.get("key")
+            if not isinstance(key, str):
+                continue
+            norm = _normalize_key(key)
+            if all(k in norm for k in target):
+                try:
+                    num = float(it.get("value"))
+                    if math.isfinite(num):
+                        return num
+                except Exception:
+                    continue
+    return None
+
+
+def _format_inr_scale(value: Optional[float]) -> Optional[float]:
+    if value is None or not math.isfinite(value):
+        return None
+    return value / 1e7
+
+
+def _pick_from_keymetrics_exact(vendor: Dict[str, Any], allowed: List[str], categories: Optional[List[str]] = None) -> Optional[float]:
+    km = vendor.get("keyMetrics")
+    if not isinstance(km, dict):
+        return None
+    allowed_norm = set(_normalize_key(a) for a in allowed)
+    for cat, items in km.items():
+        if categories and cat not in categories:
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            key = it.get("key")
+            if not isinstance(key, str):
+                continue
+            if _normalize_key(key) in allowed_norm:
+                try:
+                    num = float(it.get("value"))
+                    if math.isfinite(num):
+                        return num
+                except Exception:
+                    continue
+    return None
+
+
+def _pick_from_keymetrics_contains(vendor: Dict[str, Any], keywords: List[str], categories: Optional[List[str]] = None) -> Optional[float]:
+    km = vendor.get("keyMetrics")
+    if not isinstance(km, dict):
+        return None
+    target = [_normalize_key(k) for k in keywords]
+    for cat, items in km.items():
+        if categories and cat not in categories:
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            key = it.get("key")
+            if not isinstance(key, str):
+                continue
+            norm = _normalize_key(key)
+            if all(k in norm for k in target):
+                try:
+                    num = float(it.get("value"))
+                    if math.isfinite(num):
+                        return num
+                except Exception:
+                    continue
+    return None
+
+
+def _pick_keymetrics_key(vendor: Dict[str, Any], target_key: str, categories: Optional[List[str]] = None) -> Optional[float]:
+    km = vendor.get("keyMetrics")
+    if not isinstance(km, dict):
+        return None
+    target = _normalize_key(target_key)
+    for cat, items in km.items():
+        if categories and cat not in categories:
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            key = it.get("key")
+            if not isinstance(key, str):
+                continue
+            if _normalize_key(key) == target:
+                try:
+                    num = float(it.get("value"))
+                    if math.isfinite(num):
+                        return num
+                except Exception:
+                    return None
+    return None
+
+
+def _pick_keymetrics_display(vendor: Dict[str, Any], target_display: str, categories: Optional[List[str]] = None) -> Optional[float]:
+    km = vendor.get("keyMetrics")
+    if not isinstance(km, dict):
+        return None
+    target = _normalize_key(target_display)
+    for cat, items in km.items():
+        if categories and cat not in categories:
+            continue
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            disp = it.get("displayName")
+            if not isinstance(disp, str):
+                continue
+            if _normalize_key(disp) == target:
+                try:
+                    num = float(it.get("value"))
+                    if math.isfinite(num):
+                        return num
+                except Exception:
+                    return None
+    return None
+
+
 def _load_manual_bucket_overrides() -> Dict[str, str]:
     if not MANUAL_BUCKET_FILE.exists():
         return {}
@@ -506,6 +800,23 @@ def _fetch_equity_history(
         return pd.DataFrame(data or [])
     except Exception:
         return pd.DataFrame()
+
+
+def _fetch_equity_history_cached(
+    kite: KiteConnect,
+    symbol: str,
+    instrument_token: int,
+    from_date: datetime,
+    to_date: datetime,
+    max_age_hours: int = 24,
+) -> pd.DataFrame:
+    cached = _load_equity_history_cache(symbol, max_age_hours=max_age_hours)
+    if not cached.empty:
+        return cached
+    df = _fetch_equity_history(kite, instrument_token, from_date, to_date)
+    if not df.empty:
+        _save_equity_history_cache(symbol, df)
+    return df
 
 
 def _compute_drawdown_from_peak(
@@ -771,7 +1082,10 @@ def nifty_ohlcv(limit: int = 500):
     df = _load_cache("nifty_ohlcv")
     if df.empty:
         raise HTTPException(status_code=404, detail="NIFTY OHLCV cache missing")
-    rows = df.tail(limit).to_dict(orient="records")
+    if limit is None or int(limit) <= 0:
+        rows = df.to_dict(orient="records")
+    else:
+        rows = df.tail(int(limit)).to_dict(orient="records")
     summary = {
         "latest_close": float(df["close"].iloc[-1]) if "close" in df.columns else None,
         "high_2y": float(df["high"].max()) if "high" in df.columns else None,
@@ -1212,6 +1526,35 @@ def equities_holdings(request: Request):
     return {"holdings": holdings}
 
 
+@app.get("/equities/enriched")
+def equities_enriched(
+    request: Request,
+    use_cache: bool = True,
+):
+    creds = _get_credentials(request)
+    kite = _get_kite_client(creds.api_key, creds.access_token)
+    holdings = _fetch_holdings_with_cache(kite, use_cache=use_cache)
+    equities = [p for p in holdings if _is_equity_cash(p)] if holdings else []
+    cache = _load_indianapi_cache(max_age_days=30) if use_cache else {}
+
+    enriched_rows: List[Dict[str, Any]] = []
+    updated = False
+    for pos in equities:
+        symbol = pos.get("tradingsymbol") or pos.get("symbol") or pos.get("instrument") or "—"
+        key = str(symbol).upper()
+        vendor = cache.get(key)
+        if not vendor:
+            vendor = _indianapi_get("/stock", {"name": symbol})
+            cache[key] = vendor
+            updated = True
+        enriched_rows.append({**pos, "vendor": vendor})
+
+    if updated and use_cache:
+        _save_indianapi_cache(cache)
+
+    return {"rows": enriched_rows}
+
+
 @app.get("/equities/summary")
 def equities_summary(
     request: Request,
@@ -1404,6 +1747,696 @@ def equities_summary(
             "top5_stress_pct": top5_stress_pct,
         },
         "rows": df.to_dict(orient="records"),
+    }
+
+
+@app.get("/equities/simulate")
+def equities_simulate(
+    request: Request,
+    lookback_days: int = 504,
+    horizon_days: int = 30,
+    n_paths: int = 2000,
+    use_cache: bool = True,
+):
+    creds = _get_credentials(request)
+    kite = _get_kite_client(creds.api_key, creds.access_token)
+    holdings = _fetch_holdings_with_cache(kite, use_cache=use_cache)
+    equities = [p for p in holdings if _is_equity_cash(p)] if holdings else []
+    if not equities:
+        return {"status": "no_equities", "kpis": {}, "paths_sample": []}
+
+    to_date = datetime.now().date()
+    from_date = to_date - timedelta(days=max(lookback_days, 30))
+    histories: List[Dict[str, Any]] = []
+    total_value = 0.0
+
+    for pos in equities:
+        symbol = pos.get("tradingsymbol") or pos.get("symbol") or pos.get("instrument") or "—"
+        token = pos.get("instrument_token")
+        qty = float(pos.get("quantity") or pos.get("qty") or 0.0)
+        ltp = float(pos.get("last_price") or pos.get("ltp") or pos.get("mark_price") or 0.0)
+        if not token or qty == 0 or ltp <= 0:
+            continue
+        df = _fetch_equity_history_cached(kite, str(symbol), int(token), from_date, to_date)
+        if df.empty or "close" not in df.columns:
+            continue
+        close = pd.to_numeric(df["close"], errors="coerce").dropna()
+        if close.size < 60:
+            continue
+        rets = np.log(close / close.shift(1)).dropna().to_numpy(dtype=float)
+        if rets.size < 40:
+            continue
+        current_value = ltp * qty
+        total_value += current_value
+        histories.append(
+            {
+                "symbol": symbol,
+                "returns": rets,
+                "current_value": current_value,
+            }
+        )
+
+    if not histories or total_value <= 0:
+        return {"status": "insufficient_history", "kpis": {}, "paths_sample": []}
+
+    horizon = max(1, min(int(horizon_days), 252))
+    paths = max(200, min(int(n_paths), 20000))
+    port_terms = np.zeros(paths, dtype=float)
+
+    rng = np.random.default_rng(42)
+    for h in histories:
+        rets = h["returns"]
+        curr = float(h["current_value"])
+        idx = rng.integers(0, rets.size, size=(paths, horizon))
+        sampled = rets[idx]
+        term_ret = np.exp(np.sum(sampled, axis=1)) - 1.0
+        port_terms += curr * term_ret
+
+    term = port_terms
+    sorted_term = np.sort(term)
+    var99 = float(np.percentile(term, 1))
+    var95 = float(np.percentile(term, 5))
+    es99 = float(np.mean(sorted_term[: max(1, int(0.01 * sorted_term.size))]))
+    mean = float(np.mean(term))
+    median = float(np.median(term))
+    prob_loss = float(np.mean(term < 0))
+
+    if term.size > 3000:
+        pick = np.linspace(0, term.size - 1, 3000, dtype=int)
+        sample = term[pick]
+    else:
+        sample = term
+
+    return {
+        "status": "ok",
+        "config": {
+            "lookback_days": int(lookback_days),
+            "horizon_days": int(horizon),
+            "n_paths": int(paths),
+        },
+        "kpis": {
+            "mean": mean,
+            "median": median,
+            "var95": var95,
+            "var99": var99,
+            "es99": es99,
+            "prob_loss": prob_loss,
+            "portfolio_value": float(total_value),
+        },
+        "paths_sample": sample.astype(float).tolist(),
+    }
+
+
+@app.get("/long-term/instruments")
+def long_term_instruments(
+    request: Request,
+    limit: int = 250,
+    instrument_type: Optional[str] = None,
+    exchange: Optional[str] = None,
+):
+    creds = _get_credentials(request)
+    kite = _get_kite_client(creds.api_key, creds.access_token)
+    try:
+        instruments = kite.instruments() or []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch instruments: {exc}")
+    if instrument_type:
+        itype = instrument_type.upper()
+        instruments = [i for i in instruments if str(i.get("instrument_type", "")).upper() == itype]
+    if exchange:
+        exch = exchange.upper()
+        instruments = [i for i in instruments if str(i.get("exchange", "")).upper() == exch]
+    limit = max(1, min(int(limit), 1000))
+    rows = instruments[:limit]
+    return {"rows": rows, "count": len(instruments), "shown": len(rows)}
+
+
+@app.get("/long-term/universe-match")
+def long_term_universe_match(request: Request):
+    creds = _get_credentials(request)
+    kite = _get_kite_client(creds.api_key, creds.access_token)
+    universe = _load_long_term_universe()
+    try:
+        instruments = kite.instruments() or []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch instruments: {exc}")
+
+    inst_by_symbol = {}
+    for inst in instruments:
+        sym = str(inst.get("tradingsymbol") or "").upper()
+        if sym and sym not in inst_by_symbol:
+            inst_by_symbol[sym] = inst
+
+    def _match(group: List[str]) -> Dict[str, Any]:
+        matched = []
+        missing = []
+        for sym in group:
+            key = str(sym).upper()
+            inst = inst_by_symbol.get(key)
+            if inst:
+                matched.append(inst)
+            else:
+                missing.append(sym)
+        return {"matched": matched, "missing": missing}
+
+    nifty = _match(universe.get("nifty100", []))
+    mid = _match(universe.get("midcap150", []))
+
+    return {
+        "nifty100": {
+            "matched": nifty["matched"],
+            "missing": nifty["missing"],
+            "count": len(nifty["matched"]),
+        },
+        "midcap150": {
+            "matched": mid["matched"],
+            "missing": mid["missing"],
+            "count": len(mid["matched"]),
+        },
+    }
+
+
+@app.get("/long-term/ohlcv")
+def long_term_ohlcv(
+    request: Request,
+    days: int = 30,
+    limit: int = 250,
+    use_cache: bool = True,
+):
+    creds = _get_credentials(request)
+    kite = _get_kite_client(creds.api_key, creds.access_token)
+    universe = _load_long_term_universe()
+    try:
+        instruments = kite.instruments() or []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch instruments: {exc}")
+
+    inst_by_symbol = {}
+    for inst in instruments:
+        sym = str(inst.get("tradingsymbol") or "").upper()
+        if sym and sym not in inst_by_symbol:
+            inst_by_symbol[sym] = inst
+
+    symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
+    to_date = datetime.now().date()
+    from_date = to_date - timedelta(days=max(7, int(days)))
+
+    rows: List[Dict[str, Any]] = []
+    for sym in symbols:
+        inst = inst_by_symbol.get(sym)
+        if not inst:
+            continue
+        token = inst.get("instrument_token")
+        if not token:
+            continue
+        df = _fetch_equity_history_cached(kite, sym, int(token), from_date, to_date) if use_cache else _fetch_equity_history(kite, int(token), from_date, to_date)
+        if df.empty:
+            continue
+        df = df.copy()
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date")
+        for _, r in df.tail(max(1, int(days))).iterrows():
+            rows.append(
+                {
+                    "symbol": sym,
+                    "date": _json_safe(r.get("date")),
+                    "open": _json_safe(r.get("open")),
+                    "high": _json_safe(r.get("high")),
+                    "low": _json_safe(r.get("low")),
+                    "close": _json_safe(r.get("close")),
+                    "volume": _json_safe(r.get("volume")),
+                }
+            )
+
+    rows = sorted(rows, key=lambda x: (str(x.get("symbol")), str(x.get("date"))))
+    if limit:
+        rows = rows[: max(1, min(int(limit), 2000))]
+    return {"rows": rows, "count": len(rows)}
+
+
+@app.get("/long-term/ohlcv-latest")
+def long_term_ohlcv_latest(
+    request: Request,
+    days: int = 30,
+    limit: int = 250,
+    use_cache: bool = True,
+):
+    creds = _get_credentials(request)
+    kite = _get_kite_client(creds.api_key, creds.access_token)
+    universe = _load_long_term_universe()
+    try:
+        instruments = kite.instruments() or []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch instruments: {exc}")
+
+    inst_by_symbol = {}
+    for inst in instruments:
+        sym = str(inst.get("tradingsymbol") or "").upper()
+        if sym and sym not in inst_by_symbol:
+            inst_by_symbol[sym] = inst
+
+    symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
+    to_date = datetime.now().date()
+    from_date = to_date - timedelta(days=max(7, int(days)))
+
+    rows: List[Dict[str, Any]] = []
+    for sym in symbols:
+        inst = inst_by_symbol.get(sym)
+        if not inst:
+            continue
+        token = inst.get("instrument_token")
+        if not token:
+            continue
+        df = _fetch_equity_history_cached(kite, sym, int(token), from_date, to_date) if use_cache else _fetch_equity_history(kite, int(token), from_date, to_date)
+        if df.empty:
+            continue
+        df = df.copy()
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date")
+        last = df.tail(1)
+        if last.empty:
+            continue
+        r = last.iloc[0]
+        rows.append(
+            {
+                "symbol": sym,
+                "date": _json_safe(r.get("date")),
+                "open": _json_safe(r.get("open")),
+                "high": _json_safe(r.get("high")),
+                "low": _json_safe(r.get("low")),
+                "close": _json_safe(r.get("close")),
+                "volume": _json_safe(r.get("volume")),
+            }
+        )
+
+    rows = sorted(rows, key=lambda x: (-(float(x.get("volume") or 0.0)), str(x.get("symbol"))))
+    if limit:
+        rows = rows[: max(1, min(int(limit), 2000))]
+    return {"rows": rows, "count": len(rows)}
+
+
+@app.get("/long-term/fundamentals")
+def long_term_fundamentals(request: Request, symbol: Optional[str] = None):
+    _get_credentials(request)
+    universe = _load_long_term_universe()
+    raw_cache = _load_indianapi_cache(max_age_days=3650)
+    cache: Dict[str, Dict[str, Any]] = {}
+    # Store with per-symbol timestamps.
+    for k, v in raw_cache.items():
+        cache[k] = {"saved_at": datetime.now(timezone.utc).isoformat(), "payload": v}
+
+    if symbol:
+        symbols = [str(symbol).upper()]
+    else:
+        symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
+    rows: List[Dict[str, Any]] = []
+    for sym in symbols:
+        vendor = (cache.get(sym) or {}).get("payload") or {}
+        logger.info("[INDIANAPI] cache-only symbol=%s hit=%s", sym, bool(vendor))
+        industry = (
+            _get_nested(vendor, "industry")
+            or _get_nested(vendor, "companyProfile.mgIndustry")
+            or _get_nested(vendor, "sector")
+            or _get_nested(vendor, "companyProfile.industry")
+        )
+        company = (
+            vendor.get("companyName")
+            or _get_nested(vendor, "companyProfile.companyName")
+            or _get_nested(vendor, "companyProfile.company_name")
+        )
+        market_cap = _pick_first_num(
+            vendor,
+            [
+                "stockDetailsReusableData.marketCap",
+                "stockDetailsReusableData.market_cap",
+                "keyMetrics.marketCap",
+                "marketCap",
+                "companyProfile.marketCap",
+                "companyProfile.market_cap",
+            ],
+        )
+        if market_cap is None:
+            market_cap = _pick_from_keymetrics_contains(vendor, ["market", "cap"])
+        eps = _pick_first_num(vendor, ["keyMetrics.eps", "eps", "financials.eps", "earnings.eps"])
+        if eps is None:
+            eps = _pick_from_keymetrics_contains(vendor, ["earnings", "per", "share"], categories=["persharedata"])
+        pe = _pick_first_num(
+            vendor,
+            [
+                "stockDetailsReusableData.pPerEBasicExcludingExtraordinaryItemsTTM",
+                "stockDetailsReusableData.priceToEarningsValueRatio",
+                "keyMetrics.pe",
+                "pe",
+                "peRatio",
+                "valuation.pe",
+            ],
+        )
+        if pe is None:
+            pe = _pick_from_keymetrics_contains(vendor, ["price", "earnings"], categories=["valuation"])
+        roe = _pick_first_num(vendor, ["keyMetrics.roe", "roe"])
+        if roe is None:
+            roe = _pick_from_keymetrics_contains(vendor, ["return", "on", "equity"], categories=["mgmtEffectiveness"])
+        roce = _pick_first_num(vendor, ["keyMetrics.roce", "roce"])
+        if roce is None:
+            roce = _pick_from_keymetrics_contains(vendor, ["return", "on", "capital"], categories=["mgmtEffectiveness"])
+        revenue = _pick_first_num(
+            vendor,
+            [
+                "stockDetailsReusableData.totalRevenue",
+                "financials.revenue",
+                "incomeStatement.revenue",
+            ],
+        )
+        if revenue is None:
+            revenue = _pick_from_keymetrics_contains(vendor, ["revenue"], categories=["incomeStatement"])
+        net_income = _pick_first_num(
+            vendor,
+            [
+                "stockDetailsReusableData.NetIncome",
+                "financials.netIncome",
+                "incomeStatement.netIncome",
+            ],
+        )
+        if net_income is None:
+            net_income = _pick_from_keymetrics_contains(vendor, ["net", "income"], categories=["incomeStatement"])
+        rows.append(
+            {
+                "symbol": sym,
+                "company": company,
+                "industry": industry,
+                "market_cap": _json_safe(market_cap),
+                "eps": _json_safe(eps),
+                "pe": _json_safe(pe),
+                "roe": _json_safe(roe),
+                "roce": _json_safe(roce),
+                "revenue": _json_safe(revenue),
+                "net_income": _json_safe(net_income),
+                "revenue_fmt": _format_inr_scale(revenue),
+                "net_income_fmt": _format_inr_scale(net_income),
+                "market_cap_fmt": _format_inr_scale(market_cap),
+                "DilutedNormalizedEPS": _pick_keymetrics_key(vendor, "DilutedNormalizedEPS"),
+                "DilutedEPSExcludingExtraOrdItems": _pick_keymetrics_key(vendor, "DilutedEPSExcludingExtraOrdItems"),
+                "NetIncome": _pick_keymetrics_key(vendor, "NetIncome"),
+                "TotalRevenue": _pick_keymetrics_key(vendor, "TotalRevenue"),
+                "OperatingIncome": _pick_keymetrics_key(vendor, "OperatingIncome"),
+                "ePSChangePercentTTMOverTTM": _pick_keymetrics_key(vendor, "ePSChangePercentTTMOverTTM"),
+                "revenueChangePercentTTMPOverTTM": _pick_keymetrics_key(vendor, "revenueChangePercentTTMPOverTTM"),
+                "ePSGrowthRate5Year": _pick_keymetrics_key(vendor, "ePSGrowthRate5Year"),
+                "returnOnAverageEquityMostRecentFiscalYear": _pick_keymetrics_key(vendor, "returnOnAverageEquityMostRecentFiscalYear"),
+                "returnOnInvestmentMostRecentFiscalYear": _pick_keymetrics_key(vendor, "returnOnInvestmentMostRecentFiscalYear"),
+                "operatingMarginTrailing12Month": _pick_keymetrics_key(vendor, "operatingMarginTrailing12Month"),
+                "netProfitMarginPercentTrailing12Month": _pick_keymetrics_key(vendor, "netProfitMarginPercentTrailing12Month"),
+                "TotalDebt": _pick_keymetrics_key(vendor, "TotalDebt"),
+                "TotalEquity": _pick_keymetrics_key(vendor, "TotalEquity"),
+                "ltDebtPerEquityMostRecentFiscalYear": _pick_keymetrics_key(vendor, "ltDebtPerEquityMostRecentFiscalYear"),
+                "netInterestCoverageMostRecentFiscalYear": _pick_keymetrics_key(vendor, "netInterestCoverageMostRecentFiscalYear"),
+                "CashfromOperatingActivities": _pick_keymetrics_key(vendor, "CashfromOperatingActivities"),
+                "freeCashFlowMostRecentFiscalYear": _pick_keymetrics_key(vendor, "freeCashFlowMostRecentFiscalYear"),
+                "pPerEBasicExcludingExtraordinaryItemsTTM": _pick_keymetrics_key(vendor, "pPerEBasicExcludingExtraordinaryItemsTTM"),
+                "pegRatio": _pick_keymetrics_key(vendor, "pegRatio"),
+                "priceToSalesTrailing12Month": _pick_keymetrics_key(vendor, "priceToSalesTrailing12Month"),
+                "priceToBookMostRecentFiscalYear": _pick_keymetrics_key(vendor, "priceToBookMostRecentFiscalYear"),
+            }
+        )
+
+    return {"rows": rows, "count": len(rows)}
+
+
+
+
+@app.get("/long-term/keymetrics")
+def long_term_keymetrics(request: Request, symbol: Optional[str] = None):
+    _get_credentials(request)
+    universe = _load_long_term_universe()
+    raw_cache = _load_indianapi_cache(max_age_days=3650)
+    cache: Dict[str, Dict[str, Any]] = {}
+    for k, v in raw_cache.items():
+        cache[k] = {"saved_at": datetime.now(timezone.utc).isoformat(), "payload": v}
+
+    if symbol:
+        symbols = [str(symbol).upper()]
+    else:
+        symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
+
+    rows: List[Dict[str, Any]] = []
+    for sym in symbols:
+        vendor = (cache.get(sym) or {}).get("payload") or {}
+        km = vendor.get("keyMetrics") if isinstance(vendor, dict) else None
+        if not isinstance(km, dict):
+            continue
+        for category, items in km.items():
+            if not isinstance(items, list):
+                continue
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                rows.append(
+                    {
+                        "symbol": sym,
+                        "category": category,
+                        "displayName": it.get("displayName"),
+                        "key": it.get("key"),
+                        "value": it.get("value"),
+                    }
+                )
+    return {"rows": rows, "count": len(rows)}
+
+
+def _flatten_dict(obj: Any, prefix: str = "") -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            rows.extend(_flatten_dict(v, path))
+    elif isinstance(obj, list):
+        for idx, v in enumerate(obj):
+            path = f"{prefix}[{idx}]"
+            rows.extend(_flatten_dict(v, path))
+    else:
+        rows.append({"path": prefix, "value": obj})
+    return rows
+
+
+@app.get("/long-term/raw-flat")
+def long_term_raw_flat(request: Request, symbol: Optional[str] = None):
+    _get_credentials(request)
+    universe = _load_long_term_universe()
+    raw_cache = _load_indianapi_cache(max_age_days=3650)
+    cache: Dict[str, Dict[str, Any]] = {}
+    for k, v in raw_cache.items():
+        cache[k] = {"saved_at": datetime.now(timezone.utc).isoformat(), "payload": v}
+
+    if symbol:
+        symbols = [str(symbol).upper()]
+    else:
+        symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
+
+    rows: List[Dict[str, Any]] = []
+    for sym in symbols:
+        vendor = (cache.get(sym) or {}).get("payload") or {}
+        flat = _flatten_dict(vendor)
+        for item in flat:
+            rows.append({"symbol": sym, "path": item.get("path"), "value": item.get("value")})
+    return {"rows": rows, "count": len(rows)}
+
+
+@app.get("/long-term/raw-flat-live")
+def long_term_raw_flat_live(request: Request, symbol: str):
+    _get_credentials(request)
+    vendor = _indianapi_get("/stock", {"name": symbol})
+    flat = _flatten_dict(vendor)
+    rows = [{"symbol": symbol, "path": item.get("path"), "value": item.get("value")} for item in flat]
+    return {"rows": rows, "count": len(rows)}
+
+
+@app.get("/long-term/fundamentals-cache")
+def long_term_fundamentals_cache(request: Request, symbol: str):
+    _get_credentials(request)
+    raw_cache = _load_indianapi_cache(max_age_days=3650)
+    entry = raw_cache.get(str(symbol).upper())
+    if not entry:
+        return {"symbol": symbol, "data": None}
+    if isinstance(entry, dict) and "payload" in entry:
+        return {"symbol": symbol, "data": entry.get("payload")}
+    return {"symbol": symbol, "data": entry}
+
+
+@app.post("/long-term/fundamentals-refresh")
+def long_term_fundamentals_refresh(request: Request, symbol: str):
+    _get_credentials(request)
+    name = symbol
+    if symbol.upper() == "RELIANCE":
+        name = "Reliance"
+    vendor = _indianapi_get("/stock", {"name": name})
+    if vendor and isinstance(vendor, dict) and (
+        "keyMetrics" in vendor or "financials" in vendor or "companyProfile" in vendor
+    ):
+        cache = _load_indianapi_cache(max_age_days=3650)
+        cache[str(symbol).upper()] = {
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "payload": vendor,
+        }
+        _save_indianapi_cache(cache)
+        return {"symbol": symbol, "status": "updated", "data": vendor}
+    return {"symbol": symbol, "status": "no_data", "data": vendor}
+
+
+@app.get("/long-term/indianapi-debug")
+def long_term_indianapi_debug(name: str = "Reliance"):
+    url = f"{_indianapi_base_url()}/stock"
+    headers = _indianapi_headers(debug=True)
+    params = {"name": name}
+    try:
+        resp = requests.get(url, params=params, headers=_indianapi_headers(), timeout=20)
+        text = resp.text
+        if len(text) > 1000:
+            text = text[:1000] + "..."
+        return {
+            "url": url,
+            "params": params,
+            "debug_header": headers.get("X-Debug-Api-Key"),
+            "status_code": resp.status_code,
+            "response": text,
+        }
+    except Exception as exc:
+        return {"url": url, "params": params, "debug_header": headers.get("X-Debug-Api-Key"), "error": str(exc)}
+
+
+@app.get("/long-term/fundamentals-reliance")
+def long_term_fundamentals_reliance():
+    url = f"{_indianapi_base_url()}/stock"
+    params = {"name": "Reliance"}
+    try:
+        resp = requests.get(url, params=params, headers=_indianapi_headers(debug=True), timeout=20)
+        text = resp.text
+        data = None
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+        return {
+            "url": url,
+            "params": params,
+            "status_code": resp.status_code,
+            "debug_header": _indianapi_headers(debug=True).get("X-Debug-Api-Key"),
+            "data": data,
+            "response_raw": text[:2000] + "..." if len(text) > 2000 else text,
+        }
+    except Exception as exc:
+        return {
+            "url": url,
+            "params": params,
+            "debug_header": _indianapi_headers(debug=True).get("X-Debug-Api-Key"),
+            "error": str(exc),
+        }
+
+
+@app.get("/equities/optimize")
+def equities_optimize(
+    request: Request,
+    target_return: float = 0.12,
+    lookback_days: int = 756,
+    use_cache: bool = True,
+):
+    creds = _get_credentials(request)
+    kite = _get_kite_client(creds.api_key, creds.access_token)
+    holdings = _fetch_holdings_with_cache(kite, use_cache=use_cache)
+    equities = [p for p in holdings if _is_equity_cash(p)] if holdings else []
+    if not equities:
+        return {"status": "no_equities", "weights": [], "kpis": {}}
+
+    to_date = datetime.now().date()
+    from_date = to_date - timedelta(days=max(lookback_days, 60))
+
+    frames = []
+    symbols = []
+    current_values = []
+    for pos in equities:
+        symbol = pos.get("tradingsymbol") or pos.get("symbol") or pos.get("instrument") or "—"
+        token = pos.get("instrument_token")
+        qty = float(pos.get("quantity") or pos.get("qty") or 0.0)
+        ltp = float(pos.get("last_price") or pos.get("ltp") or pos.get("mark_price") or 0.0)
+        if not token or qty == 0 or ltp <= 0:
+            continue
+        df = _fetch_equity_history_cached(kite, str(symbol), int(token), from_date, to_date)
+        if df.empty or "close" not in df.columns:
+            continue
+        df = df.copy()
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        df = df.sort_values("date")
+        close = pd.to_numeric(df["close"], errors="coerce").dropna()
+        if close.size < 60:
+            continue
+        rets = np.log(close / close.shift(1)).dropna()
+        if rets.size < 40:
+            continue
+        s = pd.DataFrame({"date": df.loc[rets.index, "date"].values, str(symbol): rets.values})
+        frames.append(s)
+        symbols.append(str(symbol))
+        current_values.append(ltp * qty)
+
+    if not frames or len(symbols) < 2:
+        return {"status": "insufficient_history", "weights": [], "kpis": {}}
+
+    merged = frames[0]
+    for f in frames[1:]:
+        merged = pd.merge(merged, f, on="date", how="inner")
+    merged = merged.dropna()
+    if merged.shape[0] < 40:
+        return {"status": "insufficient_overlap", "weights": [], "kpis": {}}
+
+    ret_mat = merged[symbols].to_numpy(dtype=float)
+    mu_daily = np.mean(ret_mat, axis=0)
+    cov_daily = np.cov(ret_mat, rowvar=False)
+    mu = mu_daily * TRADING_DAYS_PER_YEAR
+    cov = cov_daily * TRADING_DAYS_PER_YEAR
+
+    inv = np.linalg.pinv(cov)
+    ones = np.ones(len(symbols))
+    A = float(ones @ inv @ ones)
+    B = float(ones @ inv @ mu)
+    C = float(mu @ inv @ mu)
+    D = A * C - B * B
+    if abs(D) < 1e-12:
+        return {"status": "singular_cov", "weights": [], "kpis": {}}
+
+    R = float(target_return)
+    lam = (C - B * R) / D
+    gam = (A * R - B) / D
+    w = lam * (inv @ ones) + gam * (inv @ mu)
+
+    exp_return = float(mu @ w)
+    exp_vol = float(math.sqrt(max(w @ cov @ w, 0.0)))
+    total_value = float(np.sum(current_values))
+    curr_weights = [
+        (float(val) / total_value * 100.0) if total_value > 0 else 0.0 for val in current_values
+    ]
+
+    weights = [
+        {
+            "symbol": symbols[i],
+            "weight": float(w[i]),
+            "weight_pct": float(w[i] * 100.0),
+            "current_weight_pct": curr_weights[i],
+        }
+        for i in range(len(symbols))
+    ]
+
+    return {
+        "status": "ok",
+        "config": {
+            "target_return": float(target_return),
+            "lookback_days": int(lookback_days),
+        },
+        "kpis": {
+            "expected_return": exp_return,
+            "expected_vol": exp_vol,
+        },
+        "weights": weights,
     }
 
 

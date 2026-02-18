@@ -267,14 +267,6 @@ export default function PreTradeStress() {
     [sortedVirtualLegs]
   );
 
-  const currentVirtualLegs = useMemo(
-    () => sortedVirtualLegs.filter((l) => l.source === "position"),
-    [sortedVirtualLegs]
-  );
-  const newVirtualLegs = useMemo(
-    () => sortedVirtualLegs.filter((l) => l.source === "chain"),
-    [sortedVirtualLegs]
-  );
 
   useEffect(() => {
     if (!virtualLegs.some((l) => l.enabled)) {

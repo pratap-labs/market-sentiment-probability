@@ -1133,6 +1133,168 @@ def _sample_spot_paths(
     }
 
 
+def _all_spot_paths(
+    spot_paths: np.ndarray,
+    max_steps: int = 10,
+) -> Dict[str, Any]:
+    if spot_paths is None or spot_paths.size == 0:
+        return {"days": [], "paths": [], "path_idx": []}
+    total_paths, total_steps = spot_paths.shape
+    step_count = int(min(total_steps, max_steps))
+    if step_count <= 0:
+        return {"days": [], "paths": [], "path_idx": []}
+    if total_steps == step_count:
+        step_idx = np.arange(total_steps, dtype=int)
+    else:
+        step_idx = np.linspace(0, total_steps - 1, step_count, dtype=int)
+    path_idx = np.arange(total_paths, dtype=int)
+    sampled = spot_paths[np.ix_(path_idx, step_idx)]
+    return {
+        "days": (step_idx + 1).astype(int).tolist(),
+        "paths": sampled.astype(float).tolist(),
+        "path_idx": path_idx.astype(int).tolist(),
+    }
+
+
+def _rolling_simple_returns(spot_history: pd.DataFrame, window: int) -> np.ndarray:
+    if spot_history is None or spot_history.empty or "close" not in spot_history.columns:
+        return np.array([], dtype=float)
+    if window <= 0:
+        return np.array([], dtype=float)
+    df = spot_history.copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.sort_values("date")
+    close = pd.to_numeric(df["close"], errors="coerce")
+    close = close.replace([np.inf, -np.inf], np.nan).dropna()
+    if len(close) <= window:
+        return np.array([], dtype=float)
+    rets = (close / close.shift(window) - 1.0).dropna().to_numpy(dtype=float)
+    return rets[np.isfinite(rets)]
+
+
+def _build_return_buckets(returns: np.ndarray, step: float = 0.02) -> np.ndarray:
+    if returns.size == 0 or step <= 0:
+        return np.array([], dtype=float)
+    min_ret = float(np.min(returns))
+    max_ret = float(np.max(returns))
+    min_edge = math.floor(min_ret / step) * step
+    max_edge = math.ceil(max_ret / step) * step
+    if math.isclose(min_edge, max_edge):
+        min_edge -= step
+        max_edge += step
+    edges = np.arange(min_edge, max_edge + step * 1.001, step, dtype=float)
+    if edges.size < 2:
+        edges = np.array([min_edge, max_edge], dtype=float)
+    return edges
+
+
+def _bucket_probs(returns: np.ndarray, edges: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    if returns.size == 0 or edges.size < 2:
+        return np.array([], dtype=float), np.array([], dtype=int)
+    idx = np.digitize(returns, edges, right=False) - 1
+    idx = np.clip(idx, 0, edges.size - 2)
+    counts = np.bincount(idx, minlength=edges.size - 1).astype(int)
+    total = float(np.sum(counts))
+    if total <= 0:
+        return np.zeros(edges.size - 1, dtype=float), counts
+    probs = counts.astype(float) / total
+    return probs, counts
+
+
+def _bucketed_weighted_hist(
+    terminal_pnl: np.ndarray,
+    spot_paths: np.ndarray,
+    spot0: float,
+    bucket_edges: np.ndarray,
+    bucket_probs: np.ndarray,
+    window: int,
+    bins: int = 28,
+) -> Optional[Dict[str, Any]]:
+    debug: Dict[str, Any] = {
+        "window": int(window),
+        "bins": int(bins),
+        "spot0": float(spot0) if np.isfinite(spot0) else None,
+        "spot_paths_shape": tuple(int(x) for x in spot_paths.shape) if isinstance(spot_paths, np.ndarray) else None,
+        "terminal_pnl_size": int(terminal_pnl.size) if isinstance(terminal_pnl, np.ndarray) else None,
+        "bucket_edges_size": int(bucket_edges.size) if isinstance(bucket_edges, np.ndarray) else None,
+        "bucket_probs_size": int(bucket_probs.size) if isinstance(bucket_probs, np.ndarray) else None,
+    }
+    if terminal_pnl.size == 0 or spot_paths.size == 0:
+        return {"debug": {**debug, "status": "empty_paths_or_pnl"}}
+    if bucket_edges.size < 2 or bucket_probs.size == 0:
+        return {"debug": {**debug, "status": "empty_bucket_edges_or_probs"}}
+    if window <= 0 or spot_paths.shape[1] < window:
+        return {"debug": {**debug, "status": "window_mismatch"}}
+    if not np.isfinite(spot0) or spot0 <= 0:
+        return {"debug": {**debug, "status": "invalid_spot0"}}
+    spot_term = spot_paths[:, window - 1]
+    sim_returns = spot_term / spot0 - 1.0
+    mask = np.isfinite(sim_returns) & np.isfinite(terminal_pnl)
+    sim_returns = sim_returns[mask]
+    term = terminal_pnl[mask].astype(float)
+    if sim_returns.size == 0 or term.size == 0:
+        return {"debug": {**debug, "status": "no_finite_rows"}}
+    path_bucket_idx = np.digitize(sim_returns, bucket_edges, right=False) - 1
+    path_bucket_idx = np.clip(path_bucket_idx, 0, bucket_edges.size - 2)
+    bucket_counts = np.bincount(path_bucket_idx, minlength=bucket_edges.size - 1)
+    weights = np.zeros_like(term, dtype=float)
+    for b in range(bucket_probs.size):
+        count = int(bucket_counts[b])
+        if count > 0:
+            weights[path_bucket_idx == b] = float(bucket_probs[b]) / float(count)
+    min_v = float(np.min(term))
+    max_v = float(np.max(term))
+    if math.isclose(min_v, max_v):
+        min_v -= 1.0
+        max_v += 1.0
+    bin_edges = np.linspace(min_v, max_v, bins + 1, dtype=float)
+    hist, _ = np.histogram(term, bins=bin_edges, weights=weights)
+    centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    weighted_total = float(np.sum(weights)) if weights.size else 0.0
+    weighted_mean = float(np.sum(term * weights) / weighted_total) if weighted_total > 0 else float("nan")
+    sort_idx = np.argsort(term)
+    term_sorted = term[sort_idx]
+    w_sorted = weights[sort_idx]
+    w_cum = np.cumsum(w_sorted)
+    def _w_quantile(q: float) -> float:
+        if weighted_total <= 0:
+            return float("nan")
+        target = q * weighted_total
+        idx = int(np.searchsorted(w_cum, target, side="left"))
+        idx = min(max(idx, 0), term_sorted.size - 1)
+        return float(term_sorted[idx])
+    var99 = _w_quantile(0.01)
+    var95 = _w_quantile(0.05)
+    if weighted_total > 0:
+        tail_mask = w_cum <= 0.01 * weighted_total
+        if np.any(tail_mask):
+            es_num = float(np.sum(term_sorted[tail_mask] * w_sorted[tail_mask]))
+            es_den = float(np.sum(w_sorted[tail_mask]))
+            es99 = es_num / es_den if es_den > 0 else var99
+        else:
+            es99 = var99
+    else:
+        es99 = float("nan")
+    return {
+        "bins": centers.astype(float).tolist(),
+        "weights": hist.astype(float).tolist(),
+        "total_weight": float(np.sum(hist)),
+        "bucket_window": int(window),
+        "bucket_edges": bucket_edges.astype(float).tolist(),
+        "bucket_probs": bucket_probs.astype(float).tolist(),
+        "path_bucket_counts": bucket_counts.astype(int).tolist(),
+        "weighted_kpis": {
+            "mean": weighted_mean,
+            "var95": var95,
+            "var99": var99,
+            "es99": float(es99),
+            "total_weight": float(weighted_total),
+        },
+        "debug": {**debug, "status": "ok"},
+    }
+
+
 def _build_overlay_plot_payload(engine_plot_data: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     if not engine_plot_data:
         return {"cdf": [], "tail": [], "tail_xlim": None}
@@ -1263,6 +1425,10 @@ def run_advanced_forward_risk(
         sigma_fallback = 0.20 / math.sqrt(TRADING_DAYS_PER_YEAR)
         returns_hist = rng_master.normal(0.0, sigma_fallback, size=260)
     evt = _fit_evt_left_tail((returns_hist - np.mean(returns_hist)) / max(np.std(returns_hist), 1e-8))
+    bucket_window = int(min(10, max(1, cfg.horizon_days)))
+    hist_rolling = _rolling_simple_returns(spot_history_df, bucket_window)
+    bucket_edges = _build_return_buckets(hist_rolling, step=0.02)
+    bucket_probs, _ = _bucket_probs(hist_rolling, bucket_edges)
     legs = _build_legs(positions, options_df, spot, cfg.risk_free_rate)
     if cfg.debug_logging and cfg.debug_mode_filter in (None, "all"):
         _log_leg_inputs(legs, spot, cfg)
@@ -1302,6 +1468,7 @@ def run_advanced_forward_risk(
         spot_paths = engine_sim["spot_paths"]
         returns_paths = engine_sim["returns_paths"]
         spot_paths_sample = _sample_spot_paths(spot_paths)
+        spot_paths_all = _all_spot_paths(spot_paths, max_steps=10)
         factor_shocks = None
         if cfg.simulate_surface:
             factor_shocks = _simulate_surface_factor_shocks(returns_paths, cfg, rng)
@@ -1336,6 +1503,14 @@ def run_advanced_forward_risk(
                             pnl_repricing_bs = pnl_repricing
                         k = _distribution_kpis(pnl_repricing, cfg.daily_loss_limit, cfg.total_loss_limit)
                         term = pnl_repricing[:, -1]
+                        bucketed_loss_hist = _bucketed_weighted_hist(
+                            term,
+                            spot_paths,
+                            spot,
+                            bucket_edges,
+                            bucket_probs,
+                            bucket_window,
+                        )
                         if (
                             cfg.debug_logging
                             and (cfg.debug_mode_filter in (None, "repricing"))
@@ -1376,6 +1551,7 @@ def run_advanced_forward_risk(
                         mode_results[mode_key] = {
                             "kpis": k,
                             "terminal_pnl_sample": term_sample.astype(float).tolist(),
+                            "bucketed_loss_hist": bucketed_loss_hist,
                             "mode_base": "repricing",
                             "pricing_model": model_name,
                             "iv_rule": iv_rule,
@@ -1386,6 +1562,14 @@ def run_advanced_forward_risk(
                     pnl_by_mode[mode_key] = pnl_greeks
                     k = _distribution_kpis(pnl_greeks, cfg.daily_loss_limit, cfg.total_loss_limit)
                     term = pnl_greeks[:, -1]
+                    bucketed_loss_hist = _bucketed_weighted_hist(
+                        term,
+                        spot_paths,
+                        spot,
+                        bucket_edges,
+                        bucket_probs,
+                        bucket_window,
+                    )
                     if term.size > 3000:
                         pick = np.linspace(0, term.size - 1, 3000, dtype=int)
                         term_sample = term[pick]
@@ -1394,6 +1578,7 @@ def run_advanced_forward_risk(
                     mode_results[mode_key] = {
                         "kpis": k,
                         "terminal_pnl_sample": term_sample.astype(float).tolist(),
+                        "bucketed_loss_hist": bucketed_loss_hist,
                         "mode_base": "greeks",
                         "pricing_model": "bs",
                         "iv_rule": iv_rule,
@@ -1423,6 +1608,7 @@ def run_advanced_forward_risk(
             spot_paths_worst = None
             spot_paths_worst_all = None
             spot_paths_worst_dd = None
+            spot_paths_worst_pct1 = None
             if isinstance(pnl_for_worst, np.ndarray) and pnl_for_worst.size:
                 terminal = pnl_for_worst[:, -1]
                 st = spot_paths[:, -1] if spot_paths.shape[1] else np.asarray([], dtype=float)
@@ -1450,6 +1636,15 @@ def run_advanced_forward_risk(
                     terminal_pnl=terminal,
                     pnl_paths=pnl_for_worst,
                 )
+                pct1_count = int(max(1, math.ceil(0.01 * terminal.size)))
+                pct1_idx = np.argsort(terminal)[:pct1_count]
+                spot_paths_worst_pct1 = _sample_spot_paths(
+                    spot_paths,
+                    max_steps=10,
+                    path_idx=pct1_idx,
+                    terminal_pnl=terminal,
+                    pnl_paths=pnl_for_worst,
+                )
                 # Worst by max drawdown across the full path
                 curve = np.concatenate([np.zeros((pnl_for_worst.shape[0], 1), dtype=float), pnl_for_worst], axis=1)
                 run_max = np.maximum.accumulate(curve, axis=1)
@@ -1471,9 +1666,11 @@ def run_advanced_forward_risk(
                 "fit_kpis": fit_block,
                 "modes": mode_results,
                 "spot_paths_sample": spot_paths_sample,
+                "spot_paths_all": spot_paths_all,
                 "spot_paths_worst": spot_paths_worst,
                 "spot_paths_worst_all": spot_paths_worst_all,
                 "spot_paths_worst_dd": spot_paths_worst_dd,
+                "spot_paths_worst_pct1": spot_paths_worst_pct1,
                 "spot_paths_worst_mode": overlay_key,
             }
 
@@ -1546,7 +1743,7 @@ def run_advanced_forward_risk(
     return {
         "model_version": ADV_MC_VERSION,
         "status": "ok",
-        "config": cfg.__dict__,
+        "config": {**cfg.__dict__, "spot0": float(spot)},
         "surface_model": {
             "name": "svi_style_factorized_quadratic_proxy",
             "base_factors": {
