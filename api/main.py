@@ -17,6 +17,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 import requests
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
@@ -71,7 +75,6 @@ try:
 except Exception:
     KiteConnect = None
 
-ROOT = Path(__file__).resolve().parents[1]
 CACHE_DIR = ROOT / "database" / "derivatives_cache"
 KITE_CREDS_FILE = CACHE_DIR / "kite_credentials.json"
 POSITIONS_CACHE_FILE = CACHE_DIR / "positions_cache.json"
