@@ -84,7 +84,7 @@ EQUITY_HISTORY_CACHE_DIR = CACHE_DIR / "equity_history_cache"
 LONG_TERM_UNIVERSE_FILE = ROOT / "data" / "long_term_universe.json"
 MANUAL_BUCKET_FILE = ROOT / "database" / "manual_bucket_overrides.json"
 RISK_BUCKET_SETTINGS_FILE = ROOT / "database" / "risk_bucket_settings.json"
-FRONTEND_DIST = ROOT / "frontend" / "dist"
+FRONTEND_DIST = ROOT / "dist"
 KITE_TOKEN_TTL = timedelta(hours=12)
 DEFAULT_REDIRECT_URL = "http://localhost:8000/auth/callback"
 DEFAULT_FRONTEND_URL = "http://localhost:5173/login?auth=success"
@@ -5161,13 +5161,25 @@ def data_source_refresh(
 
 
 if FRONTEND_DIST.exists():
+    def _frontend_index_response(request: Request) -> HTMLResponse:
+        index_path = FRONTEND_DIST / "index.html"
+        html = index_path.read_text(encoding="utf-8")
+        root_path = str(request.scope.get("root_path") or "").rstrip("/")
+        if root_path:
+            html = html.replace(' src="/', f' src="{root_path}/')
+            html = html.replace(' href="/', f' href="{root_path}/')
+        return HTMLResponse(content=html)
+
     @app.get("/")
-    def frontend_index():
-        return FileResponse(FRONTEND_DIST / "index.html")
+    def frontend_index(request: Request):
+        return _frontend_index_response(request)
 
     @app.get("/{full_path:path}")
-    def frontend_spa(full_path: str):
+    def frontend_spa(full_path: str, request: Request):
         candidate = FRONTEND_DIST / full_path
         if candidate.is_file():
             return FileResponse(candidate)
-        return FileResponse(FRONTEND_DIST / "index.html")
+        # Do not return HTML for missing static files (prevents MIME mismatch in browsers).
+        if full_path.startswith("assets/") or "." in Path(full_path).name:
+            raise HTTPException(status_code=404, detail="Static asset not found")
+        return _frontend_index_response(request)
