@@ -6,9 +6,12 @@ import re
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -97,11 +100,36 @@ def _parse_symbol_metadata(symbol: str) -> Dict[str, Optional[object]]:
     return payload
 
 
+def _load_monthly_spot_map() -> Dict[pd.Timestamp, float]:
+    """Return month->avg NIFTY spot from local cache; empty map if unavailable."""
+    cache_path = os.path.join(ROOT, "database", "derivatives_cache", "nifty_ohlcv.csv")
+    if not os.path.exists(cache_path):
+        return {}
+    try:
+        spot_df = pd.read_csv(cache_path)
+    except Exception:
+        return {}
+    if "date" not in spot_df.columns or "close" not in spot_df.columns:
+        return {}
+    spot_df = spot_df.copy()
+    spot_df["date"] = pd.to_datetime(spot_df["date"], errors="coerce")
+    spot_df["close"] = pd.to_numeric(spot_df["close"], errors="coerce")
+    spot_df = spot_df.dropna(subset=["date", "close"])
+    if spot_df.empty:
+        return {}
+    spot_df["month"] = spot_df["date"].dt.to_period("M").dt.to_timestamp()
+    monthly = spot_df.groupby("month")["close"].mean().to_dict()
+    return {pd.Timestamp(k): float(v) for k, v in monthly.items()}
+
+
 def _prepare_trades(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     warnings: List[str] = []
     symbol_col = _find_column(df, ["Symbol"])
     realized_col = _find_column(df, ["Realized P&L", "Realized PnL", "Realized"])
     realized_pct_col = _find_column(df, ["Realized P&L Pct.", "Realized P&L Pct", "Realized PnL Pct", "Realized %"])
+    buy_value_col = _find_column(df, ["Buy Value", "BuyValue", "Buy Amount"])
+    sell_value_col = _find_column(df, ["Sell Value", "SellValue", "Sell Amount"])
+    quantity_col = _find_column(df, ["Quantity", "Qty"])
     if not symbol_col:
         warnings.append("Missing Symbol column in the CSV.")
         return pd.DataFrame(), warnings
@@ -116,6 +144,8 @@ def _prepare_trades(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
         df["realized_pnl_pct"] = _to_number(df[realized_pct_col])
     else:
         df["realized_pnl_pct"] = pd.NA
+    df["buy_value"] = _to_number(df[buy_value_col]).fillna(0.0) if buy_value_col else 0.0
+    df["sell_value"] = _to_number(df[sell_value_col]).fillna(0.0) if sell_value_col else 0.0
 
     parsed = df["symbol"].apply(_parse_symbol_metadata)
     df["expiry_date"] = parsed.apply(lambda item: item.get("expiry_date"))
@@ -129,6 +159,64 @@ def _prepare_trades(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     if missing_expiries:
         warnings.append(f"{missing_expiries} rows are missing expiry parsing; filters may exclude them.")
 
+    # Lot size fallback used only when quantity is missing.
+    pivot = pd.Timestamp("2026-01-01")
+    df["assumed_lot_size"] = np.where(
+        df["expiry_date"].notna() & (df["expiry_date"] < pivot),
+        75.0,
+        65.0,
+    )
+    if quantity_col:
+        quantity_abs = _to_number(df[quantity_col]).abs()
+        missing_qty = quantity_abs.isna().sum()
+        if missing_qty:
+            warnings.append(
+                f"{missing_qty} rows missing quantity; applied lot-size assumption (75 before 2026, 65 from 2026)."
+            )
+        df["quantity_abs"] = quantity_abs.fillna(df["assumed_lot_size"])
+    else:
+        warnings.append("Quantity column missing; applied lot-size assumption (75 before 2026, 65 from 2026).")
+        df["quantity_abs"] = df["assumed_lot_size"]
+
+    monthly_spot_map = _load_monthly_spot_map()
+    if monthly_spot_map:
+        df["month"] = df["expiry_date"].dt.to_period("M").dt.to_timestamp()
+        df["spot_proxy"] = df["month"].map(monthly_spot_map)
+        missing_spot = df["spot_proxy"].isna().sum()
+        if missing_spot:
+            warnings.append(
+                f"{missing_spot} rows missing monthly NIFTY spot; fallback to strike-based proxy for those rows."
+            )
+    else:
+        warnings.append("NIFTY OHLCV cache unavailable; used strike-based proxy for margin floor.")
+        df["spot_proxy"] = pd.NA
+
+    pct_decimal = (pd.to_numeric(df["realized_pnl_pct"], errors="coerce").abs() / 100.0).replace(0, pd.NA)
+    capital_from_pct = (df["realized_pnl"].abs() / pct_decimal).fillna(0.0)
+    df["capital_proxy"] = df["buy_value"].where(df["buy_value"] > 0, capital_from_pct).fillna(0.0)
+
+    underlying_proxy = pd.to_numeric(df["spot_proxy"], errors="coerce").fillna(
+        pd.to_numeric(df["strike"], errors="coerce")
+    ).fillna(0.0)
+    df["notional_proxy"] = (
+        underlying_proxy
+        * pd.to_numeric(df["quantity_abs"], errors="coerce").fillna(0.0)
+    )
+    floor_rate = np.where(df["option_type"] == "FUT", 0.08, 0.12)
+    margin_floor = df["notional_proxy"] * floor_rate
+
+    # Long/defined-risk legs use capital proxy; short-biased legs should be floor-driven.
+    df["estimated_margin"] = df["capital_proxy"].clip(lower=0.0)
+    short_mask = df["sell_value"] > df["buy_value"]
+    short_credit = (df["sell_value"] - df["buy_value"]).clip(lower=0.0)
+    short_estimate = (0.15 * short_credit) + margin_floor
+    df.loc[short_mask, "estimated_margin"] = np.maximum(
+        short_estimate[short_mask],
+        margin_floor[short_mask] * 0.9,
+    )
+    fallback_mask = (df["estimated_margin"] <= 0) & (margin_floor > 0)
+    df.loc[fallback_mask, "estimated_margin"] = margin_floor[fallback_mask]
+
     return df, warnings
 
 
@@ -138,11 +226,16 @@ def _monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     working["month"] = working["expiry_date"].dt.to_period("M").dt.to_timestamp()
     grouped = working.groupby("month")
-    summary = grouped["realized_pnl"].agg(
-        total_pnl="sum",
-        total_trades="count",
-        avg_pnl="mean",
+    trade_count_col = "trade_count" if "trade_count" in working.columns else "realized_pnl"
+    summary = grouped.agg(
+        total_pnl=("realized_pnl", "sum"),
+        total_margin_est=("estimated_margin", "sum"),
+        total_trades=(trade_count_col, "sum" if trade_count_col == "trade_count" else "count"),
+        avg_pnl=("realized_pnl", "mean"),
+        avg_margin_est=("estimated_margin", "mean"),
     ).reset_index()
+    margin_denom = summary["avg_margin_est"].replace(0, pd.NA)
+    summary["monthly_return_pct"] = (summary["total_pnl"] / margin_denom * 100.0).fillna(0.0)
     summary["win_rate"] = grouped.apply(lambda g: (g["realized_pnl"] > 0).mean() * 100).values
     summary["month_label"] = summary["month"].dt.strftime("%b %Y")
     return summary.sort_values("month")
@@ -202,6 +295,7 @@ def _aggregate_by_expiry(df: pd.DataFrame) -> pd.DataFrame:
             "expiry_date": expiry,
             "realized_pnl": group["realized_pnl"].sum(),
             "realized_pnl_pct": group["realized_pnl_pct"].mean(),
+            "estimated_margin": group["estimated_margin"].sum(),
             "trade_count": len(group),
             "option_type": option_types[0] if len(option_types) == 1 else "MIXED",
             "expiry_type": expiry_types[0] if len(expiry_types) == 1 else "mixed",
@@ -326,17 +420,54 @@ def render_historical_performance_tab():
         if monthly.empty:
             st.info("No monthly summary available for the selected filters.")
         else:
-            st.dataframe(monthly[["month_label", "total_pnl", "win_rate", "total_trades", "avg_pnl"]], use_container_width=True)
-            chart = px.bar(
-                monthly,
-                x="month_label",
-                y="total_pnl",
-                color=monthly["total_pnl"].apply(lambda v: "Profit" if v >= 0 else "Loss"),
-                color_discrete_map={"Profit": "#2ca02c", "Loss": "#d62728"},
-                labels={"month_label": "Month", "total_pnl": "Monthly P&L"},
-                title="Monthly P&L"
+            st.dataframe(
+                monthly[
+                    [
+                        "month_label",
+                        "total_pnl",
+                        "total_margin_est",
+                        "monthly_return_pct",
+                        "win_rate",
+                        "total_trades",
+                        "avg_pnl",
+                    ]
+                ],
+                use_container_width=True,
             )
-            chart.update_layout(showlegend=False, xaxis_tickangle=-45)
+            chart = make_subplots(specs=[[{"secondary_y": True}]])
+            chart.add_trace(
+                go.Bar(
+                    x=monthly["month_label"],
+                    y=monthly["total_pnl"],
+                    name="Monthly P&L",
+                    marker_color=["#2ca02c" if v >= 0 else "#d62728" for v in monthly["total_pnl"]],
+                    opacity=0.7,
+                ),
+                secondary_y=False,
+            )
+            chart.add_trace(
+                go.Scatter(
+                    x=monthly["month_label"],
+                    y=monthly["total_margin_est"],
+                    name="Estimated Margin Used",
+                    mode="lines+markers",
+                    line=dict(color="#1f77b4", width=2),
+                ),
+                secondary_y=True,
+            )
+            chart.add_trace(
+                go.Scatter(
+                    x=monthly["month_label"],
+                    y=monthly["monthly_return_pct"],
+                    name="Monthly Return %",
+                    mode="lines+markers",
+                    line=dict(color="#ff7f0e", width=2, dash="dot"),
+                ),
+                secondary_y=True,
+            )
+            chart.update_layout(title="Monthly P&L vs Estimated Margin & Return", xaxis_tickangle=-45)
+            chart.update_yaxes(title_text="P&L (₹)", secondary_y=False)
+            chart.update_yaxes(title_text="Margin (₹) / Return (%)", secondary_y=True)
             st.plotly_chart(chart, use_container_width=True)
 
     with analysis_tabs[1]:

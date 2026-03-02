@@ -16,6 +16,9 @@ import HistoricalPerformance from "./pages/HistoricalPerformance";
 import ProductOverview from "./pages/ProductOverview";
 import DataSource from "./pages/DataSource";
 import RiskBucketsSpotAnalysis from "./pages/RiskBucketsSpotAnalysis";
+import SpotAnalysis from "./pages/SpotAnalysis";
+import SpotAnalysisParticipants from "./pages/SpotAnalysisParticipants";
+import SpotAnalysisModeling from "./pages/SpotAnalysisModeling";
 import { PortfolioProvider } from "./state/PortfolioContext";
 import { NotificationProvider } from "./state/NotificationContext";
 import AuthGate from "./components/AuthGate";
@@ -72,7 +75,12 @@ export default function App() {
                       <Route path="/portfolio" element={<PortfolioDashboard />} />
                       <Route path="/long-term" element={<LongTerm />} />
                       <Route path="/equities" element={<Equities />} />
-                      <Route path="/spot-analysis" element={<RiskBucketsSpotAnalysis />} />
+                      <Route path="/spot-analysis" element={<SpotAnalysis />}>
+                        <Route index element={<Navigate to="overview" replace />} />
+                        <Route path="overview" element={<RiskBucketsSpotAnalysis />} />
+                        <Route path="participants" element={<SpotAnalysisParticipants />} />
+                        <Route path="modeling" element={<SpotAnalysisModeling />} />
+                      </Route>
                       <Route path="/risk-buckets" element={<RiskBuckets />}>
                         <Route index element={<Navigate to="portfolio" replace />} />
                         <Route path="portfolio" element={<RiskBucketsPortfolio />} />

@@ -128,6 +128,11 @@ export default function PreTradeStress() {
       .filter((p) => Number(p.quantity ?? p.qty ?? 0) !== 0)
       .map((p) => {
         const qty = Number(p.quantity ?? p.qty ?? 0);
+        const rawStrike = p.strike ?? p.strike_price;
+        const strike =
+          typeof rawStrike === "number" || typeof rawStrike === "string"
+            ? rawStrike
+            : "—";
         const price = Number(
           p.last_price ??
           p.price ??
@@ -141,7 +146,7 @@ export default function PreTradeStress() {
           id: positionId(p),
           tradingsymbol: String(p.tradingsymbol ?? p.trading_symbol ?? p.symbol ?? "—"),
           expiry: p.expiry ? String(p.expiry).slice(0, 10) : "—",
-          strike: p.strike ?? p.strike_price ?? "—",
+          strike,
           type: String(p.option_type ?? p.instrument_type ?? "—"),
           qty,
           price,

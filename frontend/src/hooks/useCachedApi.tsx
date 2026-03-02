@@ -8,14 +8,17 @@ const DAY_MS = 86_400_000;
 
 export function useCachedApi<T>(key: string, path: string, ttlMs = 60_000): State<T> {
   const [state, setState] = useState<State<T>>({ data: null, error: null, loading: true });
-  const effectiveTtl = DAY_MS;
+  const effectiveTtl = ttlMs <= 0 ? 0 : ttlMs || DAY_MS;
+  const cacheEnabled = effectiveTtl > 0;
 
   useEffect(() => {
     const cacheKey = `${key}::${path}`;
-    const cached = getCacheEntry<T>(cacheKey);
-    if (cached) {
-      setState({ data: cached.value, error: null, loading: false });
-      return;
+    if (cacheEnabled) {
+      const cached = getCacheEntry<T>(cacheKey);
+      if (cached) {
+        setState({ data: cached.value, error: null, loading: false });
+        return;
+      }
     }
 
     const existing = inflight.get(cacheKey);
@@ -34,7 +37,9 @@ export function useCachedApi<T>(key: string, path: string, ttlMs = 60_000): Stat
     inflight.set(cacheKey, promise);
     promise
       .then((data) => {
-        setCache(cacheKey, data, effectiveTtl);
+        if (cacheEnabled) {
+          setCache(cacheKey, data, effectiveTtl);
+        }
         setState({ data, error: null, loading: false });
       })
       .catch((err) => {
@@ -43,7 +48,7 @@ export function useCachedApi<T>(key: string, path: string, ttlMs = 60_000): Stat
       .finally(() => {
         inflight.delete(cacheKey);
       });
-  }, [key, path, effectiveTtl]);
+  }, [key, path, effectiveTtl, cacheEnabled]);
 
   return state;
 }

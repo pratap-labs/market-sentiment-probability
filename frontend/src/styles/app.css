@@ -1244,6 +1244,65 @@ button.control-input:hover {
   background: rgba(255, 255, 255, 0.02);
 }
 
+.participant-table thead tr:first-child th {
+  text-align: center;
+  font-size: 0.62rem;
+  letter-spacing: 0.04em;
+}
+
+.participant-table thead tr:nth-child(2) th {
+  top: 34px;
+  font-size: 0.58rem;
+  letter-spacing: 0.02em;
+}
+
+.participant-table thead tr:nth-child(3) th {
+  top: 68px;
+  font-size: 0.58rem;
+  letter-spacing: 0.02em;
+}
+
+.participant-table td:nth-child(2) {
+  min-width: 108px;
+}
+
+.participant-table td:nth-child(4),
+.participant-table td:nth-child(8) {
+  border-right: 2px solid rgba(70, 92, 128, 0.7);
+}
+
+.participant-table .participant-group-sep-right {
+  border-right: 2px solid rgba(70, 92, 128, 0.7);
+}
+
+.participant-change {
+  margin-left: 8px;
+  font-weight: 700;
+}
+
+.participant-pill {
+  display: inline-block;
+  min-width: 62px;
+  text-align: center;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 0.54rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.participant-pill.bullish {
+  color: #32c77a;
+  background: rgba(18, 122, 70, 0.32);
+  border: 1px solid rgba(50, 199, 122, 0.25);
+}
+
+.participant-pill.bearish {
+  color: #ff5c5c;
+  background: rgba(150, 18, 18, 0.34);
+  border: 1px solid rgba(255, 92, 92, 0.25);
+}
+
 .page-title {
   font-size: 1.45rem;
   font-weight: 700;

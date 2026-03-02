@@ -234,7 +234,6 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
   const [selectedPathEngine, setSelectedPathEngine] = useState<string>("");
   const [selectedBucketEngine, setSelectedBucketEngine] = useState<string>("");
   const [ddView, setDdView] = useState<"terminal" | "drawdown" | "both">("both");
-  const [combinedEngineFilter, setCombinedEngineFilter] = useState<"all" | "surface" | "greeks">("all");
   const effectivePathEngine = engineOptions.includes(selectedPathEngine) ? selectedPathEngine : (engineOptions[0] || "");
   const effectiveBucketEngine = engineOptions.includes(selectedBucketEngine) ? selectedBucketEngine : (engineOptions[0] || "");
   const spotSample = (engines[effectivePathEngine]?.spot_paths_worst || engines[effectivePathEngine]?.spot_paths_sample || {}) as SpotPathsSample;
@@ -949,30 +948,26 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
         )}
       </SectionCard>
 
-      <SectionCard title="NIFTY Last 30 Days + Simulated Paths">
+      <SectionCard title="NIFTY Last 20 Days + Simulated Paths">
         {loading || !data || ohlcv.loading || !ohlcv.data ? <LoadingState /> : (
           (() => {
-            const last30 = (ohlcv.data.rows || [])
+            const last20 = (ohlcv.data.rows || [])
               .filter((r) => Boolean(String(r.date || "")))
               .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
-              .slice(-30);
-            const last10 = (ohlcv.data.rows || [])
-              .filter((r) => Boolean(String(r.date || "")))
-              .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")))
-              .slice(-10);
+              .slice(-20);
             const histRows = (ohlcv.data.rows || [])
               .filter((r) => Number.isFinite(Number(r.close)))
               .sort((a, b) => String(a.date || "").localeCompare(String(b.date || "")));
-            const hist30Dates = last30.map((r) => String(r.date || ""));
-            const hist30Close = last30.map((r) => Number(r.close || 0));
-            const hist30Open = last30.map((r) => Number(r.open || 0));
-            const hist30High = last30.map((r) => Number(r.high || 0));
-            const hist30Low = last30.map((r) => Number(r.low || 0));
-            const histDates = last10.map((r) => String(r.date || ""));
-            const histClose = last10.map((r) => Number(r.close || 0));
-            const histOpen = last10.map((r) => Number(r.open || 0));
-            const histHigh = last10.map((r) => Number(r.high || 0));
-            const histLow = last10.map((r) => Number(r.low || 0));
+            const hist20Dates = last20.map((r) => String(r.date || ""));
+            const hist20Close = last20.map((r) => Number(r.close || 0));
+            const hist20Open = last20.map((r) => Number(r.open || 0));
+            const hist20High = last20.map((r) => Number(r.high || 0));
+            const hist20Low = last20.map((r) => Number(r.low || 0));
+            const histDates = hist20Dates;
+            const histClose = hist20Close;
+            const histOpen = hist20Open;
+            const histHigh = hist20High;
+            const histLow = hist20Low;
             const lastDateStr = histDates[histDates.length - 1] || "";
             const lastClose = histClose[histClose.length - 1] || 0;
             const baseDate = lastDateStr ? new Date(lastDateStr) : null;
@@ -1070,15 +1065,21 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
                 }
               : null;
             const combinedPalette = ["#FF4D4D", "#2D7DFF", "#FFB020", "#2ECC71", "#9B59B6", "#00B8D9", "#E67E22", "#F1C40F"];
-            const combinedEngines = Object.entries(engines).filter(([engine]) => {
+            const surfaceEngines = Object.entries(engines).filter(([engine, payload]) => {
               const key = engine.toLowerCase();
-              if (combinedEngineFilter === "surface") return key.includes("|surface");
-              if (combinedEngineFilter === "greeks") return key.includes("greeks");
-              return true;
+              const worst = ((payload?.spot_paths_worst_all || {}) as SpotPathsSample).paths || [];
+              return key.includes("|surface") && worst.length > 0;
             });
+            const combinedEngines = surfaceEngines.length
+              ? surfaceEngines
+              : Object.entries(engines).filter(([, payload]) => {
+                  const worst = ((payload?.spot_paths_worst_all || {}) as SpotPathsSample).paths || [];
+                  return worst.length > 0;
+                });
             const combinedTraces = combinedEngines.flatMap(([engine, payload], engineIdx) => {
               const series = ((payload?.spot_paths_worst_all || {}) as SpotPathsSample).paths || [];
               const pnlSeries = ((payload?.spot_paths_worst_all || {}) as SpotPathsSample).terminal_pnl || [];
+              const ddSeries = ((payload?.spot_paths_worst_all || {}) as SpotPathsSample).max_drawdown || [];
               if (!series.length || !baseDate || !lastClose) return [];
               const days = (((payload?.spot_paths_worst_all || {}) as SpotPathsSample).days
                 || ((payload?.spot_paths_sample || {}) as SpotPathsSample).days
@@ -1090,46 +1091,82 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
                 return d.toISOString().slice(0, 10);
               })];
               const color = combinedPalette[engineIdx % combinedPalette.length];
-              const legendPnl = Number(pnlSeries[0]);
-              const legendLabel = Number.isFinite(legendPnl)
-                ? `${engine.toUpperCase()} (${formatInrLac(legendPnl)})`
-                : engine.toUpperCase();
-              return series.slice(0, 5).map((path, idx) => ({
+              const legendLabel = engine.toUpperCase();
+              return series.slice(0, 20).map((path, idx) => ({
                 type: "scatter",
                 mode: "lines",
                 x: simDatesCombined,
                 y: [lastClose, ...path.slice(0, simLen)],
                 line: { width: 1.6, color },
-                opacity: 0.6,
+                opacity: 0.45,
                 name: legendLabel,
+                hovertemplate: `Model: ${legendLabel}<br>Path: #${idx + 1}<br>Terminal P&L: ₹${formatNumber(pnlSeries[idx], 0)}<br>Max DD: ₹${formatNumber(ddSeries[idx], 0)}<extra></extra>`,
+                showlegend: idx === 0
+              }));
+            });
+            const combinedDrawdownTerminalTraces = combinedEngines.flatMap(([engine, payload], engineIdx) => {
+              const drawdownSeries = ((payload?.spot_paths_worst_all || {}) as SpotPathsSample).drawdown_series || [];
+              if (!drawdownSeries.length || !baseDate) return [];
+              const days = (((payload?.spot_paths_worst_all || {}) as SpotPathsSample).days
+                || ((payload?.spot_paths_sample || {}) as SpotPathsSample).days
+                || []) as number[];
+              const simLen = Math.min(days.length, 10);
+              const simDatesCombined = [baseDate.toISOString().slice(0, 10), ...days.slice(0, simLen).map((_, i) => {
+                const d = new Date(baseDate.getTime());
+                d.setDate(d.getDate() + i + 1);
+                return d.toISOString().slice(0, 10);
+              })];
+              const color = combinedPalette[engineIdx % combinedPalette.length];
+              const legendLabel = `${engine.toUpperCase()} (Terminal)`;
+              return drawdownSeries.slice(0, 20).map((path, idx) => ({
+                type: "scatter",
+                mode: "lines",
+                x: simDatesCombined,
+                y: [0, ...path.slice(0, simLen)],
+                line: { width: 1.4, color },
+                opacity: 0.45,
+                name: legendLabel,
+                hoverinfo: "skip",
+                showlegend: idx === 0
+              }));
+            });
+            const combinedDrawdownWorstTraces = combinedEngines.flatMap(([engine, payload], engineIdx) => {
+              const drawdownSeries = ((payload?.spot_paths_worst_dd || {}) as SpotPathsSample).drawdown_series || [];
+              if (!drawdownSeries.length || !baseDate) return [];
+              const days = (((payload?.spot_paths_worst_dd || {}) as SpotPathsSample).days
+                || ((payload?.spot_paths_sample || {}) as SpotPathsSample).days
+                || []) as number[];
+              const simLen = Math.min(days.length, 10);
+              const simDatesCombined = [baseDate.toISOString().slice(0, 10), ...days.slice(0, simLen).map((_, i) => {
+                const d = new Date(baseDate.getTime());
+                d.setDate(d.getDate() + i + 1);
+                return d.toISOString().slice(0, 10);
+              })];
+              const color = combinedPalette[engineIdx % combinedPalette.length];
+              const legendLabel = `${engine.toUpperCase()} (Worst DD)`;
+              return drawdownSeries.slice(0, 20).map((path, idx) => ({
+                type: "scatter",
+                mode: "lines",
+                x: simDatesCombined,
+                y: [0, ...path.slice(0, simLen)],
+                line: { width: 1.4, color, dash: "dot" },
+                opacity: 0.45,
+                name: legendLabel,
+                hoverinfo: "skip",
                 showlegend: idx === 0
               }));
             });
             return (
               <>
-                <div style={{ display: "flex", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
-                  <label className="control-field" style={{ minWidth: 220 }}>
-                    <span className="control-label">Combined Engine Filter</span>
-                    <select
-                      className="control-input"
-                      value={combinedEngineFilter}
-                      onChange={(e) => setCombinedEngineFilter(e.target.value as "all" | "surface" | "greeks")}
-                    >
-                      <option value="all">All Engines</option>
-                      <option value="surface">Surface Engines</option>
-                      <option value="greeks">Greeks Engines</option>
-                    </select>
-                  </label>
-                </div>
                 <Plot
                   data={[
                     {
                       type: "candlestick",
-                      x: hist30Dates,
-                      open: hist30Open,
-                      high: hist30High,
-                      low: hist30Low,
-                      close: hist30Close,
+                      x: hist20Dates,
+                      open: hist20Open,
+                      high: hist20High,
+                      low: hist20Low,
+                      close: hist20Close,
                       name: "NIFTY OHLC",
                       increasing: { line: { color: "#2ecc71" } },
                       decreasing: { line: { color: "#ff4d4d" } }
@@ -1242,26 +1279,10 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
                   <Plot
                     data={[
                       ...(ddView !== "drawdown"
-                        ? worstAllDDAdj.map((series) => ({
-                            type: "scatter",
-                            mode: "lines",
-                            x: simDates,
-                            y: series,
-                            line: { width: 1.4, color: "rgba(255,77,77,0.6)" },
-                            hoverinfo: "skip",
-                            showlegend: false
-                          }))
+                        ? combinedDrawdownTerminalTraces
                         : []),
                       ...(ddView !== "terminal"
-                        ? worstDDAdj.map((series) => ({
-                            type: "scatter",
-                            mode: "lines",
-                            x: simDates,
-                            y: series,
-                            line: { width: 1.4, color: "rgba(46,204,113,0.6)" },
-                            hoverinfo: "skip",
-                            showlegend: false
-                          }))
+                        ? combinedDrawdownWorstTraces
                         : []),
                     ]}
                     layout={{
@@ -1271,7 +1292,7 @@ export default function RiskBucketsPortfolio({ dataOverride, loadingOverride, er
                       margin: { l: 56, r: 20, t: 12, b: 48 },
                       xaxis: { title: "Date", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
                       yaxis: { title: "Drawdown (₹)", automargin: true, tickfont: { color: axisColor, size: 10 }, titlefont: { color: axisColor, size: 11 } },
-                      showlegend: false
+                      legend: { font: { color: axisColor, size: 10 }, orientation: "h", x: 0, y: -0.2 }
                     }}
                     config={{ displayModeBar: false, responsive: true }}
                     style={{ width: "100%", height: "100%" }}

@@ -37,6 +37,7 @@ export default function HistoricalPerformance() {
   );
 
   const trades = data?.trades || [];
+  const monthly = data?.monthly || [];
   const xRange = useMemo(() => {
     if (!trades.length) return null;
     const dates = trades
@@ -129,21 +130,59 @@ export default function HistoricalPerformance() {
       <SectionCard title="Monthly Performance">
         {loading || !data ? <LoadingState /> : (
           <Plot
-            data={[{
-              type: "bar",
-              x: data.monthly.map((m) => m.month_label as string),
-              y: data.monthly.map((m) => Number(m.total_pnl || 0)),
-              marker: {
-                color: data.monthly.map((m) => (Number(m.total_pnl || 0) >= 0 ? "#2ecc71" : "#ff4d4d"))
+            data={[
+              {
+                type: "bar",
+                x: monthly.map((m) => m.month_label as string),
+                y: monthly.map((m) => Number(m.total_pnl || 0)),
+                name: "Monthly P&L",
+                marker: {
+                  color: monthly.map((m) => (Number(m.total_pnl || 0) >= 0 ? "#2ecc71" : "#ff4d4d"))
+                }
+              },
+              {
+                type: "scatter",
+                mode: "lines+markers",
+                x: monthly.map((m) => m.month_label as string),
+                y: monthly.map((m) => Number(m.total_margin_est || 0)),
+                name: "Estimated Margin",
+                yaxis: "y2",
+                line: { color: "#4f8cff", width: 2 }
+              },
+              {
+                type: "scatter",
+                mode: "lines+markers",
+                x: monthly.map((m) => m.month_label as string),
+                y: monthly.map((m) => Number(m.monthly_return_pct || 0)),
+                name: "Monthly Return %",
+                yaxis: "y3",
+                line: { color: "#ff9f1a", width: 2, dash: "dot" }
               }
-            }]}
+            ]}
             layout={{
-              height: 320,
+              height: 360,
               paper_bgcolor: "rgba(0,0,0,0)",
               plot_bgcolor: "rgba(0,0,0,0)",
               margin: { l: 30, r: 20, t: 20, b: 30 },
               xaxis: { tickangle: -20, tickfont: { color: "#b9c4d6", size: 10 }, titlefont: { color: "#b9c4d6", size: 11 } },
-              yaxis: { tickfont: { color: "#b9c4d6", size: 10 }, titlefont: { color: "#b9c4d6", size: 11 } }
+              yaxis: { title: "P&L (₹)", tickfont: { color: "#b9c4d6", size: 10 }, titlefont: { color: "#b9c4d6", size: 11 } },
+              yaxis2: {
+                title: "Margin (₹)",
+                overlaying: "y",
+                side: "right",
+                tickfont: { color: "#95b8ff", size: 10 },
+                titlefont: { color: "#95b8ff", size: 11 }
+              },
+              yaxis3: {
+                title: "Return (%)",
+                overlaying: "y",
+                side: "right",
+                anchor: "free",
+                position: 0.97,
+                tickfont: { color: "#ffcf8a", size: 10 },
+                titlefont: { color: "#ffcf8a", size: 11 }
+              },
+              legend: { orientation: "h", y: 1.12 }
             }}
             config={{ displayModeBar: false, responsive: true }}
             useResizeHandler

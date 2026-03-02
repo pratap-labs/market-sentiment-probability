@@ -3,8 +3,13 @@ from __future__ import annotations
 import logging
 import os
 import time
+import sys
+import subprocess
 import calendar
 import math
+import json
+import io
+import zipfile
 import numpy as np
 from datetime import date
 import uuid
@@ -28,6 +33,7 @@ from scripts.utils import (
     enrich_position_with_greeks,
 )
 from scripts.data import NSEDataFetcher
+from scripts.data import train_flow_probability_models as flow_train
 from scripts.utils.greeks import calculate_implied_volatility
 from scripts.utils.stress_testing import compute_var_es_metrics, get_weighted_scenarios, classify_bucket
 from scripts.utils.forward_risk import run_advanced_forward_risk
@@ -229,6 +235,27 @@ def _read_csv(path: Path) -> pd.DataFrame:
         return pd.read_csv(path)
     except Exception:
         return pd.DataFrame()
+
+
+def _append_csv_dedup(path: Path, new_df: pd.DataFrame, dedup_cols: List[str]) -> pd.DataFrame:
+    if new_df.empty:
+        return _read_csv(path)
+    old_df = _read_csv(path)
+    if old_df.empty:
+        out = new_df.copy()
+    else:
+        out = pd.concat([old_df, new_df], ignore_index=True)
+    keys = [c for c in dedup_cols if c in out.columns]
+    if keys:
+        out = out.drop_duplicates(subset=keys, keep="last")
+    else:
+        out = out.drop_duplicates(keep="last")
+
+    # Keep cache deterministic for charting: each expiry should be chronological.
+    sort_cols = [c for c in ["expiry_date", "expiry", "date", "timestamp_order"] if c in out.columns]
+    if sort_cols:
+        out = out.sort_values(sort_cols).reset_index(drop=True)
+    return out
 
 
 def _load_cache(name: str) -> pd.DataFrame:
@@ -508,17 +535,29 @@ def _load_long_term_universe() -> Dict[str, List[str]]:
 
 
 def _json_safe(val: Any) -> Any:
+    if val is None:
+        return None
     if isinstance(val, (np.integer,)):
         return int(val)
-    if isinstance(val, (np.floating,)):
-        return float(val)
+    if isinstance(val, (float, np.floating)):
+        f = float(val)
+        return f if math.isfinite(f) else None
     if isinstance(val, (np.ndarray,)):
-        return val.tolist()
+        return [_json_safe(x) for x in val.tolist()]
+    if isinstance(val, (list, tuple, set)):
+        return [_json_safe(x) for x in val]
+    if isinstance(val, dict):
+        return {str(k): _json_safe(v) for k, v in val.items()}
     if isinstance(val, (pd.Timestamp, datetime, date)):
         try:
             return val.isoformat()
         except Exception:
             return str(val)
+    try:
+        if pd.isna(val):
+            return None
+    except Exception:
+        pass
     return val
 
 
@@ -809,11 +848,29 @@ def _fetch_equity_history_cached(
     from_date: datetime,
     to_date: datetime,
     max_age_hours: int = 24,
+    min_cache_days: int = 370,
 ) -> pd.DataFrame:
     cached = _load_equity_history_cache(symbol, max_age_hours=max_age_hours)
     if not cached.empty:
-        return cached
-    df = _fetch_equity_history(kite, instrument_token, from_date, to_date)
+        # Reuse cache only when it actually spans the requested window.
+        if "date" in cached.columns:
+            cached_dates = pd.to_datetime(cached["date"], errors="coerce").dropna()
+            if not cached_dates.empty:
+                cached_start = cached_dates.min().date()
+                cached_end = cached_dates.max().date()
+                requested_start = pd.to_datetime(from_date).date()
+                requested_end = pd.to_datetime(to_date).date()
+                if cached_start <= requested_start and cached_end >= requested_end:
+                    return cached
+            else:
+                return cached
+        else:
+            return cached
+    requested_start = pd.to_datetime(from_date).date()
+    requested_end = pd.to_datetime(to_date).date()
+    min_start = requested_end - timedelta(days=max(1, int(min_cache_days)))
+    fetch_start = min(requested_start, min_start)
+    df = _fetch_equity_history(kite, instrument_token, fetch_start, requested_end)
     if not df.empty:
         _save_equity_history_cache(symbol, df)
     return df
@@ -1100,6 +1157,9 @@ def futures_data(limit: int = 1000):
     df = _load_cache("nifty_futures")
     if df.empty:
         raise HTTPException(status_code=404, detail="Futures cache missing")
+    sort_cols = [c for c in ["expiry_date", "expiry", "date", "timestamp_order"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols).reset_index(drop=True)
     try:
         return {"rows": _df_to_records(df, limit)}
     except Exception as exc:
@@ -2037,6 +2097,143 @@ def long_term_ohlcv_latest(
     return {"rows": rows, "count": len(rows)}
 
 
+@app.get("/long-term/momentum-scores")
+def long_term_momentum_scores(
+    request: Request,
+    lookback_days: int = 260,
+    limit: int = 250,
+    use_cache: bool = True,
+):
+    creds = _get_credentials(request)
+    kite = _get_kite_client(creds.api_key, creds.access_token)
+    universe = _load_long_term_universe()
+    try:
+        instruments = kite.instruments() or []
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch instruments: {exc}")
+
+    inst_by_symbol = {}
+    for inst in instruments:
+        sym = str(inst.get("tradingsymbol") or "").upper()
+        if sym and sym not in inst_by_symbol:
+            inst_by_symbol[sym] = inst
+
+    symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
+    to_date = datetime.now().date()
+    from_date = to_date - timedelta(days=max(120, int(lookback_days)))
+
+    metric_rows: List[Dict[str, Any]] = []
+    fallback_windows = [max(120, int(lookback_days)), 180, 120, 90, 60, 45]
+    # Keep order but drop duplicates.
+    fallback_windows = list(dict.fromkeys([w for w in fallback_windows if w > 0]))
+    for sym in symbols:
+        inst = inst_by_symbol.get(sym)
+        if not inst:
+            continue
+        token = inst.get("instrument_token")
+        if not token:
+            continue
+
+        df = pd.DataFrame()
+        for window_days in fallback_windows:
+            window_from = to_date - timedelta(days=int(window_days))
+            if use_cache:
+                df = _fetch_equity_history_cached(
+                    kite,
+                    sym,
+                    int(token),
+                    window_from,
+                    to_date,
+                    max_age_hours=24,
+                )
+            else:
+                df = _fetch_equity_history(kite, int(token), window_from, to_date)
+            if not df.empty:
+                break
+        if df.empty:
+            continue
+
+        df = df.copy()
+        if "date" in df.columns:
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["close"] = pd.to_numeric(df.get("close"), errors="coerce")
+        df = df.dropna(subset=["date", "close"]).sort_values("date")
+        if df.empty or len(df) < 20:
+            continue
+
+        closes = df["close"].astype(float).reset_index(drop=True)
+        latest_close = float(closes.iloc[-1])
+
+        def _ret(n: int) -> Optional[float]:
+            if len(closes) <= n:
+                return None
+            prev = float(closes.iloc[-(n + 1)])
+            if prev <= 0:
+                return None
+            return (latest_close / prev) - 1.0
+
+        r21 = _ret(21)
+        r63 = _ret(63)
+        r126 = _ret(126)
+        sma50 = float(closes.tail(50).mean()) if len(closes) >= 50 else None
+        sma200 = float(closes.tail(200).mean()) if len(closes) >= 200 else None
+        trend_strength = ((sma50 / sma200) - 1.0) if sma50 and sma200 and sma200 > 0 else None
+        prev_55_high = float(closes.iloc[:-1].tail(55).max()) if len(closes) > 55 else None
+        breakout_55 = ((latest_close / prev_55_high) - 1.0) if prev_55_high and prev_55_high > 0 else None
+        ret_series = closes.pct_change().dropna()
+        vol_63 = float(ret_series.tail(63).std(ddof=0) * np.sqrt(252.0)) if len(ret_series) >= 20 else None
+        risk_adj_63 = (r63 / vol_63) if r63 is not None and vol_63 and vol_63 > 0 else None
+
+        metric_rows.append(
+            {
+                "symbol": sym,
+                "date": _json_safe(df["date"].iloc[-1]),
+                "close": _json_safe(latest_close),
+                "momentum_1m_pct": _json_safe(r21 * 100.0) if r21 is not None else None,
+                "momentum_3m_pct": _json_safe(r63 * 100.0) if r63 is not None else None,
+                "momentum_6m_pct": _json_safe(r126 * 100.0) if r126 is not None else None,
+                "sma50": _json_safe(sma50),
+                "sma200": _json_safe(sma200),
+                "trend_strength_pct": _json_safe(trend_strength * 100.0) if trend_strength is not None else None,
+                "breakout_55d_pct": _json_safe(breakout_55 * 100.0) if breakout_55 is not None else None,
+                "vol_3m_pct": _json_safe(vol_63 * 100.0) if vol_63 is not None else None,
+                "risk_adj_3m": _json_safe(risk_adj_63) if risk_adj_63 is not None else None,
+            }
+        )
+
+    if not metric_rows:
+        return {"rows": [], "count": 0}
+
+    score_df = pd.DataFrame(metric_rows)
+    score_specs = {
+        "score_1m": "momentum_1m_pct",
+        "score_3m": "momentum_3m_pct",
+        "score_6m": "momentum_6m_pct",
+        "score_trend": "trend_strength_pct",
+        "score_breakout": "breakout_55d_pct",
+        "score_risk_adj": "risk_adj_3m",
+    }
+    score_cols: List[str] = []
+    for score_col, metric_col in score_specs.items():
+        if metric_col in score_df.columns:
+            vals = pd.to_numeric(score_df[metric_col], errors="coerce")
+            score_df[score_col] = vals.rank(method="average", pct=True) * 100.0
+            score_cols.append(score_col)
+
+    score_df["composite_score"] = score_df[score_cols].mean(axis=1, skipna=True) if score_cols else np.nan
+    score_df = score_df.sort_values(["composite_score", "symbol"], ascending=[False, True])
+    if limit:
+        score_df = score_df.head(max(1, min(int(limit), 2000)))
+
+    rows = []
+    for row in score_df.to_dict(orient="records"):
+        clean: Dict[str, Any] = {}
+        for k, v in row.items():
+            clean[k] = _json_safe(v)
+        rows.append(clean)
+    return {"rows": rows, "count": len(rows)}
+
+
 @app.get("/long-term/fundamentals")
 def long_term_fundamentals(request: Request, symbol: Optional[str] = None):
     _get_credentials(request)
@@ -2162,6 +2359,278 @@ def long_term_fundamentals(request: Request, symbol: Optional[str] = None):
         )
 
     return {"rows": rows, "count": len(rows)}
+
+
+@app.get("/long-term/earnings-scores")
+def long_term_earnings_scores(request: Request, symbol: Optional[str] = None, limit: int = 250):
+    _get_credentials(request)
+    universe = _load_long_term_universe()
+    raw_cache = _load_indianapi_cache(max_age_days=3650)
+    cache: Dict[str, Dict[str, Any]] = {}
+    for k, v in raw_cache.items():
+        cache[k] = {"saved_at": datetime.now(timezone.utc).isoformat(), "payload": v}
+
+    if symbol:
+        symbols = [str(symbol).upper()]
+    else:
+        symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
+
+    rows: List[Dict[str, Any]] = []
+    for sym in symbols:
+        vendor = (cache.get(sym) or {}).get("payload") or {}
+
+        eps_qoq_yoy = (
+            _pick_keymetrics_key(vendor, "ePSChangePercentMostRecentQuarter1YearAgo")
+            or _pick_keymetrics_key(vendor, "ePSChangePercentQTPOverQTP")
+        )
+        eps_ttm = _pick_keymetrics_key(vendor, "ePSChangePercentTTMOverTTM")
+        revenue_qoq_yoy = (
+            _pick_keymetrics_key(vendor, "revenueChangePercentMostRecentQuarter1YearAgo")
+            or _pick_keymetrics_key(vendor, "revenueChangePercentQTPOverQTP")
+        )
+
+        op_margin_ttm = _pick_keymetrics_key(vendor, "operatingMarginTrailing12Month")
+        op_margin_5y = _pick_keymetrics_key(vendor, "operatingMargin5YearAverage")
+        op_margin_trend = None
+        if op_margin_ttm is not None and op_margin_5y is not None:
+            op_margin_trend = op_margin_ttm - op_margin_5y
+
+        rows.append(
+            {
+                "symbol": sym,
+                "eps_qoq_yoy_pct": _json_safe(eps_qoq_yoy),
+                "eps_ttm_growth_pct": _json_safe(eps_ttm),
+                "revenue_qoq_yoy_pct": _json_safe(revenue_qoq_yoy),
+                "operating_margin_trend_pct": _json_safe(op_margin_trend),
+                "operating_margin_ttm_pct": _json_safe(op_margin_ttm),
+                "operating_margin_5y_avg_pct": _json_safe(op_margin_5y),
+            }
+        )
+
+    if not rows:
+        return {"rows": [], "count": 0}
+
+    score_df = pd.DataFrame(rows)
+    score_specs = {
+        "score_eps_qoq_yoy": ("eps_qoq_yoy_pct", 0.40),
+        "score_eps_ttm": ("eps_ttm_growth_pct", 0.30),
+        "score_revenue_qoq_yoy": ("revenue_qoq_yoy_pct", 0.20),
+        "score_op_margin_trend": ("operating_margin_trend_pct", 0.10),
+    }
+
+    available_weight_cols: List[str] = []
+    for score_col, (metric_col, weight) in score_specs.items():
+        vals = pd.to_numeric(score_df.get(metric_col), errors="coerce")
+        score_df[score_col] = vals.rank(method="average", pct=True) * 100.0
+        w_col = f"{score_col}_weighted"
+        score_df[w_col] = score_df[score_col] * weight
+        available_weight_cols.append(w_col)
+
+    row_weight_sum = pd.Series(0.0, index=score_df.index)
+    for score_col, (_, weight) in score_specs.items():
+        row_weight_sum = row_weight_sum + score_df[score_col].notna().astype(float) * weight
+
+    weighted_sum = score_df[available_weight_cols].sum(axis=1, skipna=True)
+    score_df["earnings_acceleration_score"] = np.where(
+        row_weight_sum > 0,
+        weighted_sum / row_weight_sum,
+        np.nan,
+    )
+    score_df["coverage_weight"] = row_weight_sum * 100.0
+
+    score_df = score_df.sort_values(
+        ["earnings_acceleration_score", "coverage_weight", "symbol"],
+        ascending=[False, False, True],
+    )
+    if limit:
+        score_df = score_df.head(max(1, min(int(limit), 2000)))
+
+    out_rows: List[Dict[str, Any]] = []
+    for row in score_df.to_dict(orient="records"):
+        clean: Dict[str, Any] = {}
+        for k, v in row.items():
+            if k.endswith("_weighted"):
+                continue
+            clean[k] = _json_safe(v)
+        out_rows.append(clean)
+    return {"rows": out_rows, "count": len(out_rows)}
+
+
+@app.get("/long-term/quality-scores")
+def long_term_quality_scores(request: Request, symbol: Optional[str] = None, limit: int = 250):
+    _get_credentials(request)
+    universe = _load_long_term_universe()
+    raw_cache = _load_indianapi_cache(max_age_days=3650)
+    cache: Dict[str, Dict[str, Any]] = {}
+    for k, v in raw_cache.items():
+        cache[k] = {"saved_at": datetime.now(timezone.utc).isoformat(), "payload": v}
+
+    if symbol:
+        symbols = [str(symbol).upper()]
+    else:
+        symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
+
+    rows: List[Dict[str, Any]] = []
+    for sym in symbols:
+        vendor = (cache.get(sym) or {}).get("payload") or {}
+
+        roe = _pick_keymetrics_key(vendor, "returnOnAverageEquityMostRecentFiscalYear")
+        roce = _pick_keymetrics_key(vendor, "returnOnInvestmentMostRecentFiscalYear")
+        debt_to_equity = _pick_keymetrics_key(vendor, "ltDebtPerEquityMostRecentFiscalYear")
+        interest_coverage = _pick_keymetrics_key(vendor, "netInterestCoverageMostRecentFiscalYear")
+        operating_margin = _pick_keymetrics_key(vendor, "operatingMarginTrailing12Month")
+        net_profit_margin = _pick_keymetrics_key(vendor, "netProfitMarginPercentTrailing12Month")
+        beta = (
+            _pick_keymetrics_key(vendor, "beta")
+            or _pick_from_keymetrics_contains(vendor, ["beta"], categories=["stockPriceSummary"])
+            or _pick_from_keymetrics_contains(vendor, ["beta"])
+        )
+
+        rows.append(
+            {
+                "symbol": sym,
+                "roe_pct": _json_safe(roe),
+                "roce_pct": _json_safe(roce),
+                "debt_to_equity": _json_safe(debt_to_equity),
+                "interest_coverage": _json_safe(interest_coverage),
+                "operating_margin_pct": _json_safe(operating_margin),
+                "net_profit_margin_pct": _json_safe(net_profit_margin),
+                "beta": _json_safe(beta),
+            }
+        )
+
+    if not rows:
+        return {"rows": [], "count": 0}
+
+    score_df = pd.DataFrame(rows)
+    score_specs = {
+        "score_roe": ("roe_pct", 0.30, False),
+        "score_roce": ("roce_pct", 0.20, False),
+        "score_debt_to_equity": ("debt_to_equity", 0.20, True),
+        "score_interest_coverage": ("interest_coverage", 0.20, False),
+        "score_operating_margin": ("operating_margin_pct", 0.10, False),
+    }
+
+    weighted_cols: List[str] = []
+    for score_col, (metric_col, weight, inverse) in score_specs.items():
+        vals = pd.to_numeric(score_df.get(metric_col), errors="coerce")
+        if inverse:
+            vals = -vals
+        score_df[score_col] = vals.rank(method="average", pct=True) * 100.0
+        w_col = f"{score_col}_weighted"
+        score_df[w_col] = score_df[score_col] * weight
+        weighted_cols.append(w_col)
+
+    row_weight_sum = pd.Series(0.0, index=score_df.index)
+    for score_col, (_, weight, _) in score_specs.items():
+        row_weight_sum = row_weight_sum + score_df[score_col].notna().astype(float) * weight
+
+    weighted_sum = score_df[weighted_cols].sum(axis=1, skipna=True)
+    score_df["quality_score"] = np.where(
+        row_weight_sum > 0,
+        weighted_sum / row_weight_sum,
+        np.nan,
+    )
+    score_df["coverage_weight"] = row_weight_sum * 100.0
+
+    score_df = score_df.sort_values(
+        ["quality_score", "coverage_weight", "symbol"],
+        ascending=[False, False, True],
+    )
+    if limit:
+        score_df = score_df.head(max(1, min(int(limit), 2000)))
+
+    out_rows: List[Dict[str, Any]] = []
+    for row in score_df.to_dict(orient="records"):
+        clean: Dict[str, Any] = {}
+        for k, v in row.items():
+            if k.endswith("_weighted"):
+                continue
+            clean[k] = _json_safe(v)
+        out_rows.append(clean)
+    return {"rows": out_rows, "count": len(out_rows)}
+
+
+@app.get("/long-term/final-composite-scores")
+def long_term_final_composite_scores(request: Request, symbol: Optional[str] = None, limit: int = 250):
+    _get_credentials(request)
+
+    momentum_payload = long_term_momentum_scores(
+        request=request,
+        lookback_days=320,
+        limit=2000,
+        use_cache=False,
+    )
+    earnings_payload = long_term_earnings_scores(
+        request=request,
+        symbol=symbol,
+        limit=2000,
+    )
+    quality_payload = long_term_quality_scores(
+        request=request,
+        symbol=symbol,
+        limit=2000,
+    )
+
+    momentum_rows = momentum_payload.get("rows", []) if isinstance(momentum_payload, dict) else []
+    earnings_rows = earnings_payload.get("rows", []) if isinstance(earnings_payload, dict) else []
+    quality_rows = quality_payload.get("rows", []) if isinstance(quality_payload, dict) else []
+
+    momentum_by_symbol: Dict[str, Dict[str, Any]] = {
+        str(r.get("symbol", "")).upper(): r for r in momentum_rows if isinstance(r, dict)
+    }
+    earnings_by_symbol: Dict[str, Dict[str, Any]] = {
+        str(r.get("symbol", "")).upper(): r for r in earnings_rows if isinstance(r, dict)
+    }
+    quality_by_symbol: Dict[str, Dict[str, Any]] = {
+        str(r.get("symbol", "")).upper(): r for r in quality_rows if isinstance(r, dict)
+    }
+
+    all_symbols = sorted(set(momentum_by_symbol.keys()) | set(earnings_by_symbol.keys()) | set(quality_by_symbol.keys()))
+
+    def _to_finite(v: Any) -> Optional[float]:
+        try:
+            x = float(v)
+            return x if math.isfinite(x) else None
+        except Exception:
+            return None
+
+    out_rows: List[Dict[str, Any]] = []
+    for sym in all_symbols:
+        m = _to_finite((momentum_by_symbol.get(sym) or {}).get("composite_score"))
+        e = _to_finite((earnings_by_symbol.get(sym) or {}).get("earnings_acceleration_score"))
+        q = _to_finite((quality_by_symbol.get(sym) or {}).get("quality_score"))
+
+        weight_sum = (0.55 if m is not None else 0.0) + (0.30 if e is not None else 0.0) + (0.15 if q is not None else 0.0)
+        weighted_sum = (m or 0.0) * 0.55 + (e or 0.0) * 0.30 + (q or 0.0) * 0.15
+        final_score = (weighted_sum / weight_sum) if weight_sum > 0 else None
+
+        out_rows.append(
+            {
+                "symbol": sym,
+                "momentum_composite_score": _json_safe(m),
+                "earnings_acceleration_score": _json_safe(e),
+                "quality_score": _json_safe(q),
+                "coverage_weight": _json_safe(weight_sum * 100.0),
+                "final_composite_score": _json_safe(final_score),
+            }
+        )
+
+    out_rows = sorted(
+        out_rows,
+        key=lambda r: (
+            -(float(r.get("final_composite_score")) if isinstance(r.get("final_composite_score"), (int, float)) else float("-inf")),
+            -(float(r.get("coverage_weight")) if isinstance(r.get("coverage_weight"), (int, float)) else 0.0),
+            str(r.get("symbol", "")),
+        ),
+    )
+    if symbol:
+        target = str(symbol).upper()
+        out_rows = [r for r in out_rows if str(r.get("symbol", "")).upper() == target]
+    if limit:
+        out_rows = out_rows[: max(1, min(int(limit), 2000))]
+
+    return {"rows": out_rows, "count": len(out_rows)}
 
 
 
@@ -3795,11 +4264,13 @@ def data_source_cache_status():
     def _status(name: str) -> Dict[str, Any]:
         path = CACHE_DIR / f"{name}.csv"
         exists = path.exists()
+        updated_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat() if exists else None
         return {
             "name": name,
             "exists": exists,
-            "updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat() if exists else None,
+            "updated_at": updated_at,
             "size_bytes": path.stat().st_size if exists else 0,
+            "latest_data_date": updated_at[:10] if isinstance(updated_at, str) else None,
         }
 
     return {
@@ -3807,6 +4278,7 @@ def data_source_cache_status():
         "nifty_futures": _status("nifty_futures"),
         "nifty_options_ce": _status("nifty_options_ce"),
         "nifty_options_pe": _status("nifty_options_pe"),
+        "participants": _participant_cache_status(),
     }
 
 
@@ -3834,34 +4306,748 @@ def _last_tuesday(year: int, month: int) -> datetime:
     return last_day
 
 
-def _build_expiry_list(count: int = 3) -> List[datetime]:
+def _build_expiry_list(previous_count: int = 5, next_count: int = 5) -> List[datetime]:
     today = datetime.now()
+    months_back = max(1, int(previous_count)) + 1
+    months_fwd = max(1, int(next_count)) + 1
     expiries: List[datetime] = []
-    year = today.year
-    month = today.month
-    while len(expiries) < count:
-        expiry = _last_tuesday(year, month)
-        if expiry >= today:
-            expiries.append(expiry)
+    start_month_anchor = datetime(today.year, today.month, 1) - timedelta(days=31 * months_back)
+    end_month_anchor = datetime(today.year, today.month, 1) + timedelta(days=31 * months_fwd)
+    year = start_month_anchor.year
+    month = start_month_anchor.month
+    while (year, month) <= (end_month_anchor.year, end_month_anchor.month):
+        expiries.append(_last_tuesday(year, month))
         month += 1
         if month > 12:
             month = 1
             year += 1
-    unique_expiries = sorted({expiry.date(): expiry for expiry in expiries}.values())
+
+    past = sorted([e for e in expiries if e < today], reverse=True)[: max(0, int(previous_count))]
+    future = sorted([e for e in expiries if e >= today])[: max(0, int(next_count))]
+    unique_expiries = sorted({e.date(): e for e in (past + future)}.values())
     return unique_expiries
 
 
+def _iter_dates(start_date: date, end_date: date) -> List[date]:
+    if start_date > end_date:
+        raise HTTPException(status_code=400, detail="start_date must be <= end_date")
+    days = (end_date - start_date).days
+    return [start_date + timedelta(days=offset) for offset in range(days + 1)]
+
+
+def _nse_reports_archives_payload() -> List[Dict[str, str]]:
+    return [
+        {
+            "name": "F&O - Participant wise Open Interest(csv)",
+            "type": "archives",
+            "category": "derivatives",
+            "section": "equity",
+        },
+        {
+            "name": "F&O - Participant wise Trading Volumes(csv)",
+            "type": "archives",
+            "category": "derivatives",
+            "section": "equity",
+        },
+    ]
+
+
+def _extract_date_from_participant_filename(path: Path) -> Optional[date]:
+    token = path.stem.split("_")[-1]
+    if len(token) != 8 or not token.isdigit():
+        return None
+    try:
+        return datetime.strptime(token, "%d%m%Y").date()
+    except Exception:
+        return None
+
+
+def _to_num(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return 0.0
+    try:
+        return float(text)
+    except Exception:
+        return 0.0
+
+
+def _parse_participant_csv(path: Path) -> Dict[str, Dict[str, float]]:
+    df = pd.read_csv(path, skiprows=1)
+    df.columns = [str(col).strip() for col in df.columns]
+    if "Client Type" not in df.columns:
+        raise ValueError(f"Unexpected participant CSV format: {path}")
+
+    out: Dict[str, Dict[str, float]] = {}
+    for _, row in df.iterrows():
+        raw_name = str(row.get("Client Type", "")).strip()
+        if not raw_name:
+            continue
+        normalized = raw_name.upper()
+        if normalized == "TOTAL":
+            continue
+        key = "PRO" if normalized == "PRO" else normalized
+        if key not in {"FII", "DII", "PRO", "CLIENT"}:
+            continue
+        fi_long = _to_num(row.get("Future Index Long"))
+        fi_short = _to_num(row.get("Future Index Short"))
+        call_long = _to_num(row.get("Option Index Call Long"))
+        call_short = _to_num(row.get("Option Index Call Short"))
+        put_long = _to_num(row.get("Option Index Put Long"))
+        put_short = _to_num(row.get("Option Index Put Short"))
+        total_long = _to_num(row.get("Total Long Contracts"))
+        total_short = _to_num(row.get("Total Short Contracts"))
+        out[key] = {
+            "future_index_long": fi_long,
+            "future_index_short": fi_short,
+            "future_index_net": fi_long - fi_short,
+            "option_index_call_long": call_long,
+            "option_index_call_short": call_short,
+            "option_index_call_net": call_long - call_short,
+            "option_index_put_long": put_long,
+            "option_index_put_short": put_short,
+            "option_index_put_net": put_long - put_short,
+            "total_long": total_long,
+            "total_short": total_short,
+            "total_net": total_long - total_short,
+        }
+    return out
+
+
+def _participant_cache_status() -> Dict[str, Any]:
+    nse_dir = ROOT / "database" / "nse_reports"
+    if not nse_dir.exists():
+        return {
+            "name": "participants",
+            "exists": False,
+            "updated_at": None,
+            "size_bytes": 0,
+            "latest_data_date": None,
+        }
+
+    oi_paths = sorted(nse_dir.glob("fao_participant_oi_*.csv"))
+    vol_paths = sorted(nse_dir.glob("fao_participant_vol_*.csv"))
+    oi_by_date: Dict[date, Path] = {}
+    vol_by_date: Dict[date, Path] = {}
+
+    for path in oi_paths:
+        parsed_date = _extract_date_from_participant_filename(path)
+        if parsed_date:
+            oi_by_date[parsed_date] = path
+    for path in vol_paths:
+        parsed_date = _extract_date_from_participant_filename(path)
+        if parsed_date:
+            vol_by_date[parsed_date] = path
+
+    common_dates = sorted(set(oi_by_date.keys()) & set(vol_by_date.keys()))
+    if not common_dates:
+        return {
+            "name": "participants",
+            "exists": False,
+            "updated_at": None,
+            "size_bytes": 0,
+            "latest_data_date": None,
+        }
+
+    latest_date = common_dates[-1]
+    latest_files = [oi_by_date[latest_date], vol_by_date[latest_date]]
+    latest_mtime = max([f.stat().st_mtime for f in latest_files if f.exists()], default=0.0)
+    total_size = sum(path.stat().st_size for path in (oi_paths + vol_paths) if path.exists())
+    return {
+        "name": "participants",
+        "exists": True,
+        "updated_at": datetime.fromtimestamp(latest_mtime).isoformat() if latest_mtime > 0 else None,
+        "size_bytes": total_size,
+        "latest_data_date": latest_date.isoformat(),
+    }
+
+
+def _load_nifty_close_map() -> Dict[date, float]:
+    path = CACHE_DIR / "nifty_ohlcv.csv"
+    if not path.exists():
+        return {}
+    try:
+        df = pd.read_csv(path)
+    except Exception:
+        return {}
+    if df.empty or "date" not in df.columns or "close" not in df.columns:
+        return {}
+    dt = pd.to_datetime(df["date"], errors="coerce")
+    close = pd.to_numeric(df["close"], errors="coerce")
+    out: Dict[date, float] = {}
+    for idx in range(len(df)):
+        d = dt.iloc[idx]
+        c = close.iloc[idx]
+        if pd.isna(d) or pd.isna(c):
+            continue
+        out[d.date()] = float(c)
+    return out
+
+
+@app.get("/spot-analysis/participants")
+def spot_analysis_participants(limit: int = 120):
+    nse_dir = ROOT / "database" / "nse_reports"
+    if not nse_dir.exists():
+        raise HTTPException(status_code=404, detail="NSE reports directory not found")
+
+    oi_paths = sorted(nse_dir.glob("fao_participant_oi_*.csv"))
+    vol_paths = sorted(nse_dir.glob("fao_participant_vol_*.csv"))
+    if not oi_paths or not vol_paths:
+        raise HTTPException(status_code=404, detail="Participant OI/VOL files not found")
+
+    oi_by_date: Dict[date, Path] = {}
+    vol_by_date: Dict[date, Path] = {}
+    for p in oi_paths:
+        d = _extract_date_from_participant_filename(p)
+        if d:
+            oi_by_date[d] = p
+    for p in vol_paths:
+        d = _extract_date_from_participant_filename(p)
+        if d:
+            vol_by_date[d] = p
+
+    all_common_dates = sorted(set(oi_by_date.keys()) & set(vol_by_date.keys()))
+    if not all_common_dates:
+        return {"rows": []}
+
+    close_map = _load_nifty_close_map()
+    sorted_close_dates = sorted(close_map.keys())
+    previous_close: Dict[date, float] = {}
+    prev_val: Optional[float] = None
+    for d in sorted_close_dates:
+        if prev_val is not None:
+            previous_close[d] = prev_val
+        prev_val = close_map[d]
+
+    parsed_by_date: Dict[date, Dict[str, Dict[str, Dict[str, float]]]] = {}
+    for d in all_common_dates:
+        parsed_by_date[d] = {
+            "oi": _parse_participant_csv(oi_by_date[d]),
+            "vol": _parse_participant_csv(vol_by_date[d]),
+        }
+
+    rows_asc: List[Dict[str, Any]] = []
+    prev_date: Optional[date] = None
+    for d in all_common_dates:
+        oi_data = parsed_by_date[d]["oi"]
+        vol_data = parsed_by_date[d]["vol"]
+        prev_oi_data = parsed_by_date[prev_date]["oi"] if prev_date in parsed_by_date else {}
+        participants: Dict[str, Dict[str, Any]] = {}
+        for name in ["FII", "DII", "PRO", "CLIENT"]:
+            oi = oi_data.get(name, {})
+            vol = vol_data.get(name, {})
+            prev_oi = prev_oi_data.get(name, {}) if isinstance(prev_oi_data, dict) else {}
+            fut_net_oi = _to_num(oi.get("future_index_net"))
+            fut_oi_chg = fut_net_oi - _to_num(prev_oi.get("future_index_net")) if prev_date else None
+            call_net_oi = _to_num(oi.get("option_index_call_net"))
+            put_net_oi = _to_num(oi.get("option_index_put_net"))
+            call_oi_chg = call_net_oi - _to_num(prev_oi.get("option_index_call_net")) if prev_date else None
+            put_oi_chg = put_net_oi - _to_num(prev_oi.get("option_index_put_net")) if prev_date else None
+            participants[name.lower()] = {
+                "futures_index_net_oi": fut_net_oi,
+                "futures_index_net_volume": _to_num(vol.get("future_index_net")),
+                "futures_index_oi_change": fut_oi_chg,
+                "option_index_call_net_oi": _to_num(oi.get("option_index_call_net")),
+                "option_index_put_net_oi": _to_num(oi.get("option_index_put_net")),
+                "option_index_call_oi_change": call_oi_chg,
+                "option_index_put_oi_change": put_oi_chg,
+                "option_index_call_net_volume": _to_num(vol.get("option_index_call_net")),
+                "option_index_put_net_volume": _to_num(vol.get("option_index_put_net")),
+                "total_net_volume": _to_num(vol.get("total_net")),
+                "total_net_oi": _to_num(oi.get("total_net")),
+                "signal": "BULLISH" if _to_num(fut_oi_chg) >= 0 else "BEARISH",
+            }
+
+        close = close_map.get(d)
+        prev_close = previous_close.get(d)
+        pct = None
+        if close is not None and prev_close is not None and prev_close != 0:
+            pct = ((close - prev_close) / prev_close) * 100.0
+
+        rows_asc.append(
+            {
+                "date": d.isoformat(),
+                "nifty_close": close,
+                "nifty_change_pct": pct,
+                "fii_buy_sell_amt_cr": (
+                    (_to_num(participants.get("fii", {}).get("futures_index_oi_change")) * float(close)) / 1e7
+                    if close is not None
+                    else None
+                ),
+                "fii_cash_cr": (
+                    (_to_num(participants.get("fii", {}).get("total_net_volume")) * float(close)) / 1e7
+                    if close is not None
+                    else None
+                ),
+                "dii_cash_cr": (
+                    (_to_num(participants.get("dii", {}).get("total_net_volume")) * float(close)) / 1e7
+                    if close is not None
+                    else None
+                ),
+                "participants": participants,
+            }
+        )
+        prev_date = d
+
+    rows = list(reversed(rows_asc))
+    if limit > 0:
+        rows = rows[:limit]
+    return {"rows": rows}
+
+
+@app.get("/spot-analysis/flow-model-summary")
+def spot_analysis_flow_model_summary(pred_limit: int = 20):
+    model_dir = ROOT / "artifacts" / "flow_spot_models"
+    metrics_path = model_dir / "metrics.json"
+    preds_path = model_dir / "test_predictions.csv"
+    diagnostics_path = model_dir / "diagnostics.json"
+    live_signal_path = model_dir / "live_signal.json"
+
+    if not metrics_path.exists() or not preds_path.exists():
+        raise HTTPException(status_code=404, detail="Model artifacts not found. Run training first.")
+
+    try:
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read metrics.json: {exc}")
+
+    try:
+        preds_df = pd.read_csv(preds_path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read test_predictions.csv: {exc}")
+
+    rows: List[Dict[str, Any]] = []
+    if not preds_df.empty:
+        preds_df["date"] = pd.to_datetime(preds_df.get("date"), errors="coerce")
+        preds_df = preds_df.sort_values(["horizon", "date"], ascending=[True, False])
+        if pred_limit > 0:
+            preds_df = preds_df.groupby("horizon", as_index=False).head(pred_limit)
+        for row in preds_df.to_dict(orient="records"):
+            clean: Dict[str, Any] = {}
+            for k, v in row.items():
+                clean[k] = _json_safe(v)
+            rows.append(clean)
+
+    diagnostics: Dict[str, Any] = {}
+    if diagnostics_path.exists():
+        try:
+            diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+        except Exception:
+            diagnostics = {}
+
+    live_signal: Dict[str, Any] = {"rows": []}
+    if live_signal_path.exists():
+        try:
+            live_signal = json.loads(live_signal_path.read_text(encoding="utf-8"))
+        except Exception:
+            live_signal = {"rows": []}
+
+    return {
+        "metrics": metrics,
+        "diagnostics": diagnostics,
+        "predictions": rows,
+        "live_signal": live_signal,
+    }
+
+
+@app.get("/spot-analysis/feature-diagnostics")
+def spot_analysis_feature_diagnostics(
+    rolling_window: int = 90,
+    top_n: int = 30,
+    corr_threshold: float = 0.9,
+):
+    artifacts_dir = ROOT / "artifacts" / "flow_spot_models"
+    metrics_path = artifacts_dir / "metrics.json"
+    metrics: Dict[str, Any] = {}
+    if metrics_path.exists():
+        try:
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except Exception:
+            metrics = {}
+
+    target_mode = str(metrics.get("target_mode") or "forward_mean_return")
+    test_days = int(metrics.get("test_days") or 10)
+    horizons_raw = metrics.get("horizons") or []
+    horizons = sorted(
+        {int(h.get("horizon")) for h in horizons_raw if isinstance(h, dict) and h.get("horizon") is not None}
+    ) or [1, 3, 5, 10]
+    selected_by_h: Dict[int, List[str]] = {
+        int(h.get("horizon")): [str(x) for x in (h.get("selected_features") or [])]
+        for h in horizons_raw
+        if isinstance(h, dict) and h.get("horizon") is not None
+    }
+
+    try:
+        df = flow_train._build_dataset()
+        feature_cols = flow_train._feature_columns(df)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to build feature dataset: {exc}")
+    if not feature_cols:
+        raise HTTPException(status_code=500, detail="No feature columns available")
+
+    working = df.dropna(subset=feature_cols).reset_index(drop=True)
+    rw = max(20, int(rolling_window))
+    tn = max(5, int(top_n))
+    th = max(0.0, min(0.999, float(corr_threshold)))
+
+    by_horizon: Dict[str, List[Dict[str, Any]]] = {}
+    all_selected_union: List[str] = []
+    for h in horizons:
+        target_col = f"target_ret_{h}"
+        d = flow_train._make_targets(working, h, target_mode=target_mode).dropna(subset=[target_col]).copy()
+        if len(d) <= test_days:
+            by_horizon[str(h)] = []
+            continue
+        train = d.iloc[:-test_days].copy()
+        y = pd.to_numeric(train[target_col], errors="coerce")
+        selected = [f for f in selected_by_h.get(h, []) if f in train.columns]
+        if not selected:
+            selected = feature_cols[: min(25, len(feature_cols))]
+        all_selected_union.extend(selected)
+
+        rows: List[Dict[str, Any]] = []
+        for c in selected:
+            x = pd.to_numeric(train[c], errors="coerce")
+            full_corr = x.corr(y)
+            roll_corr = x.rolling(rw).corr(y)
+            valid = roll_corr.dropna()
+            if valid.empty:
+                continue
+            mean_ic = float(valid.mean())
+            median_ic = float(valid.median())
+            ic_std = float(valid.std(ddof=0))
+            ic_ir = float(mean_ic / ic_std) if ic_std > 1e-12 else 0.0
+            pos = float((valid > 0).mean())
+            neg = float((valid < 0).mean())
+            rows.append(
+                {
+                    "feature": c,
+                    "full_corr": _json_safe(full_corr),
+                    "median_ic": _json_safe(median_ic),
+                    "mean_ic": _json_safe(mean_ic),
+                    "ic_std": _json_safe(ic_std),
+                    "ic_ir": _json_safe(ic_ir),
+                    "sign_consistency": _json_safe(max(pos, neg)),
+                    "coverage": _json_safe(float(valid.size) / float(len(train))),
+                }
+            )
+        rows = sorted(rows, key=lambda r: abs(float(r.get("median_ic") or 0.0)), reverse=True)[:tn]
+        by_horizon[str(h)] = rows
+
+    selected_unique = sorted(set(all_selected_union))
+    col_pairs: List[Dict[str, Any]] = []
+    if len(selected_unique) >= 2:
+        cx = working[selected_unique].apply(pd.to_numeric, errors="coerce").fillna(method="ffill").fillna(method="bfill")
+        cmat = cx.corr(numeric_only=True).abs()
+        for i, a in enumerate(selected_unique):
+            for b in selected_unique[i + 1:]:
+                v = cmat.at[a, b] if (a in cmat.index and b in cmat.columns) else np.nan
+                if pd.notna(v) and float(v) >= th:
+                    col_pairs.append({"feature_a": a, "feature_b": b, "abs_corr": float(v)})
+        col_pairs = sorted(col_pairs, key=lambda r: float(r["abs_corr"]), reverse=True)[:100]
+
+    return {
+        "target_mode": target_mode,
+        "test_days": test_days,
+        "rolling_window": rw,
+        "top_n": tn,
+        "corr_threshold": th,
+        "by_horizon": by_horizon,
+        "collinearity_pairs": col_pairs,
+    }
+
+
+@app.post("/spot-analysis/flow-model/train")
+def spot_analysis_flow_model_train(timeout_seconds: int = 600):
+    return _run_flow_model_training(timeout_seconds=timeout_seconds)
+
+
+def _run_flow_model_training(timeout_seconds: int = 600) -> Dict[str, Any]:
+    script_path = ROOT / "scripts" / "data" / "train_flow_probability_models.py"
+    if not script_path.exists():
+        raise HTTPException(status_code=404, detail=f"Training script not found: {script_path}")
+
+    cmd = [sys.executable, str(script_path)]
+    started_at = datetime.now(timezone.utc)
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            timeout=max(30, int(timeout_seconds)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(
+            status_code=504,
+            detail={
+                "status": "timeout",
+                "timeout_seconds": int(timeout_seconds),
+                "stdout": (exc.stdout or "")[-4000:],
+                "stderr": (exc.stderr or "")[-4000:],
+            },
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to run training script: {exc}")
+
+    ended_at = datetime.now(timezone.utc)
+    artifacts_dir = ROOT / "artifacts" / "flow_spot_models"
+    metrics_path = artifacts_dir / "metrics.json"
+    diagnostics_path = artifacts_dir / "diagnostics.json"
+    preds_path = artifacts_dir / "test_predictions.csv"
+    live_signal_path = artifacts_dir / "live_signal.json"
+
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "status": "error",
+                "return_code": result.returncode,
+                "stdout": (result.stdout or "")[-4000:],
+                "stderr": (result.stderr or "")[-4000:],
+            },
+        )
+
+    metrics: Dict[str, Any] = {}
+    if metrics_path.exists():
+        try:
+            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        except Exception:
+            metrics = {}
+
+    return {
+        "status": "ok",
+        "started_at": started_at.isoformat(),
+        "ended_at": ended_at.isoformat(),
+        "duration_seconds": (ended_at - started_at).total_seconds(),
+        "command": " ".join(cmd),
+        "stdout": (result.stdout or "")[-4000:],
+        "stderr": (result.stderr or "")[-4000:],
+        "artifacts": {
+            "metrics": str(metrics_path),
+            "diagnostics": str(diagnostics_path),
+            "predictions": str(preds_path),
+            "live_signal": str(live_signal_path),
+        },
+        "metrics": metrics,
+    }
+
+
+def _latest_participant_common_date() -> Optional[date]:
+    nse_dir = ROOT / "database" / "nse_reports"
+    if not nse_dir.exists():
+        return None
+    oi_paths = sorted(nse_dir.glob("fao_participant_oi_*.csv"))
+    vol_paths = sorted(nse_dir.glob("fao_participant_vol_*.csv"))
+    if not oi_paths or not vol_paths:
+        return None
+    oi_dates = {d for p in oi_paths if (d := _extract_date_from_participant_filename(p))}
+    vol_dates = {d for p in vol_paths if (d := _extract_date_from_participant_filename(p))}
+    common = sorted(oi_dates & vol_dates)
+    return common[-1] if common else None
+
+
+@app.post("/spot-analysis/flow-model/retrain-latest")
+def spot_analysis_flow_model_retrain_latest(
+    timeout_seconds: int = 900,
+):
+    latest_local = _latest_participant_common_date()
+    train_payload = _run_flow_model_training(timeout_seconds=timeout_seconds)
+    return {
+        "status": "skipped",
+        "reason": "cache_only_retrain",
+        "note": "No data fetch performed. Training used local caches only.",
+        "latest_local_date": latest_local.isoformat() if latest_local else None,
+        "training": train_payload,
+    }
+
+
+def _fetch_nse_report_for_date(session: requests.Session, dt: date, timeout_seconds: float) -> Dict[str, Any]:
+    api_url = "https://www.nseindia.com/api/reports"
+    params = {
+        "archives": json.dumps(_nse_reports_archives_payload(), separators=(",", ":")),
+        "date": dt.strftime("%d-%b-%Y"),
+        "type": "Archives",
+    }
+    response = session.get(api_url, params=params, timeout=timeout_seconds)
+    raw_preview = response.content[:120]
+    logger.info(
+        (
+            "[NSE_ARCHIVE][RESPONSE] date=%s status=%s content_type=%s "
+            "content_encoding=%s content_length_header=%s bytes=%d preview_hex=%s"
+        ),
+        dt.isoformat(),
+        response.status_code,
+        response.headers.get("content-type"),
+        response.headers.get("content-encoding"),
+        response.headers.get("content-length"),
+        len(response.content),
+        raw_preview.hex(),
+    )
+    response.raise_for_status()
+    content_type = (response.headers.get("content-type") or "").lower()
+    is_zip = "application/zip" in content_type or response.content[:2] == b"PK"
+    if is_zip:
+        return {
+            "format": "zip",
+            "content_type": response.headers.get("content-type"),
+            "body": response.content,
+        }
+    return {
+        "format": "json",
+        "content_type": response.headers.get("content-type"),
+        "body": response.json(),
+    }
+
+
+def _fetch_nse_reports_range_impl(
+    start_date: date,
+    end_date: date,
+    delay_seconds: float = 2.0,
+    timeout_seconds: float = 10.0,
+) -> Dict[str, Any]:
+    dates = _iter_dates(start_date, end_date)
+    output_dir = ROOT / "database" / "nse_reports"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    session = requests.Session()
+    session.headers.update(
+        {
+            "user-agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "accept": "*/*",
+            "accept-language": "en-US,en;q=0.9",
+            "cache-control": "no-cache",
+            "pragma": "no-cache",
+            "referer": "https://www.nseindia.com/reports",
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "same-origin",
+            "x-requested-with": "XMLHttpRequest",
+        }
+    )
+
+    try:
+        session.get("https://www.nseindia.com/reports", timeout=timeout_seconds)
+    except Exception:
+        logger.warning("NSE warmup request failed; continuing with direct API calls")
+
+    results: List[Dict[str, Any]] = []
+    for idx, dt in enumerate(dates):
+        iso_day = dt.isoformat()
+        start_ts = time.perf_counter()
+        logger.info("[NSE_ARCHIVE] start date=%s", iso_day)
+        try:
+            payload = _fetch_nse_report_for_date(session=session, dt=dt, timeout_seconds=timeout_seconds)
+            fmt = str(payload.get("format"))
+            if fmt == "zip":
+                with zipfile.ZipFile(io.BytesIO(payload["body"])) as zf:
+                    members = [name for name in zf.namelist() if name and not name.endswith("/")]
+                    zf.extractall(output_dir)
+                saved_files = [str(output_dir / name) for name in members]
+            else:
+                file_path = output_dir / f"nse_{iso_day}.json"
+                file_path.write_text(json.dumps(payload["body"], ensure_ascii=True), encoding="utf-8")
+                saved_files = [str(file_path)]
+            elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
+            logger.info(
+                "[NSE_ARCHIVE] finish date=%s status=ok format=%s files=%s elapsed_ms=%d",
+                iso_day,
+                fmt,
+                saved_files,
+                elapsed_ms,
+            )
+            results.append(
+                {"date": iso_day, "status": "ok", "format": fmt, "files": saved_files, "elapsed_ms": elapsed_ms}
+            )
+        except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
+            logger.exception("[NSE_ARCHIVE] finish date=%s status=error elapsed_ms=%d", iso_day, elapsed_ms)
+            results.append({"date": iso_day, "status": "error", "error": str(exc), "elapsed_ms": elapsed_ms})
+
+        if idx < len(dates) - 1 and delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+    ok_count = sum(1 for item in results if item.get("status") == "ok")
+    return {
+        "status": "completed",
+        "total_dates": len(dates),
+        "ok": ok_count,
+        "failed": len(dates) - ok_count,
+        "delay_seconds": delay_seconds,
+        "timeout_seconds": timeout_seconds,
+        "results": results,
+    }
+
+
+@app.post("/data-source/nse-reports/fetch-range")
+def fetch_nse_reports_range(
+    start_date: date,
+    end_date: date,
+    delay_seconds: float = 2.0,
+    timeout_seconds: float = 10.0,
+):
+    return _fetch_nse_reports_range_impl(
+        start_date=start_date,
+        end_date=end_date,
+        delay_seconds=delay_seconds,
+        timeout_seconds=timeout_seconds,
+    )
+
+
 @app.post("/data-source/refresh/{name}")
-def data_source_refresh(name: str, request: Request):
+def data_source_refresh(
+    name: str,
+    request: Request,
+    previous_count: Optional[int] = None,
+    next_count: Optional[int] = None,
+    lookback_days: int = 1825,
+):
     name = name.strip()
-    if name not in {"nifty_ohlcv", "nifty_futures", "nifty_options_ce", "nifty_options_pe"}:
+    if name not in {"nifty_ohlcv", "nifty_futures", "nifty_options_ce", "nifty_options_pe", "participants"}:
         raise HTTPException(status_code=400, detail="Unsupported dataset")
+
+    if name == "participants":
+        status = _participant_cache_status()
+        today = datetime.now().date()
+        latest_cached: Optional[date] = None
+        latest_data_date = status.get("latest_data_date")
+        if isinstance(latest_data_date, str):
+            try:
+                latest_cached = datetime.strptime(latest_data_date, "%Y-%m-%d").date()
+            except Exception:
+                latest_cached = None
+
+        start_date = latest_cached if latest_cached is not None else (today - timedelta(days=7))
+        if start_date > today:
+            start_date = today
+
+        result = _fetch_nse_reports_range_impl(
+            start_date=start_date,
+            end_date=today,
+            delay_seconds=2.0,
+            timeout_seconds=10.0,
+        )
+        result["dataset"] = "participants"
+        result["start_date"] = start_date.isoformat()
+        result["end_date"] = today.isoformat()
+        result["mode"] = "from_last_update_to_today" if latest_cached is not None else "recent_7d_seed"
+        return result
 
     if name == "nifty_ohlcv":
         creds = _get_credentials(request)
         kite = _get_kite_client(creds.api_key, creds.access_token)
         to_date = datetime.now()
-        from_date = to_date - timedelta(days=730)
+        use_lookback_days = max(30, int(lookback_days))
+        from_date = to_date - timedelta(days=use_lookback_days)
         instrument_token = 256265
         data = kite.historical_data(
             instrument_token=instrument_token,
@@ -3874,18 +5060,36 @@ def data_source_refresh(name: str, request: Request):
             raise HTTPException(status_code=500, detail="No OHLCV data returned")
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         df.to_csv(CACHE_DIR / "nifty_ohlcv.csv", index=False)
-        return {"status": "ok", "rows": len(df)}
+        return {
+            "status": "ok",
+            "rows": len(df),
+            "lookback_days": use_lookback_days,
+            "from_date": from_date.date().isoformat(),
+            "to_date": to_date.date().isoformat(),
+        }
 
     fetcher = NSEDataFetcher()
-    expiries = _build_expiry_list()
-    to_date = datetime.now()
-    from_date = to_date - timedelta(days=90)
-    from_date_str = from_date.strftime('%d-%m-%Y')
-    to_date_str = to_date.strftime('%d-%m-%Y')
+    today = datetime.now().date()
+
+    # Default behavior preserved; callers can override via query params.
+    default_previous = 5 if name == "nifty_futures" else 4
+    default_next = 5 if name == "nifty_futures" else 3
+    use_previous = default_previous if previous_count is None else int(previous_count)
+    use_next = default_next if next_count is None else int(next_count)
+    if use_previous < 0 or use_next < 0:
+        raise HTTPException(status_code=400, detail="previous_count and next_count must be >= 0")
+    if (use_previous + use_next) <= 0:
+        raise HTTPException(status_code=400, detail="At least one of previous_count or next_count must be > 0")
+    expiries = _build_expiry_list(previous_count=use_previous, next_count=use_next)
 
     if name == "nifty_futures":
         all_futures = []
         for expiry in expiries:
+            expiry_date = expiry.date()
+            window_from = expiry_date - timedelta(days=60)
+            window_to = min(expiry_date, today)
+            from_date_str = window_from.strftime('%d-%m-%Y')
+            to_date_str = window_to.strftime('%d-%m-%Y')
             raw = fetcher.fetch_futures_data(
                 from_date=from_date_str,
                 to_date=to_date_str,
@@ -3902,12 +5106,30 @@ def data_source_refresh(name: str, request: Request):
             raise HTTPException(status_code=500, detail="No futures data fetched")
         df = pd.concat(all_futures, ignore_index=True)
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        df.to_csv(CACHE_DIR / "nifty_futures.csv", index=False)
-        return {"status": "ok", "rows": len(df)}
+        cache_path = CACHE_DIR / "nifty_futures.csv"
+        merged = _append_csv_dedup(
+            cache_path,
+            df,
+            dedup_cols=["date", "expiry_date", "symbol", "instrument_type"],
+        )
+        merged.to_csv(cache_path, index=False)
+        return {
+            "status": "ok",
+            "fetched_rows": len(df),
+            "total_rows": len(merged),
+            "previous_count": use_previous,
+            "next_count": use_next,
+            "expiries": [e.strftime("%Y-%m-%d") for e in expiries],
+        }
 
     opt_type = "CE" if name == "nifty_options_ce" else "PE"
     all_options = []
     for expiry in expiries:
+        expiry_date = expiry.date()
+        window_from = expiry_date - timedelta(days=60)
+        window_to = min(expiry_date, today)
+        from_date_str = window_from.strftime('%d-%m-%Y')
+        to_date_str = window_to.strftime('%d-%m-%Y')
         raw = fetcher.fetch_options_data(
             from_date=from_date_str,
             to_date=to_date_str,
@@ -3926,7 +5148,13 @@ def data_source_refresh(name: str, request: Request):
     df = pd.concat(all_options, ignore_index=True)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     df.to_csv(CACHE_DIR / f"{name}.csv", index=False)
-    return {"status": "ok", "rows": len(df)}
+    return {
+        "status": "ok",
+        "rows": len(df),
+        "previous_count": use_previous,
+        "next_count": use_next,
+        "expiries": [e.strftime("%Y-%m-%d") for e in expiries],
+    }
 
 
 if FRONTEND_DIST.exists():

@@ -7,7 +7,13 @@ import { useCachedApi } from "../hooks/useCachedApi";
 import { API_BASE_URL } from "../api/client";
 import { useNotifications } from "../state/NotificationContext";
 
-type CacheStatus = Record<string, { name?: string; exists: boolean; updated_at: string | null; size_bytes: number }>;
+type CacheStatus = Record<string, {
+  name?: string;
+  exists: boolean;
+  updated_at: string | null;
+  size_bytes: number;
+  latest_data_date?: string | null;
+}>;
 type RowsResponse = { rows: Record<string, unknown>[] };
 type OptionsResponse = { ce: Record<string, unknown>[]; pe: Record<string, unknown>[] };
 
@@ -30,7 +36,8 @@ export default function DataSource() {
         name: key,
         exists: val.exists ? "Yes" : "No",
         updated_at: val.updated_at || "N/A",
-        size_bytes: val.size_bytes
+        size_bytes: val.size_bytes,
+        latest_data_date: val.latest_data_date || "N/A"
       }))
     : []), [data]);
 
@@ -68,6 +75,7 @@ export default function DataSource() {
               { key: "name", label: "Dataset" },
               { key: "exists", label: "Exists" },
               { key: "updated_at", label: "Updated" },
+              { key: "latest_data_date", label: "Latest Data Date" },
               { key: "size_bytes", label: "Size (bytes)" },
               {
                 key: "action",
@@ -96,7 +104,11 @@ export default function DataSource() {
                       }
                     }}
                   >
-                    {refreshing === String(row.name) ? "Updating..." : "Fetch Latest"}
+                    {refreshing === String(row.name)
+                      ? "Updating..."
+                      : String(row.name) === "participants"
+                        ? "Update to Today"
+                        : "Fetch Latest"}
                   </button>
                 )
               }

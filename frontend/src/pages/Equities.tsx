@@ -219,7 +219,7 @@ export default function Equities() {
         "stockDetailsReusableData.marketCap"
       ]);
       let marketCapBucket: ScoredRow["marketCapBucket"] = "Unknown";
-      if (Number.isFinite(marketCap)) {
+      if (marketCap !== undefined && Number.isFinite(marketCap)) {
         marketCapBucket = marketCap >= 5e11 ? "Large" : "Mid";
       }
       const qty = Number(r.qty || 0);

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import SectionCard from "../components/SectionCard";
 import LoadingState from "../components/LoadingState";
 import ErrorState from "../components/ErrorState";
@@ -7,23 +7,30 @@ import { useCachedApi } from "../hooks/useCachedApi";
 import { apiFetch } from "../api/client";
 
 export default function LongTerm() {
-  const { error } = useCachedApi<{ rows: Record<string, unknown>[]; count?: number; shown?: number }>(
-    "long_term_instruments",
-    "/long-term/instruments?limit=250&instrument_type=EQ&exchange=NSE",
-    300_000
-  );
-  const { data: universeData } = useCachedApi<{
-    nifty100?: { matched?: Record<string, unknown>[]; missing?: string[]; count?: number };
-    midcap150?: { matched?: Record<string, unknown>[]; missing?: string[]; count?: number };
-  }>(
-    "long_term_universe_match",
-    "/long-term/universe-match",
-    300_000
-  );
   const { data: ohlcvData } = useCachedApi<{ rows: Record<string, unknown>[]; count?: number }>(
     "long_term_ohlcv_latest",
-    "/long-term/ohlcv-latest?days=30&limit=250",
-    300_000
+    "/long-term/ohlcv-latest?days=30&limit=250&use_cache=false",
+    0
+  );
+  const { data: momentumData } = useCachedApi<{ rows: Record<string, unknown>[]; count?: number }>(
+    "long_term_momentum_scores",
+    "/long-term/momentum-scores?lookback_days=320&limit=250&use_cache=false",
+    0
+  );
+  const { data: earningsData } = useCachedApi<{ rows: Record<string, unknown>[]; count?: number }>(
+    "long_term_earnings_scores",
+    "/long-term/earnings-scores?limit=250",
+    0
+  );
+  const { data: qualityData } = useCachedApi<{ rows: Record<string, unknown>[]; count?: number }>(
+    "long_term_quality_scores",
+    "/long-term/quality-scores?limit=250",
+    0
+  );
+  const { data: finalCompositeData } = useCachedApi<{ rows: Record<string, unknown>[]; count?: number }>(
+    "long_term_final_composite_scores",
+    "/long-term/final-composite-scores?limit=250",
+    0
   );
   const [fundamentalsData, setFundamentalsData] = useState<{ rows: Record<string, unknown>[]; count?: number } | null>(null);
   const [fundamentalsError, setFundamentalsError] = useState<string | null>(null);
@@ -32,17 +39,6 @@ export default function LongTerm() {
   const [detailJson, setDetailJson] = useState<Record<string, unknown> | null>(null);
   const [detailLoading, setDetailLoading] = useState<boolean>(false);
   const [detailError, setDetailError] = useState<string | null>(null);
-
-  const matchedRows = useMemo(() => {
-    const rows: Record<string, unknown>[] = [];
-    (universeData?.nifty100?.matched || []).forEach((m) => {
-      rows.push({ symbol: (m as Record<string, unknown>).tradingsymbol, group: "NIFTY100" });
-    });
-    (universeData?.midcap150?.matched || []).forEach((m) => {
-      rows.push({ symbol: (m as Record<string, unknown>).tradingsymbol, group: "MIDCAP150" });
-    });
-    return rows;
-  }, [universeData]);
 
 
   useEffect(() => {
@@ -69,59 +65,6 @@ export default function LongTerm() {
 
   return (
     <>
-      {error ? <ErrorState message={error} /> : null}
-      <SectionCard title="Universe Match (NIFTY100 + MIDCAP150)">
-        {!universeData ? (
-          <LoadingState />
-        ) : (
-          <>
-            <div style={{ marginBottom: 12, color: "#b9c4d6" }}>
-              NIFTY100 missing: {universeData.nifty100?.missing?.length ?? 0}
-              {" "} | MIDCAP150 missing: {universeData.midcap150?.missing?.length ?? 0}
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16, marginBottom: 16 }}>
-              <div className="chart-panel">
-                <h4>NIFTY100 Matched</h4>
-                <div style={{ maxHeight: 220, overflow: "auto", color: "#b9c4d6" }}>
-                  {(universeData.nifty100?.matched || []).map((m) => (
-                    <div key={String((m as Record<string, unknown>).tradingsymbol || (m as Record<string, unknown>).symbol || (m as Record<string, unknown>).name || Math.random())}>
-                      {String((m as Record<string, unknown>).tradingsymbol || (m as Record<string, unknown>).symbol || (m as Record<string, unknown>).name || "—")}
-                    </div>
-                  ))}
-                </div>
-              </div>
-              <div className="chart-panel">
-                <h4>MIDCAP150 Matched</h4>
-                <div style={{ maxHeight: 220, overflow: "auto", color: "#b9c4d6" }}>
-                  {(universeData.midcap150?.matched || []).map((m) => (
-                    <div key={String((m as Record<string, unknown>).tradingsymbol || (m as Record<string, unknown>).symbol || (m as Record<string, unknown>).name || Math.random())}>
-                      {String((m as Record<string, unknown>).tradingsymbol || (m as Record<string, unknown>).symbol || (m as Record<string, unknown>).name || "—")}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 16 }}>
-              <div className="chart-panel">
-                <h4>NIFTY100 Missing</h4>
-                <div style={{ maxHeight: 220, overflow: "auto", color: "#b9c4d6" }}>
-                  {(universeData.nifty100?.missing || []).map((m) => (
-                    <div key={m}>{m}</div>
-                  ))}
-                </div>
-              </div>
-              <div className="chart-panel">
-                <h4>MIDCAP150 Missing</h4>
-                <div style={{ maxHeight: 220, overflow: "auto", color: "#b9c4d6" }}>
-                  {(universeData.midcap150?.missing || []).map((m) => (
-                    <div key={m}>{m}</div>
-                  ))}
-                </div>
-              </div>
-            </div>
-          </>
-        )}
-      </SectionCard>
       <SectionCard title="Universe OHLCV (Latest, Sorted by Volume)">
         {!ohlcvData ? (
           <LoadingState />
@@ -237,8 +180,132 @@ export default function LongTerm() {
                 }
               ]}
               rows={fundamentalsData?.rows || []}
+              maxHeight={400}
+            />
+          </>
+        )}
+      </SectionCard>
+      <SectionCard title="Momentum Strategy Scores">
+        {!momentumData ? (
+          <LoadingState />
+        ) : (
+          <>
+            <div style={{ marginBottom: 12, color: "#b9c4d6" }}>
+              Rows: {momentumData.count ?? momentumData.rows.length}
+            </div>
+            <DataTable
+              columns={[
+                { key: "symbol", label: "Symbol" },
+                { key: "close", label: "Close", format: (v) => (v == null ? "—" : Number(v).toFixed(2)) },
+                { key: "momentum_1m_pct", label: "1M Mom %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "momentum_3m_pct", label: "3M Mom %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "momentum_6m_pct", label: "6M Mom %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "trend_strength_pct", label: "Trend % (50/200)", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "breakout_55d_pct", label: "55D Breakout %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "risk_adj_3m", label: "Risk-Adj 3M", format: (v) => (v == null ? "—" : Number(v).toFixed(3)) },
+                { key: "score_1m", label: "Score 1M", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_3m", label: "Score 3M", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_6m", label: "Score 6M", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_trend", label: "Score Trend", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_breakout", label: "Score Breakout", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_risk_adj", label: "Score RiskAdj", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "composite_score", label: "Composite Score", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+              ]}
+              rows={momentumData.rows || []}
               maxHeight={640}
             />
+          </>
+        )}
+      </SectionCard>
+      <SectionCard title="Earnings Acceleration Scores (*)">
+        {!earningsData ? (
+          <LoadingState />
+        ) : (
+          <>
+            <div style={{ marginBottom: 12, color: "#b9c4d6" }}>
+              Rows: {earningsData.count ?? earningsData.rows.length}
+            </div>
+            <DataTable
+              columns={[
+                { key: "symbol", label: "Symbol" },
+                { key: "eps_qoq_yoy_pct", label: "EPS QoQ YoY %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "eps_ttm_growth_pct", label: "EPS TTM Growth %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "revenue_qoq_yoy_pct", label: "Revenue QoQ YoY %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "operating_margin_trend_pct", label: "Op Margin Trend %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "score_eps_qoq_yoy", label: "Score EPS QoQ (40%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_eps_ttm", label: "Score EPS TTM (30%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_revenue_qoq_yoy", label: "Score Rev QoQ (20%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_op_margin_trend", label: "Score OpMargin (10%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "coverage_weight", label: "Coverage %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(0)}%`) },
+                { key: "earnings_acceleration_score", label: "Composite Score*", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+              ]}
+              rows={earningsData.rows || []}
+              maxHeight={640}
+            />
+            <div style={{ marginTop: 8, color: "#8fa1b8", fontSize: 12 }}>
+              * Coverage-normalized score (weights rescaled by available metrics).
+            </div>
+          </>
+        )}
+      </SectionCard>
+      <SectionCard title="Quality Scores (*)">
+        {!qualityData ? (
+          <LoadingState />
+        ) : (
+          <>
+            <div style={{ marginBottom: 12, color: "#b9c4d6" }}>
+              Rows: {qualityData.count ?? qualityData.rows.length}
+            </div>
+            <DataTable
+              columns={[
+                { key: "symbol", label: "Symbol" },
+                { key: "roe_pct", label: "ROE %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "roce_pct", label: "ROCE %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "debt_to_equity", label: "Debt/Equity", format: (v) => (v == null ? "—" : Number(v).toFixed(2)) },
+                { key: "interest_coverage", label: "Interest Coverage", format: (v) => (v == null ? "—" : Number(v).toFixed(2)) },
+                { key: "operating_margin_pct", label: "Operating Margin %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "net_profit_margin_pct", label: "Net Profit Margin %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(2)}%`) },
+                { key: "beta", label: "Beta", format: (v) => (v == null ? "—" : Number(v).toFixed(2)) },
+                { key: "score_roe", label: "Score ROE (30%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_roce", label: "Score ROCE (20%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_debt_to_equity", label: "Score D/E Inv (20%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_interest_coverage", label: "Score IntCov (20%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "score_operating_margin", label: "Score OpMargin (10%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "coverage_weight", label: "Coverage %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(0)}%`) },
+                { key: "quality_score", label: "Quality Score*", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+              ]}
+              rows={qualityData.rows || []}
+              maxHeight={640}
+            />
+            <div style={{ marginTop: 8, color: "#8fa1b8", fontSize: 12 }}>
+              * Coverage-normalized score (weights rescaled by available metrics).
+            </div>
+          </>
+        )}
+      </SectionCard>
+      <SectionCard title="Final Composite Scores (55/30/15) (*)">
+        {!finalCompositeData ? (
+          <LoadingState />
+        ) : (
+          <>
+            <div style={{ marginBottom: 12, color: "#b9c4d6" }}>
+              Rows: {finalCompositeData.count ?? finalCompositeData.rows.length}
+            </div>
+            <DataTable
+              columns={[
+                { key: "symbol", label: "Symbol" },
+                { key: "momentum_composite_score", label: "Momentum (55%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "earnings_acceleration_score", label: "Earnings (30%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "quality_score", label: "Quality (15%)", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+                { key: "coverage_weight", label: "Coverage %", format: (v) => (v == null ? "—" : `${Number(v).toFixed(0)}%`) },
+                { key: "final_composite_score", label: "Final Composite*", format: (v) => (v == null ? "—" : Number(v).toFixed(1)) },
+              ]}
+              rows={finalCompositeData.rows || []}
+              maxHeight={640}
+            />
+            <div style={{ marginTop: 8, color: "#8fa1b8", fontSize: 12 }}>
+              * Coverage-normalized score (missing model weights are renormalized).
+            </div>
           </>
         )}
       </SectionCard>

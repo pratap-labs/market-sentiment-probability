@@ -11,6 +11,17 @@ type Ohlcv = { rows: Record<string, unknown>[]; summary: Record<string, unknown>
 type Futures = { rows: Record<string, unknown>[] };
 type Options = { ce: Record<string, unknown>[]; pe: Record<string, unknown>[] };
 
+const EXPIRY_PALETTE = [
+  "#2D7DFF",
+  "#FF9F1C",
+  "#2EC4B6",
+  "#E96767",
+  "#9B5DE5",
+  "#75F37B",
+  "#F15BB5",
+  "#00BBF9"
+];
+
 export default function RiskBucketsSpotAnalysis() {
   const history = useCachedApi<History>(
     "risk_buckets_history",
@@ -19,7 +30,7 @@ export default function RiskBucketsSpotAnalysis() {
   );
   const ohlcv = useCachedApi<Ohlcv>("nifty_ohlcv", "/derivatives/nifty-ohlcv?limit=400", 60_000);
   const futures = useCachedApi<Futures>("nifty_futures", "/derivatives/futures?limit=600", 60_000);
-  const options = useCachedApi<Options>("nifty_options", "/derivatives/options?limit=600", 60_000);
+  const options = useCachedApi<Options>("nifty_options", "/derivatives/options?limit=25000", 60_000);
   const { setControls } = useControls();
   const [selectedExpiry, setSelectedExpiry] = useState<string>("All");
 
@@ -40,12 +51,52 @@ export default function RiskBucketsSpotAnalysis() {
     rows.forEach((r) => {
       const expiry = String(r.expiry_date || r.expiry || "");
       if (!expiry) return;
+      if (expiry.startsWith("2025-10")) return;
       if (!byExpiry[expiry]) byExpiry[expiry] = { x: [], oi: [] };
       byExpiry[expiry].x.push(String(r.date || ""));
       byExpiry[expiry].oi.push(Number(r.open_interest || 0));
     });
     return byExpiry;
   }, [futures.data]);
+
+  const expiryColorMap = useMemo(() => {
+    const expirySet = new Set<string>();
+    Object.keys(futuresSeries).forEach((e) => expirySet.add(e));
+    (options.data?.ce || []).forEach((r) => {
+      const e = String(r.expiry_date || r.expiry || "");
+      if (e) expirySet.add(e);
+    });
+    (options.data?.pe || []).forEach((r) => {
+      const e = String(r.expiry_date || r.expiry || "");
+      if (e) expirySet.add(e);
+    });
+    const all = Array.from(expirySet).sort();
+    const out: Record<string, string> = {};
+    all.forEach((e, i) => {
+      out[e] = EXPIRY_PALETTE[i % EXPIRY_PALETTE.length];
+    });
+    return out;
+  }, [futuresSeries, options.data]);
+
+  const sharedOiXRange = useMemo(() => {
+    const fixedStart = "2025-10-01";
+    const futuresDates: string[] = [];
+    Object.values(futuresSeries).forEach((s) => {
+      s.x.forEach((d) => {
+        if (d) futuresDates.push(String(d));
+      });
+    });
+    const optionsDates = [
+      ...(options.data?.ce || []).map((r) => String(r.date || "")),
+      ...(options.data?.pe || []).map((r) => String(r.date || "")),
+    ].filter(Boolean);
+    const all = [...futuresDates, ...optionsDates]
+      .map((d) => String(d))
+      .filter(Boolean)
+      .sort();
+    if (!all.length) return [fixedStart, fixedStart];
+    return [fixedStart, all[all.length - 1]];
+  }, [futuresSeries, options.data]);
 
   const expiries = useMemo(() => {
     const ce = options.data?.ce || [];
@@ -90,28 +141,59 @@ export default function RiskBucketsSpotAnalysis() {
   const optionsOiTrend = useMemo(() => {
     const ce = options.data?.ce || [];
     const pe = options.data?.pe || [];
-    const all = [...ce, ...pe];
-    const filtered = selectedExpiry === "All"
-      ? all
-      : all.filter((r) => String(r.expiry_date || r.expiry || "") === selectedExpiry);
+    const rows: Array<Record<string, unknown> & { __side: "CE" | "PE" }> = [
+      ...ce.map((r) => ({ ...r, __side: "CE" as const })),
+      ...pe.map((r) => ({ ...r, __side: "PE" as const }))
+    ];
+    if (!rows.length) return { dates: [] as string[], traces: [] as any[] };
 
-    const byDate = new Map<string, { ce: number; pe: number }>();
-    filtered.forEach((r) => {
-      const date = String(r.date || "");
-      if (!date) return;
-      const optType = String(r.option_type || "").toUpperCase();
-      const oi = Number(r.open_int || r.open_interest || 0);
-      const entry = byDate.get(date) || { ce: 0, pe: 0 };
-      if (optType === "CE") entry.ce += oi;
-      if (optType === "PE") entry.pe += oi;
-      byDate.set(date, entry);
+    const allDates = Array.from(
+      new Set(rows.map((r) => String(r["date"] || "")).filter(Boolean))
+    ).sort();
+    const dateIndex = new Map<string, number>(allDates.map((d, i) => [d, i]));
+
+    const byExpiry: Record<string, { CE: (number | null)[]; PE: (number | null)[] }> = {};
+    rows.forEach((r) => {
+      const expiry = String(r["expiry_date"] || r["expiry"] || "");
+      const date = String(r["date"] || "");
+      if (!expiry || !date || !dateIndex.has(date)) return;
+      if (!byExpiry[expiry]) {
+        byExpiry[expiry] = {
+          CE: Array(allDates.length).fill(null),
+          PE: Array(allDates.length).fill(null)
+        };
+      }
+      const side = r.__side;
+      const idx = dateIndex.get(date)!;
+      const oi = Number(r["open_int"] || r["open_interest"] || 0);
+      const prev = byExpiry[expiry][side][idx];
+      byExpiry[expiry][side][idx] = (prev ?? 0) + oi;
     });
-    const dates = Array.from(byDate.keys()).sort();
-    const ceSeries = dates.map((d) => byDate.get(d)?.ce || 0);
-    const peSeries = dates.map((d) => byDate.get(d)?.pe || 0);
-    const total = dates.map((_, i) => ceSeries[i] + peSeries[i]);
-    return { dates, ceSeries, peSeries, total };
-  }, [options.data, selectedExpiry]);
+
+    const expiryList = Object.keys(byExpiry).sort();
+    const traces: any[] = [];
+    expiryList.forEach((expiry) => {
+      const color = expiryColorMap[expiry] || "#2D7DFF";
+      traces.push({
+        type: "scatter",
+        mode: "lines",
+        name: `${expiry} CE`,
+        x: allDates,
+        y: byExpiry[expiry].CE,
+        line: { color, width: 2 }
+      });
+      traces.push({
+        type: "scatter",
+        mode: "lines",
+        name: `${expiry} PE`,
+        x: allDates,
+        y: byExpiry[expiry].PE,
+        line: { color, width: 1.6, dash: "dot" }
+      });
+    });
+
+    return { dates: allDates, traces };
+  }, [options.data, expiryColorMap]);
 
   const perStrike = useMemo(() => {
     const ce = options.data?.ce || [];
@@ -218,15 +300,17 @@ export default function RiskBucketsSpotAnalysis() {
               mode: "lines",
               name: expiry,
               x: s.x,
-              y: s.oi
+              y: s.oi,
+              line: { color: expiryColorMap[expiry] || "#2D7DFF", width: 2 }
             }))}
             layout={{
               height: 320,
               paper_bgcolor: "rgba(0,0,0,0)",
               plot_bgcolor: "rgba(0,0,0,0)",
               margin: { l: 30, r: 30, t: 30, b: 30 },
-              xaxis: { tickfont: { color: "#b9c4d6", size: 10 } },
-              yaxis: { tickfont: { color: "#b9c4d6", size: 10 } }
+              xaxis: { tickfont: { color: "#b9c4d6", size: 10 }, range: sharedOiXRange },
+              yaxis: { tickfont: { color: "#b9c4d6", size: 10 } },
+              showlegend: false
             }}
             config={{ displayModeBar: false, responsive: true }}
             useResizeHandler
@@ -238,18 +322,15 @@ export default function RiskBucketsSpotAnalysis() {
       <SectionCard title="Options OI Trend">
         {options.loading || !options.data ? <LoadingState /> : (
           <Plot
-            data={[
-              { type: "scatter", mode: "lines", name: "Total OI", x: optionsOiTrend.dates, y: optionsOiTrend.total, line: { color: "#2D7DFF", width: 2 } },
-              { type: "scatter", mode: "lines", name: "CE OI", x: optionsOiTrend.dates, y: optionsOiTrend.ceSeries, line: { color: "#E96767", width: 1.5 } },
-              { type: "scatter", mode: "lines", name: "PE OI", x: optionsOiTrend.dates, y: optionsOiTrend.peSeries, line: { color: "#75F37B", width: 1.5 } }
-            ]}
+            data={optionsOiTrend.traces}
             layout={{
               height: 300,
               paper_bgcolor: "rgba(0,0,0,0)",
               plot_bgcolor: "rgba(0,0,0,0)",
-              margin: { l: 30, r: 30, t: 30, b: 30 },
-              xaxis: { tickfont: { color: "#b9c4d6", size: 10 } },
-              yaxis: { tickfont: { color: "#b9c4d6", size: 10 } }
+              margin: { l: 30, r: 30, t: 30, b: 80 },
+              xaxis: { tickfont: { color: "#b9c4d6", size: 10 }, range: sharedOiXRange },
+              yaxis: { tickfont: { color: "#b9c4d6", size: 10 } },
+              legend: { orientation: "h", y: -0.22, x: 0, xanchor: "left", yanchor: "top" }
             }}
             config={{ displayModeBar: false, responsive: true }}
             useResizeHandler
