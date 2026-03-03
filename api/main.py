@@ -5161,25 +5161,20 @@ def data_source_refresh(
 
 
 if FRONTEND_DIST.exists():
-    def _frontend_index_response(request: Request) -> HTMLResponse:
-        index_path = FRONTEND_DIST / "index.html"
-        html = index_path.read_text(encoding="utf-8")
-        root_path = str(request.scope.get("root_path") or "").rstrip("/")
-        if root_path:
-            html = html.replace(' src="/', f' src="{root_path}/')
-            html = html.replace(' href="/', f' href="{root_path}/')
-        return HTMLResponse(content=html)
-
     @app.get("/")
-    def frontend_index(request: Request):
-        return _frontend_index_response(request)
+    def frontend_index():
+        return FileResponse(FRONTEND_DIST / "index.html")
 
-    @app.get("/{full_path:path}")
-    def frontend_spa(full_path: str, request: Request):
-        candidate = FRONTEND_DIST / full_path
+    @app.get("/client-assets/{asset_path:path}")
+    def frontend_client_asset(asset_path: str):
+        candidate = FRONTEND_DIST / "client-assets" / asset_path
         if candidate.is_file():
             return FileResponse(candidate)
-        # Do not return HTML for missing static files (prevents MIME mismatch in browsers).
-        if full_path.startswith("assets/") or "." in Path(full_path).name:
-            raise HTTPException(status_code=404, detail="Static asset not found")
-        return _frontend_index_response(request)
+        raise HTTPException(status_code=404, detail="Static asset not found")
+
+    @app.get("/dist/{asset_path:path}")
+    def frontend_dist_asset(asset_path: str):
+        candidate = FRONTEND_DIST / asset_path
+        if candidate.is_file():
+            return FileResponse(candidate)
+        raise HTTPException(status_code=404, detail="Static asset not found")
