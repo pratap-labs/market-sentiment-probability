@@ -27,6 +27,7 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse
 from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from scripts.utils import (
@@ -103,6 +104,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _log_frontend_static_state(stage: str) -> None:
+    index_file = FRONTEND_DIST / "index.html"
+    client_assets_dir = FRONTEND_DIST / "client-assets"
+    logger.info(
+        "[static:%s] cwd=%s root=%s dist=%s dist_exists=%s index_exists=%s client_assets_exists=%s",
+        stage,
+        Path.cwd(),
+        ROOT,
+        FRONTEND_DIST,
+        FRONTEND_DIST.exists(),
+        index_file.exists(),
+        client_assets_dir.exists(),
+    )
+    if client_assets_dir.exists():
+        try:
+            files = sorted(p.name for p in client_assets_dir.iterdir() if p.is_file())
+            logger.info(
+                "[static:%s] client-assets file_count=%s sample=%s",
+                stage,
+                len(files),
+                files[:8],
+            )
+        except Exception as exc:
+            logger.exception("[static:%s] failed to inspect client-assets: %s", stage, exc)
+
+
+@app.on_event("startup")
+async def startup_diagnostics() -> None:
+    logger.info("[startup] GammaShield API starting")
+    logger.info("[startup] python=%s", sys.version.replace("\n", " "))
+    logger.info("[startup] sys.path[0:5]=%s", sys.path[:5])
+    _log_frontend_static_state("startup")
 
 
 class KiteHeaders(BaseModel):
@@ -5161,20 +5196,7 @@ def data_source_refresh(
 
 
 if FRONTEND_DIST.exists():
-    @app.get("/")
-    def frontend_index():
-        return FileResponse(FRONTEND_DIST / "index.html")
-
-    @app.get("/client-assets/{asset_path:path}")
-    def frontend_client_asset(asset_path: str):
-        candidate = FRONTEND_DIST / "client-assets" / asset_path
-        if candidate.is_file():
-            return FileResponse(candidate)
-        raise HTTPException(status_code=404, detail="Static asset not found")
-
-    @app.get("/dist/{asset_path:path}")
-    def frontend_dist_asset(asset_path: str):
-        candidate = FRONTEND_DIST / asset_path
-        if candidate.is_file():
-            return FileResponse(candidate)
-        raise HTTPException(status_code=404, detail="Static asset not found")
+    logger.info("[static:init] mounting StaticFiles at '/' from dist=%s", FRONTEND_DIST)
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="spa")
+else:
+    logger.warning("[static:init] dist folder missing at startup: %s", FRONTEND_DIST)
