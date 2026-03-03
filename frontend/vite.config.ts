@@ -5,7 +5,8 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: "../dist",
-    emptyOutDir: true
+    emptyOutDir: true,
+    assetsDir: "client-assets"
   },
   server: {
     port: 5173
