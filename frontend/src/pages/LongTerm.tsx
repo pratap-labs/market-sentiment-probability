@@ -9,12 +9,12 @@ import { apiFetch } from "../api/client";
 export default function LongTerm() {
   const { data: ohlcvData } = useCachedApi<{ rows: Record<string, unknown>[]; count?: number }>(
     "long_term_ohlcv_latest",
-    "/long-term/ohlcv-latest?days=30&limit=250&use_cache=false",
+    "/long-term/ohlcv-latest?days=30&limit=250&use_cache=true",
     0
   );
   const { data: momentumData } = useCachedApi<{ rows: Record<string, unknown>[]; count?: number }>(
     "long_term_momentum_scores",
-    "/long-term/momentum-scores?lookback_days=320&limit=250&use_cache=false",
+    "/long-term/momentum-scores?lookback_days=320&limit=250&use_cache=true",
     0
   );
   const { data: earningsData } = useCachedApi<{ rows: Record<string, unknown>[]; count?: number }>(

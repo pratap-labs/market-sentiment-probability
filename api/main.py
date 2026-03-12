@@ -82,7 +82,9 @@ POSITIONS_CACHE_FILE = CACHE_DIR / "positions_cache.json"
 EQUITIES_CACHE_FILE = CACHE_DIR / "equities_holdings.json"
 INDIANAPI_CACHE_FILE = ROOT / "data" / "indianapi_stock_cache.json"
 EQUITY_HISTORY_CACHE_DIR = CACHE_DIR / "equity_history_cache"
+LONG_TERM_FINAL_COMPOSITE_CACHE_FILE = CACHE_DIR / "long_term_final_composite_scores.json"
 LONG_TERM_UNIVERSE_FILE = ROOT / "data" / "long_term_universe.json"
+NIFTY50_WEIGHTS_FILE = ROOT / "data" / "nifty50_weights.json"
 MANUAL_BUCKET_FILE = ROOT / "database" / "manual_bucket_overrides.json"
 RISK_BUCKET_SETTINGS_FILE = ROOT / "database" / "risk_bucket_settings.json"
 FRONTEND_DIST = ROOT / "dist"
@@ -95,6 +97,8 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+# FastAPI/bare mode does not run Streamlit's script context; silence noisy warnings.
+logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 
 app = FastAPI(title="GammaShield API", version="0.1.0")
 app.add_middleware(
@@ -488,6 +492,40 @@ def _save_equity_history_cache(symbol: str, df: pd.DataFrame) -> None:
         return
 
 
+def _load_long_term_final_composite_cache(max_age_hours: int = 12) -> Optional[List[Dict[str, Any]]]:
+    path = LONG_TERM_FINAL_COMPOSITE_CACHE_FILE
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text())
+        saved_at_raw = payload.get("saved_at")
+        rows = payload.get("rows")
+        if not isinstance(saved_at_raw, str) or not isinstance(rows, list):
+            return None
+        saved_at = datetime.fromisoformat(saved_at_raw)
+        if datetime.now(timezone.utc) - saved_at > timedelta(hours=max_age_hours):
+            return None
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            if isinstance(r, dict):
+                out.append(r)
+        return out
+    except Exception:
+        return None
+
+
+def _save_long_term_final_composite_cache(rows: List[Dict[str, Any]]) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "rows": rows,
+        }
+        LONG_TERM_FINAL_COMPOSITE_CACHE_FILE.write_text(json.dumps(payload))
+    except Exception:
+        return
+
+
 def _load_indianapi_cache(max_age_days: int = 30) -> Dict[str, Dict[str, Any]]:
     if not INDIANAPI_CACHE_FILE.exists():
         return {}
@@ -570,6 +608,39 @@ def _load_long_term_universe() -> Dict[str, List[str]]:
     except Exception:
         return {"nifty100": [], "midcap150": []}
     return {"nifty100": [], "midcap150": []}
+
+
+def _load_nifty50_weights() -> List[Dict[str, Any]]:
+    if not NIFTY50_WEIGHTS_FILE.exists():
+        return []
+    try:
+        payload = json.loads(NIFTY50_WEIGHTS_FILE.read_text())
+        if not isinstance(payload, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for row in payload:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol") or "").upper()
+            company = str(row.get("company") or "").strip()
+            try:
+                weight_pct = float(row.get("weight_pct"))
+            except Exception:
+                continue
+            if not sym or not company or not math.isfinite(weight_pct) or weight_pct <= 0:
+                continue
+            out.append(
+                {
+                    "symbol": sym,
+                    "company": company,
+                    "weight_pct": float(weight_pct),
+                    "weight": float(weight_pct / 100.0),
+                }
+            )
+        out = sorted(out, key=lambda r: (-float(r["weight_pct"]), str(r["symbol"])))
+        return out
+    except Exception:
+        return []
 
 
 def _json_safe(val: Any) -> Any:
@@ -2019,6 +2090,7 @@ def long_term_ohlcv(
     request: Request,
     days: int = 30,
     limit: int = 250,
+    symbol: Optional[str] = None,
     use_cache: bool = True,
 ):
     creds = _get_credentials(request)
@@ -2035,7 +2107,10 @@ def long_term_ohlcv(
         if sym and sym not in inst_by_symbol:
             inst_by_symbol[sym] = inst
 
-    symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
+    if symbol:
+        symbols = [str(symbol).upper()]
+    else:
+        symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
     to_date = datetime.now().date()
     from_date = to_date - timedelta(days=max(7, int(days)))
 
@@ -2078,6 +2153,7 @@ def long_term_ohlcv_latest(
     request: Request,
     days: int = 30,
     limit: int = 250,
+    symbol: Optional[str] = None,
     use_cache: bool = True,
 ):
     creds = _get_credentials(request)
@@ -2094,7 +2170,10 @@ def long_term_ohlcv_latest(
         if sym and sym not in inst_by_symbol:
             inst_by_symbol[sym] = inst
 
-    symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
+    if symbol:
+        symbols = [str(symbol).upper()]
+    else:
+        symbols = [str(s).upper() for s in (universe.get("nifty100", []) + universe.get("midcap150", []))]
     to_date = datetime.now().date()
     from_date = to_date - timedelta(days=max(7, int(days)))
 
@@ -2590,14 +2669,30 @@ def long_term_quality_scores(request: Request, symbol: Optional[str] = None, lim
 
 
 @app.get("/long-term/final-composite-scores")
-def long_term_final_composite_scores(request: Request, symbol: Optional[str] = None, limit: int = 250):
+def long_term_final_composite_scores(
+    request: Request,
+    symbol: Optional[str] = None,
+    limit: int = 250,
+    use_cache: bool = True,
+):
     _get_credentials(request)
+
+    if use_cache:
+        cached_rows = _load_long_term_final_composite_cache(max_age_hours=12)
+        if isinstance(cached_rows, list):
+            out_rows = cached_rows
+            if symbol:
+                target = str(symbol).upper()
+                out_rows = [r for r in out_rows if str(r.get("symbol", "")).upper() == target]
+            if limit:
+                out_rows = out_rows[: max(1, min(int(limit), 2000))]
+            return {"rows": out_rows, "count": len(out_rows)}
 
     momentum_payload = long_term_momentum_scores(
         request=request,
         lookback_days=320,
         limit=2000,
-        use_cache=False,
+        use_cache=use_cache,
     )
     earnings_payload = long_term_earnings_scores(
         request=request,
@@ -2662,6 +2757,10 @@ def long_term_final_composite_scores(request: Request, symbol: Optional[str] = N
             str(r.get("symbol", "")),
         ),
     )
+
+    if use_cache:
+        _save_long_term_final_composite_cache(out_rows)
+
     if symbol:
         target = str(symbol).upper()
         out_rows = [r for r in out_rows if str(r.get("symbol", "")).upper() == target]
@@ -2669,6 +2768,235 @@ def long_term_final_composite_scores(request: Request, symbol: Optional[str] = N
         out_rows = out_rows[: max(1, min(int(limit), 2000))]
 
     return {"rows": out_rows, "count": len(out_rows)}
+
+
+@app.get("/long-term/constituents")
+def long_term_constituents(
+    request: Request,
+    top_n: int = 50,
+    lookback_days: int = 30,
+    use_cache: bool = True,
+):
+    _get_credentials(request)
+    top_n = max(1, min(int(top_n), 200))
+    ranked = _load_nifty50_weights()[:top_n]
+    if not ranked:
+        return {"rows": [], "count": 0}
+
+    score_payload = long_term_final_composite_scores(
+        request=request,
+        symbol=None,
+        limit=2000,
+        use_cache=use_cache,
+    )
+    score_rows = score_payload.get("rows", []) if isinstance(score_payload, dict) else []
+    score_by_symbol: Dict[str, float] = {}
+    for row in score_rows:
+        if not isinstance(row, dict):
+            continue
+        sym = str(row.get("symbol") or "").upper()
+        try:
+            s = float(row.get("final_composite_score"))
+            if sym and math.isfinite(s):
+                score_by_symbol[sym] = s
+        except Exception:
+            continue
+
+    out_rows: List[Dict[str, Any]] = []
+    for idx, item in enumerate(ranked, start=1):
+        sym = str(item["symbol"]).upper()
+        weight = float(item["weight"])
+        weight_pct = float(item["weight_pct"])
+        score = score_by_symbol.get(sym)
+
+        sdf = _load_equity_history_cache(sym, max_age_hours=24 * 365 * 20)
+        latest: Dict[str, Any] = {}
+        if not sdf.empty:
+            sdf = sdf.copy()
+            if "date" in sdf.columns:
+                sdf["date"] = pd.to_datetime(sdf["date"], errors="coerce")
+            if "close" in sdf.columns:
+                sdf["close"] = pd.to_numeric(sdf["close"], errors="coerce")
+            if "volume" in sdf.columns:
+                sdf["volume"] = pd.to_numeric(sdf["volume"], errors="coerce")
+            if "date" in sdf.columns:
+                sdf = sdf.dropna(subset=["date"]).sort_values("date")
+            if not sdf.empty:
+                lr = sdf.tail(1).iloc[0]
+                latest = {
+                    "date": lr.get("date"),
+                    "close": lr.get("close"),
+                    "volume": lr.get("volume"),
+                }
+
+        out_rows.append(
+            {
+                "rank": idx,
+                "symbol": sym,
+                "company": item.get("company"),
+                "final_composite_score": _json_safe(score),
+                "weight": _json_safe(weight),
+                "weight_pct": _json_safe(weight_pct),
+                "date": _json_safe(latest.get("date")),
+                "close": _json_safe(latest.get("close")),
+                "volume": _json_safe(latest.get("volume")),
+            }
+        )
+
+    return {"rows": out_rows, "count": len(out_rows)}
+
+
+@app.get("/long-term/constituents-contribution-timeseries")
+def long_term_constituents_contribution_timeseries(
+    request: Request,
+    top_n: int = 20,
+    days: int = 180,
+    use_cache: bool = True,
+):
+    _get_credentials(request)
+    top_n = max(1, min(int(top_n), 100))
+    days = max(10, min(int(days), 730))
+
+    cons_payload = long_term_constituents(
+        request=request,
+        top_n=top_n,
+        lookback_days=max(days, 30),
+        use_cache=use_cache,
+    )
+    cons_rows = cons_payload.get("rows", []) if isinstance(cons_payload, dict) else []
+    if not cons_rows:
+        return {"rows": [], "count": 0, "constituents": []}
+
+    weight_by_symbol: Dict[str, float] = {}
+    for r in cons_rows:
+        if not isinstance(r, dict):
+            continue
+        sym = str(r.get("symbol") or "").upper()
+        if not sym:
+            continue
+        try:
+            w = float(r.get("weight") or 0.0)
+            if math.isfinite(w) and w > 0:
+                weight_by_symbol[sym] = w
+        except Exception:
+            continue
+    if not weight_by_symbol:
+        return {"rows": [], "count": 0, "constituents": []}
+
+    nifty_df = _load_cache("nifty_ohlcv")
+    if nifty_df.empty or "date" not in nifty_df.columns or "close" not in nifty_df.columns:
+        raise HTTPException(status_code=404, detail="nifty_ohlcv cache missing")
+    nifty_df = nifty_df.copy()
+    nifty_df["date"] = pd.to_datetime(nifty_df["date"], errors="coerce")
+    nifty_df["close"] = pd.to_numeric(nifty_df["close"], errors="coerce")
+    nifty_df = nifty_df.dropna(subset=["date", "close"]).sort_values("date")
+    nifty_df["prev_close"] = nifty_df["close"].shift(1)
+    nifty_df["nifty_change_points"] = nifty_df["close"] - nifty_df["prev_close"]
+    nifty_df["nifty_change_pct"] = np.where(
+        nifty_df["prev_close"] > 0,
+        (nifty_df["close"] / nifty_df["prev_close"] - 1.0) * 100.0,
+        np.nan,
+    )
+    nifty_rows = nifty_df.tail(days).copy()
+    date_keys = [d.date().isoformat() for d in nifty_rows["date"]]
+
+    stock_by_symbol: Dict[str, Dict[str, Dict[str, float]]] = {}
+    # In cache-only mode, we intentionally bypass freshness checks and use what exists on disk.
+    max_age_hours = 24 * 365 * 20
+    for sym in weight_by_symbol.keys():
+        sdf = _load_equity_history_cache(sym, max_age_hours=max_age_hours)
+        if sdf.empty or "date" not in sdf.columns or "close" not in sdf.columns:
+            continue
+        sdf = sdf.copy()
+        sdf["date"] = pd.to_datetime(sdf["date"], errors="coerce")
+        sdf["close"] = pd.to_numeric(sdf["close"], errors="coerce")
+        sdf["volume"] = pd.to_numeric(sdf.get("volume"), errors="coerce")
+        sdf = sdf.dropna(subset=["date", "close"]).sort_values("date")
+        sdf["prev_close"] = sdf["close"].shift(1)
+        sdf["ret"] = np.where(
+            sdf["prev_close"] > 0,
+            (sdf["close"] / sdf["prev_close"]) - 1.0,
+            np.nan,
+        )
+        per_date: Dict[str, Dict[str, float]] = {}
+        for _, row in sdf.iterrows():
+            d = row["date"]
+            if pd.isna(d):
+                continue
+            key = pd.to_datetime(d).date().isoformat()
+            per_date[key] = {
+                "close": float(row["close"]) if pd.notna(row["close"]) else float("nan"),
+                "ret": float(row["ret"]) if pd.notna(row["ret"]) else float("nan"),
+                "volume": float(row["volume"]) if pd.notna(row["volume"]) else 0.0,
+            }
+        stock_by_symbol[sym] = per_date
+
+    out_rows: List[Dict[str, Any]] = []
+    for _, nrow in nifty_rows.iterrows():
+        date_val = nrow["date"]
+        dkey = pd.to_datetime(date_val).date().isoformat()
+        nifty_close = float(nrow["close"]) if pd.notna(nrow["close"]) else None
+        nifty_prev = float(nrow["prev_close"]) if pd.notna(nrow["prev_close"]) else None
+        nifty_change_points = float(nrow["nifty_change_points"]) if pd.notna(nrow["nifty_change_points"]) else None
+        nifty_change_pct = float(nrow["nifty_change_pct"]) if pd.notna(nrow["nifty_change_pct"]) else None
+
+        entries: List[Dict[str, Any]] = []
+        for sym, weight in weight_by_symbol.items():
+            srow = (stock_by_symbol.get(sym) or {}).get(dkey)
+            if not isinstance(srow, dict):
+                continue
+            stock_ret = srow.get("ret")
+            ltp = srow.get("close")
+            volume = srow.get("volume")
+            if not isinstance(stock_ret, float) or not math.isfinite(stock_ret):
+                continue
+            contribution_points = (
+                float(weight) * float(stock_ret) * float(nifty_prev)
+                if nifty_prev is not None and math.isfinite(float(nifty_prev))
+                else None
+            )
+            entries.append(
+                {
+                    "symbol": sym,
+                    "weight_pct": _json_safe(weight * 100.0),
+                    "ltp": _json_safe(ltp),
+                    "change_pct": _json_safe(stock_ret * 100.0),
+                    "volume": _json_safe(volume),
+                    "contribution_points": _json_safe(contribution_points),
+                }
+            )
+
+        entries = sorted(
+            entries,
+            key=lambda x: (
+                -(float(x.get("contribution_points")) if isinstance(x.get("contribution_points"), (int, float)) else 0.0),
+                str(x.get("symbol") or ""),
+            ),
+        )
+        pos = [e for e in entries if isinstance(e.get("contribution_points"), (int, float)) and float(e["contribution_points"]) > 0]
+        neg = [e for e in entries if isinstance(e.get("contribution_points"), (int, float)) and float(e["contribution_points"]) < 0]
+        pos_total = float(sum(float(e["contribution_points"]) for e in pos)) if pos else 0.0
+        neg_total = float(sum(float(e["contribution_points"]) for e in neg)) if neg else 0.0
+        total = pos_total + neg_total
+
+        out_rows.append(
+            {
+                "date": dkey,
+                "nifty_close": _json_safe(nifty_close),
+                "nifty_change_points": _json_safe(nifty_change_points),
+                "nifty_change_pct": _json_safe(nifty_change_pct),
+                "positive_count": len(pos),
+                "negative_count": len(neg),
+                "positive_total": _json_safe(pos_total),
+                "negative_total": _json_safe(neg_total),
+                "net_total": _json_safe(total),
+                "constituents": entries,
+            }
+        )
+
+    out_rows = [r for r in out_rows if str(r.get("date") or "") in set(date_keys)]
+    out_rows = sorted(out_rows, key=lambda r: str(r.get("date") or ""))
+    return {"rows": out_rows, "count": len(out_rows), "constituents": list(weight_by_symbol.keys())}
 
 
 
@@ -4524,6 +4852,425 @@ def _load_nifty_close_map() -> Dict[date, float]:
             continue
         out[d.date()] = float(c)
     return out
+
+
+def _wilson_score_interval(successes: int, trials: int, z: float = 1.96) -> Dict[str, float]:
+    n = int(max(0, trials))
+    k = int(max(0, min(successes, n)))
+    if n == 0:
+        return {"low": 0.0, "high": 0.0}
+    phat = k / n
+    z2 = z * z
+    denom = 1.0 + (z2 / n)
+    center = (phat + (z2 / (2.0 * n))) / denom
+    margin = (z / denom) * math.sqrt((phat * (1.0 - phat) / n) + (z2 / (4.0 * n * n)))
+    return {"low": max(0.0, center - margin), "high": min(1.0, center + margin)}
+
+
+def _gap_bucket_metrics(segment: pd.DataFrame, direction: str, threshold_pct: float) -> Dict[str, Any]:
+    if segment.empty:
+        return {
+            "events": 0,
+            "hit_count": 0,
+            "hit_rate_pct": 0.0,
+            "hit_rate_ci_low_pct": 0.0,
+            "hit_rate_ci_high_pct": 0.0,
+            "extend_beyond_open_gap_count": 0,
+            "extend_beyond_open_gap_pct": 0.0,
+            "reversal_count": 0,
+            "reversal_pct": 0.0,
+            "mean_close_pct": None,
+            "median_gap_pct": None,
+            "median_close_pct": None,
+            "mean_close_minus_gap_pct": None,
+        }
+
+    if direction == "up":
+        hit_mask = segment["close_pct"] > float(threshold_pct)
+        extend_mask = segment["close_pct"] >= segment["gap_pct"]
+        reversal_mask = segment["close_pct"] < 0.0
+    else:
+        hit_mask = segment["close_pct"] < (-1.0 * float(threshold_pct))
+        extend_mask = segment["close_pct"] <= segment["gap_pct"]
+        reversal_mask = segment["close_pct"] > 0.0
+
+    events = int(len(segment))
+    hit_count = int(hit_mask.sum())
+    extend_count = int(extend_mask.sum())
+    reversal_count = int(reversal_mask.sum())
+    ci = _wilson_score_interval(hit_count, events)
+    return {
+        "events": events,
+        "hit_count": hit_count,
+        "hit_rate_pct": float((hit_count / events) * 100.0),
+        "hit_rate_ci_low_pct": float(ci["low"] * 100.0),
+        "hit_rate_ci_high_pct": float(ci["high"] * 100.0),
+        "extend_beyond_open_gap_count": extend_count,
+        "extend_beyond_open_gap_pct": float((extend_count / events) * 100.0),
+        "reversal_count": reversal_count,
+        "reversal_pct": float((reversal_count / events) * 100.0),
+        "mean_close_pct": float(segment["close_pct"].mean()),
+        "median_gap_pct": float(segment["gap_pct"].median()),
+        "median_close_pct": float(segment["close_pct"].median()),
+        "mean_close_minus_gap_pct": float((segment["close_pct"] - segment["gap_pct"]).mean()),
+    }
+
+
+WORLD_INDEXES: List[Dict[str, str]] = [
+    {"country": "US", "symbol": "^GSPC", "name": "S&P 500"},
+    {"country": "US", "symbol": "^IXIC", "name": "NASDAQ Composite"},
+    {"country": "US", "symbol": "^DJI", "name": "Dow Jones"},
+    {"country": "Japan", "symbol": "^N225", "name": "Nikkei 225"},
+    {"country": "Germany", "symbol": "^GDAXI", "name": "DAX"},
+    {"country": "Germany", "symbol": "^MDAXI", "name": "MDAX"},
+    {"country": "France", "symbol": "^FCHI", "name": "CAC 40"},
+    {"country": "France", "symbol": "^SBF120", "name": "SBF 120"},
+    {"country": "UK", "symbol": "^FTSE", "name": "FTSE 100"},
+    {"country": "UK", "symbol": "^FTMC", "name": "FTSE 250"},
+]
+
+
+def _safe_ret(series: List[float], lookback: int) -> Optional[float]:
+    if len(series) <= lookback:
+        return None
+    prev = float(series[-(lookback + 1)])
+    curr = float(series[-1])
+    if prev == 0:
+        return None
+    return ((curr / prev) - 1.0) * 100.0
+
+
+def _fetch_yahoo_index_series(symbol: str, range_window: str = "6mo") -> pd.DataFrame:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"interval": "1d", "range": range_window}
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = requests.get(url, params=params, headers=headers, timeout=20)
+    resp.raise_for_status()
+    payload = resp.json()
+    chart = (((payload or {}).get("chart") or {}).get("result") or [])
+    if not chart:
+        return pd.DataFrame(columns=["date", "close"])
+    block = chart[0] if isinstance(chart[0], dict) else {}
+    ts = block.get("timestamp") or []
+    indicators = block.get("indicators") or {}
+    quote = (indicators.get("quote") or [{}])[0]
+    open_arr = quote.get("open") or []
+    high_arr = quote.get("high") or []
+    low_arr = quote.get("low") or []
+    close_arr = quote.get("close") or []
+    if not ts or not close_arr:
+        return pd.DataFrame(columns=["date", "open", "high", "low", "close"])
+
+    def _aligned(values: Any, n: int) -> List[Any]:
+        if not isinstance(values, list):
+            return [None] * n
+        if len(values) >= n:
+            return values[:n]
+        return values + ([None] * (n - len(values)))
+
+    out = pd.DataFrame(
+        {
+            "timestamp": ts,
+            "open": _aligned(open_arr, len(ts)),
+            "high": _aligned(high_arr, len(ts)),
+            "low": _aligned(low_arr, len(ts)),
+            "close": _aligned(close_arr, len(ts)),
+        }
+    )
+    out["date"] = pd.to_datetime(out["timestamp"], unit="s", utc=True).dt.date
+    out["open"] = pd.to_numeric(out["open"], errors="coerce")
+    out["high"] = pd.to_numeric(out["high"], errors="coerce")
+    out["low"] = pd.to_numeric(out["low"], errors="coerce")
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    out = out.dropna(subset=["date", "open", "high", "low", "close"]).copy()
+    out = out.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    return out[["date", "open", "high", "low", "close"]]
+
+
+def _nifty_world_correlation_analysis(
+    world_history_by_symbol: Dict[str, pd.DataFrame],
+) -> Dict[str, Any]:
+    nifty_path = CACHE_DIR / "nifty_ohlcv.csv"
+    if not nifty_path.exists():
+        return {"error": "NIFTY OHLCV cache missing"}
+    try:
+        nifty_df = pd.read_csv(nifty_path)
+    except Exception as exc:
+        return {"error": f"Failed to read nifty_ohlcv.csv: {exc}"}
+
+    if nifty_df.empty or "date" not in nifty_df.columns or "close" not in nifty_df.columns:
+        return {"error": "nifty_ohlcv.csv missing required columns: date/close"}
+
+    ndt = pd.to_datetime(nifty_df["date"], errors="coerce")
+    nclose = pd.to_numeric(nifty_df["close"], errors="coerce")
+    n = pd.DataFrame({"date": ndt.dt.date, "close": nclose}).dropna(subset=["date", "close"]).copy()
+    n = n.sort_values("date").drop_duplicates(subset=["date"], keep="last")
+    if n.empty:
+        return {"error": "NIFTY series empty after cleaning"}
+
+    n["nifty_ret"] = n["close"].pct_change()
+    wide = n[["date", "nifty_ret"]].copy()
+
+    for symbol, sdf in world_history_by_symbol.items():
+        if sdf.empty:
+            continue
+        d = sdf[["date", "close"]].copy()
+        d["close"] = pd.to_numeric(d["close"], errors="coerce")
+        d = d.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates(subset=["date"], keep="last")
+        if d.empty:
+            continue
+        d[f"ret_{symbol}"] = d["close"].pct_change()
+        # Keep NIFTY trading calendar as base; do not require exact all-market overlap.
+        wide = wide.merge(d[["date", f"ret_{symbol}"]], on="date", how="left")
+
+    ret_cols = [c for c in wide.columns if c.startswith("ret_")]
+    wide = wide.dropna(subset=["nifty_ret"]).copy()
+    if wide.empty or not ret_cols:
+        return {"error": "Insufficient data for NIFTY/world return analysis"}
+
+    corr_rows: List[Dict[str, Any]] = []
+    for c in ret_cols:
+        pair = wide[["nifty_ret", c]].dropna()
+        corr = pair["nifty_ret"].corr(pair[c]) if not pair.empty else np.nan
+        overlap_samples = int(len(pair))
+        symbol = c.replace("ret_", "", 1)
+        corr_rows.append(
+            {
+                "symbol": symbol,
+                "corr_with_nifty": float(corr) if pd.notna(corr) else None,
+                "overlap_samples": overlap_samples,
+            }
+        )
+    corr_rows = sorted(corr_rows, key=lambda r: abs(float(r.get("corr_with_nifty") or 0.0)), reverse=True)
+
+    # Linear model: nifty_ret = intercept + sum(beta_i * world_ret_i)
+    x_cols = [r["symbol"] for r in corr_rows]
+    x_frame = wide[[f"ret_{s}" for s in x_cols]].copy()
+    coverage_by_symbol: List[Dict[str, Any]] = []
+    for s in x_cols:
+        col = f"ret_{s}"
+        cov = float(x_frame[col].notna().mean()) if col in x_frame.columns and len(x_frame) > 0 else 0.0
+        coverage_by_symbol.append({"symbol": s, "coverage_pct": cov * 100.0})
+    x_mat = x_frame.fillna(0.0).to_numpy(dtype=float)
+    y_vec = wide["nifty_ret"].to_numpy(dtype=float)
+    if x_mat.size == 0 or y_vec.size == 0:
+        return {
+            "samples": int(len(wide)),
+            "date_start": str(wide["date"].iloc[0]),
+            "date_end": str(wide["date"].iloc[-1]),
+            "correlation_by_symbol": corr_rows,
+            "model": {"error": "No valid predictors"},
+        }
+
+    x_aug = np.column_stack([np.ones(len(x_mat)), x_mat])
+    coef, *_ = np.linalg.lstsq(x_aug, y_vec, rcond=None)
+    y_pred = x_aug @ coef
+    ss_res = float(np.sum((y_vec - y_pred) ** 2))
+    ss_tot = float(np.sum((y_vec - np.mean(y_vec)) ** 2))
+    r2 = float(1.0 - (ss_res / ss_tot)) if ss_tot > 1e-12 else 0.0
+
+    beta_rows: List[Dict[str, Any]] = []
+    for i, symbol in enumerate(x_cols, start=1):
+        beta_rows.append({"symbol": symbol, "beta": float(coef[i])})
+    beta_rows = sorted(beta_rows, key=lambda r: abs(float(r["beta"])), reverse=True)
+
+    return {
+        "samples": int(len(wide)),
+        "date_start": str(wide["date"].iloc[0]),
+        "date_end": str(wide["date"].iloc[-1]),
+        "target": "nifty_ret",
+        "feature_count": int(len(x_cols)),
+        "correlation_by_symbol": corr_rows,
+        "model": {
+            "method": "OLS",
+            "intercept": float(coef[0]),
+            "r2": r2,
+            "betas": beta_rows,
+            "feature_coverage": coverage_by_symbol,
+            "imputation": "Missing input returns filled with 0.0 on NIFTY trading dates",
+        },
+    }
+
+
+@app.get("/spot-analysis/world-indexes")
+def spot_analysis_world_indexes():
+    db_dir = ROOT / "database" / "world_indexes"
+    db_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = db_dir / "world_indexes_snapshot.json"
+    history_path = db_dir / "world_indexes_history.csv"
+
+    rows: List[Dict[str, Any]] = []
+    history_rows: List[Dict[str, Any]] = []
+    history_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    history_frames_by_symbol: Dict[str, pd.DataFrame] = {}
+    generated_at = datetime.now(timezone.utc).isoformat()
+
+    for meta in WORLD_INDEXES:
+        symbol = str(meta["symbol"])
+        try:
+            series_df = _fetch_yahoo_index_series(symbol, range_window="2y")
+        except Exception as exc:
+            rows.append(
+                {
+                    "country": meta["country"],
+                    "symbol": symbol,
+                    "name": meta["name"],
+                    "error": str(exc),
+                }
+            )
+            continue
+
+        if series_df.empty:
+            rows.append(
+                {
+                    "country": meta["country"],
+                    "symbol": symbol,
+                    "name": meta["name"],
+                    "error": "No data returned",
+                }
+            )
+            continue
+
+        history_frames_by_symbol[symbol] = series_df[["date", "close"]].copy()
+
+        closes = [float(x) for x in series_df["close"].tolist() if pd.notna(x)]
+        latest_close = closes[-1] if closes else None
+        prev_close = closes[-2] if len(closes) >= 2 else None
+        day_change_pct = (
+            ((latest_close / prev_close) - 1.0) * 100.0
+            if latest_close is not None and prev_close is not None and prev_close != 0
+            else None
+        )
+        last_date = series_df["date"].iloc[-1]
+        rows.append(
+            {
+                "country": meta["country"],
+                "symbol": symbol,
+                "name": meta["name"],
+                "last_date": last_date.isoformat() if hasattr(last_date, "isoformat") else str(last_date),
+                "close": latest_close,
+                "prev_close": prev_close,
+                "day_change_pct": day_change_pct,
+                "ret_5d_pct": _safe_ret(closes, 5),
+                "ret_1m_pct": _safe_ret(closes, 21),
+                "ret_3m_pct": _safe_ret(closes, 63),
+                "points_count": int(len(closes)),
+            }
+        )
+
+        symbol_hist: List[Dict[str, Any]] = []
+        for _, row in series_df.iterrows():
+            d = row["date"]
+            row_payload = {
+                "date": d.isoformat() if hasattr(d, "isoformat") else str(d),
+                "open": float(row["open"]),
+                "high": float(row["high"]),
+                "low": float(row["low"]),
+                "close": float(row["close"]),
+            }
+            symbol_hist.append(row_payload)
+            history_rows.append(
+                {
+                    **row_payload,
+                    "country": meta["country"],
+                    "symbol": symbol,
+                    "name": meta["name"],
+                }
+            )
+        history_by_symbol[symbol] = symbol_hist
+
+    history_df = pd.DataFrame(history_rows)
+    if not history_df.empty:
+        history_df = history_df.sort_values(["country", "symbol", "date"]).drop_duplicates(
+            subset=["symbol", "date"], keep="last"
+        )
+        history_df.to_csv(history_path, index=False)
+
+    snapshot_payload = {
+        "generated_at": generated_at,
+        "source": "Yahoo Finance chart API",
+        "rows": rows,
+        "history_by_symbol": history_by_symbol,
+        "nifty_relationship": _nifty_world_correlation_analysis(history_frames_by_symbol),
+        "db": {
+            "snapshot_path": str(snapshot_path),
+            "history_path": str(history_path),
+            "symbols_count": len(WORLD_INDEXES),
+        },
+    }
+    snapshot_path.write_text(json.dumps(snapshot_payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    return snapshot_payload
+
+
+@app.get("/spot-analysis/gap-edge")
+def spot_analysis_gap_edge(threshold_pct: float = 0.5):
+    path = CACHE_DIR / "nifty_ohlcv.csv"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="NIFTY OHLCV cache missing")
+
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to read nifty_ohlcv.csv: {exc}")
+
+    if df.empty or "date" not in df.columns or "open" not in df.columns or "close" not in df.columns:
+        raise HTTPException(status_code=500, detail="nifty_ohlcv.csv missing required columns: date/open/close")
+
+    dt = pd.to_datetime(df["date"], errors="coerce")
+    open_px = pd.to_numeric(df["open"], errors="coerce")
+    close_px = pd.to_numeric(df["close"], errors="coerce")
+    ohlc = pd.DataFrame({"date": dt, "open": open_px, "close": close_px}).dropna(subset=["date", "open", "close"])
+    if ohlc.empty:
+        raise HTTPException(status_code=500, detail="NIFTY OHLCV cache has no valid rows")
+
+    ohlc = ohlc.sort_values("date").reset_index(drop=True)
+    ohlc["prev_close"] = ohlc["close"].shift(1)
+    ohlc = ohlc.dropna(subset=["prev_close"]).copy()
+    ohlc = ohlc[ohlc["prev_close"] != 0].copy()
+    if ohlc.empty:
+        raise HTTPException(status_code=500, detail="NIFTY OHLCV cache does not have valid previous-close rows")
+
+    ohlc["gap_pct"] = ((ohlc["open"] / ohlc["prev_close"]) - 1.0) * 100.0
+    ohlc["close_pct"] = ((ohlc["close"] / ohlc["prev_close"]) - 1.0) * 100.0
+    max_date = ohlc["date"].max()
+    years_windows = [1, 3, 5]
+
+    windows: List[Dict[str, Any]] = []
+    for years in years_windows:
+        start_date = max_date - pd.DateOffset(years=years)
+        segment = ohlc[ohlc["date"] >= start_date].copy()
+        gap_up = segment[segment["gap_pct"] > float(threshold_pct)].copy()
+        gap_down = segment[segment["gap_pct"] < (-1.0 * float(threshold_pct))].copy()
+        combined_events = int(len(gap_up) + len(gap_down))
+        combined_hit_count = int(
+            (gap_up["close_pct"] > float(threshold_pct)).sum() + (gap_down["close_pct"] < (-1.0 * float(threshold_pct))).sum()
+        )
+        combined_ci = _wilson_score_interval(combined_hit_count, combined_events)
+        windows.append(
+            {
+                "years": int(years),
+                "start_date": start_date.date().isoformat(),
+                "end_date": max_date.date().isoformat(),
+                "sample_days": int(len(segment)),
+                "threshold_pct": float(threshold_pct),
+                "gap_up": _gap_bucket_metrics(gap_up, direction="up", threshold_pct=threshold_pct),
+                "gap_down": _gap_bucket_metrics(gap_down, direction="down", threshold_pct=threshold_pct),
+                "combined": {
+                    "events": combined_events,
+                    "hit_count": combined_hit_count,
+                    "hit_rate_pct": float((combined_hit_count / combined_events) * 100.0) if combined_events > 0 else 0.0,
+                    "hit_rate_ci_low_pct": float(combined_ci["low"] * 100.0),
+                    "hit_rate_ci_high_pct": float(combined_ci["high"] * 100.0),
+                },
+            }
+        )
+
+    return {
+        "source": str(path),
+        "as_of_date": max_date.date().isoformat(),
+        "threshold_pct": float(threshold_pct),
+        "windows": windows,
+    }
 
 
 @app.get("/spot-analysis/participants")

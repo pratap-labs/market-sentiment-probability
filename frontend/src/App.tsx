@@ -19,6 +19,9 @@ import RiskBucketsSpotAnalysis from "./pages/RiskBucketsSpotAnalysis";
 import SpotAnalysis from "./pages/SpotAnalysis";
 import SpotAnalysisParticipants from "./pages/SpotAnalysisParticipants";
 import SpotAnalysisModeling from "./pages/SpotAnalysisModeling";
+import SpotAnalysisConstituents from "./pages/SpotAnalysisConstituents";
+import SpotAnalysisGapEdge from "./pages/SpotAnalysisGapEdge";
+import SpotAnalysisWorldIndexes from "./pages/SpotAnalysisWorldIndexes";
 import { PortfolioProvider } from "./state/PortfolioContext";
 import { NotificationProvider } from "./state/NotificationContext";
 import AuthGate from "./components/AuthGate";
@@ -79,6 +82,9 @@ export default function App() {
                         <Route index element={<Navigate to="overview" replace />} />
                         <Route path="overview" element={<RiskBucketsSpotAnalysis />} />
                         <Route path="participants" element={<SpotAnalysisParticipants />} />
+                        <Route path="gap-edge" element={<SpotAnalysisGapEdge />} />
+                        <Route path="world-indexes" element={<SpotAnalysisWorldIndexes />} />
+                        <Route path="constituents" element={<SpotAnalysisConstituents />} />
                         <Route path="modeling" element={<SpotAnalysisModeling />} />
                       </Route>
                       <Route path="/risk-buckets" element={<RiskBuckets />}>
