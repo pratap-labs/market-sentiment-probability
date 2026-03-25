@@ -15,6 +15,7 @@ import MarketRegime from "./pages/MarketRegime";
 import HistoricalPerformance from "./pages/HistoricalPerformance";
 import ProductOverview from "./pages/ProductOverview";
 import DataSource from "./pages/DataSource";
+import Neighborhoods from "./pages/Neighborhoods";
 import RiskBucketsSpotAnalysis from "./pages/RiskBucketsSpotAnalysis";
 import SpotAnalysis from "./pages/SpotAnalysis";
 import SpotAnalysisParticipants from "./pages/SpotAnalysisParticipants";
@@ -41,6 +42,7 @@ const navItems = [
   { label: "Market Regime", to: "/market-regime" },
   { label: "Historical", to: "/historical" },
   { label: "Data Source", to: "/data-source" },
+  { label: "Neighborhoods", to: "/neighborhoods" },
   { label: "Settings", to: "/settings" }
 ];
 
@@ -102,6 +104,7 @@ export default function App() {
                       <Route path="/product" element={<ProductOverview />} />
                       <Route path="/derivatives" element={<RiskBucketsSpotAnalysis />} />
                       <Route path="/data-source" element={<DataSource />} />
+                      <Route path="/neighborhoods" element={<Neighborhoods />} />
                       <Route path="/settings" element={<RiskBucketsSettings />} />
                     </Routes>
                   </main>

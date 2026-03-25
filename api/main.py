@@ -9,6 +9,7 @@ import calendar
 import math
 import json
 import io
+import re
 import zipfile
 import numpy as np
 from datetime import date
@@ -4661,6 +4662,221 @@ def data_source_preview(name: str, limit: int = 20):
     except Exception as exc:
         logger.exception("preview serialize failed for %s", name)
         raise HTTPException(status_code=500, detail=f"Failed to serialize preview: {exc}")
+
+
+def _is_neighborhood_code(value: Any) -> bool:
+    try:
+        text = str(value).strip()
+    except Exception:
+        return False
+    return bool(re.match(r"^[A-Z]\d{2}\b", text))
+
+
+def _to_int_safely(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        try:
+            return int(float(value))
+        except Exception:
+            return 0
+    text = str(value).strip().replace(".", "").replace(",", ".")
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except Exception:
+        return 0
+
+
+@app.get("/neighborhood-reports/summary")
+def neighborhood_reports_summary(limit: int = 200) -> Dict[str, Any]:
+    amsterdam_dir = ROOT / "database" / "amsterdam"
+    if not amsterdam_dir.exists():
+        raise HTTPException(status_code=404, detail="Amsterdam dataset folder not found")
+
+    household_file = amsterdam_dir / "2021_stadsdelen_1_05_c6d5b81741.xlsx"
+    residency_file = amsterdam_dir / "2020_stadsdelen_1_08_839dc1f4bf.xlsx"
+    nationality_file = amsterdam_dir / "2021_stadsdelen_1_09_c0a2f2d350.xlsx"
+    migration_file = amsterdam_dir / "2021_tijdreeksen_6_93cbf8f0a5.xlsx"
+
+    if (
+        not household_file.exists()
+        or not residency_file.exists()
+        or not nationality_file.exists()
+        or not migration_file.exists()
+    ):
+        raise HTTPException(status_code=404, detail="Required neighborhood files are missing")
+
+    try:
+        # Household mix: rows begin below metadata header block.
+        df_house = pd.read_excel(household_file, skiprows=7, header=None)
+        house_records: Dict[str, Dict[str, Any]] = {}
+        for row in df_house.itertuples(index=False):
+            raw_code_name = row[0] if len(row) > 0 else None
+            if not _is_neighborhood_code(raw_code_name):
+                continue
+            code_name = str(raw_code_name).strip()
+            code = code_name.split(" ", 1)[0]
+            name = code_name.split(" ", 1)[1] if " " in code_name else code
+
+            single_person = _to_int_safely(row[1] if len(row) > 1 else 0)
+            couple_no_kids = _to_int_safely(row[2] if len(row) > 2 else 0) + _to_int_safely(row[3] if len(row) > 3 else 0)
+            family_with_kids = _to_int_safely(row[4] if len(row) > 4 else 0) + _to_int_safely(row[5] if len(row) > 5 else 0)
+            single_parent = _to_int_safely(row[6] if len(row) > 6 else 0)
+            other_household = _to_int_safely(row[7] if len(row) > 7 else 0) + _to_int_safely(row[8] if len(row) > 8 else 0)
+            total_households = single_person + couple_no_kids + family_with_kids + single_parent + other_household
+
+            house_records[code] = {
+                "code": code,
+                "neighborhood": name,
+                "single_person": single_person,
+                "couple_no_children": couple_no_kids,
+                "family_with_children": family_with_kids,
+                "single_parent": single_parent,
+                "other_household": other_household,
+                "household_total": total_households,
+            }
+
+        # Residency duration: turnover/stability proxy.
+        df_res = pd.read_excel(residency_file, skiprows=5, header=None)
+        for row in df_res.itertuples(index=False):
+            raw_code_name = row[0] if len(row) > 0 else None
+            if not _is_neighborhood_code(raw_code_name):
+                continue
+            code_name = str(raw_code_name).strip()
+            code = code_name.split(" ", 1)[0]
+            if code not in house_records:
+                continue
+            lt_1y = _to_int_safely(row[1] if len(row) > 1 else 0)
+            y1_4 = _to_int_safely(row[2] if len(row) > 2 else 0)
+            y20_24 = _to_int_safely(row[6] if len(row) > 6 else 0)
+            y25p = _to_int_safely(row[7] if len(row) > 7 else 0)
+            residents_total = _to_int_safely(row[8] if len(row) > 8 else 0)
+            house_records[code].update(
+                {
+                    "residents_total": residents_total,
+                    "recent_mover_pct": round(((lt_1y + y1_4) / residents_total * 100), 2) if residents_total else None,
+                    "long_term_pct": round(((y20_24 + y25p) / residents_total * 100), 2) if residents_total else None,
+                }
+            )
+
+        # Nationality (top countries in source table).
+        df_nat = pd.read_excel(nationality_file, skiprows=5, header=None)
+        for row in df_nat.itertuples(index=False):
+            raw_code = row[0] if len(row) > 0 else None
+            raw_name = row[1] if len(row) > 1 else None
+            code = str(raw_code).strip() if raw_code is not None else ""
+            if not re.match(r"^[A-Z]\d{2}$", code):
+                continue
+            if code not in house_records:
+                house_records[code] = {
+                    "code": code,
+                    "neighborhood": str(raw_name or code),
+                }
+            nl_nat = _to_int_safely(row[2] if len(row) > 2 else 0)
+            uk_nat = _to_int_safely(row[3] if len(row) > 3 else 0)
+            it_nat = _to_int_safely(row[4] if len(row) > 4 else 0)
+            tr_nat = _to_int_safely(row[5] if len(row) > 5 else 0)
+            de_nat = _to_int_safely(row[6] if len(row) > 6 else 0)
+            fr_nat = _to_int_safely(row[7] if len(row) > 7 else 0)
+            residents_total = house_records[code].get("residents_total")
+            nl_share = round((nl_nat / residents_total * 100), 2) if isinstance(residents_total, (int, float)) and residents_total else None
+            house_records[code].update(
+                {
+                    "netherlands_nationality": nl_nat,
+                    "uk_nationality": uk_nat,
+                    "italy_nationality": it_nat,
+                    "turkey_nationality": tr_nat,
+                    "germany_nationality": de_nat,
+                    "france_nationality": fr_nat,
+                    "netherlands_nationality_pct": nl_share,
+                }
+            )
+
+        # Ethnicity proxy via migration background (wijk level), year 2021.
+        def _read_migration_sheet(sheet_name: str, target_key: str) -> None:
+            df_mig = pd.read_excel(migration_file, sheet_name=sheet_name, skiprows=2)
+            if df_mig.empty:
+                return
+            first_col = df_mig.columns[0]
+            year_col = None
+            for col in df_mig.columns:
+                if str(col).strip() == "2021":
+                    year_col = col
+                    break
+            if year_col is None:
+                return
+            for _, row in df_mig.iterrows():
+                code_name = row.get(first_col)
+                if not _is_neighborhood_code(code_name):
+                    continue
+                code_text = str(code_name).strip()
+                code = code_text.split(" ", 1)[0]
+                if code not in house_records:
+                    continue
+                val = row.get(year_col)
+                house_records[code][target_key] = _to_int_safely(val)
+
+        _read_migration_sheet("2021_tijdreeksen_6_totaal", "migration_total_2021")
+        _read_migration_sheet("Nederlands", "dutch_background_2021")
+        _read_migration_sheet("westers", "western_background_2021")
+        _read_migration_sheet("totaal niet-westers", "non_western_background_2021")
+        _read_migration_sheet("Surinaams", "surinamese_background_2021")
+        _read_migration_sheet("Antilliaans", "antillean_background_2021")
+        _read_migration_sheet("Turks", "turkish_background_2021")
+        _read_migration_sheet("Marokkaans", "moroccan_background_2021")
+
+        rows: List[Dict[str, Any]] = []
+        for record in house_records.values():
+            household_total = record.get("household_total")
+            single_person = record.get("single_person", 0)
+            family_with_children = record.get("family_with_children", 0)
+            single_parent = record.get("single_parent", 0)
+            if isinstance(household_total, (int, float)) and household_total:
+                family_share = round(((family_with_children + single_parent) / household_total * 100), 2)
+                single_share = round((single_person / household_total * 100), 2)
+            else:
+                family_share = None
+                single_share = None
+            record["family_share_pct"] = family_share
+            record["single_share_pct"] = single_share
+            mig_total = record.get("migration_total_2021")
+            if isinstance(mig_total, (int, float)) and mig_total:
+                record["dutch_background_pct"] = round((record.get("dutch_background_2021", 0) / mig_total * 100), 2)
+                record["western_background_pct"] = round((record.get("western_background_2021", 0) / mig_total * 100), 2)
+                record["non_western_background_pct"] = round((record.get("non_western_background_2021", 0) / mig_total * 100), 2)
+            else:
+                record["dutch_background_pct"] = None
+                record["western_background_pct"] = None
+                record["non_western_background_pct"] = None
+            rows.append(record)
+
+        rows = sorted(rows, key=lambda x: str(x.get("neighborhood", "")))
+        if limit > 0:
+            rows = rows[: min(limit, 5000)]
+
+        family_vals = [r["family_share_pct"] for r in rows if isinstance(r.get("family_share_pct"), (int, float))]
+        stability_vals = [r["long_term_pct"] for r in rows if isinstance(r.get("long_term_pct"), (int, float))]
+        return {
+            "rows": rows,
+            "summary": {
+                "neighborhood_count": len(rows),
+                "avg_family_share_pct": round(float(np.mean(family_vals)), 2) if family_vals else None,
+                "avg_long_term_pct": round(float(np.mean(stability_vals)), 2) if stability_vals else None,
+                "source_files": [
+                    household_file.name,
+                    residency_file.name,
+                    nationality_file.name,
+                    migration_file.name,
+                ],
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to build neighborhood report summary")
+        raise HTTPException(status_code=500, detail=f"Neighborhood report build failed: {exc}")
 
 
 def _last_tuesday(year: int, month: int) -> datetime:
