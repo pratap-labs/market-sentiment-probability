@@ -7,7 +7,7 @@ from datetime import datetime, date
 from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
-import streamlit as st
+from scripts.utils.optional_streamlit import st
 
 from scripts.utils import (
     calculate_portfolio_greeks,

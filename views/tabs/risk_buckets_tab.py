@@ -10,7 +10,6 @@ from typing import Dict, List, Optional, Tuple
 import math
 import numpy as np
 import pandas as pd
-import streamlit as st
 import altair as alt
 import json
 
@@ -23,6 +22,7 @@ from scripts.utils import (
     classify_bucket,
 )
 from scripts.utils.formatters import format_inr
+from scripts.utils.optional_streamlit import st
 from scripts.utils.option_pricing import price_option
 from views.tabs.portfolio_buckets_tab import (
     _classify_trade_zone,
@@ -897,14 +897,12 @@ def compute_trade_risk(
     spot_override: Optional[float] = None,
     forward_override: Optional[float] = None,
     target_date: Optional[object] = None,
+    horizon_days: int = 10,
 ) -> Tuple[pd.DataFrame, Dict[str, List[Dict[str, object]]]]:
-    options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
     iv_percentile = 35
-    if isinstance(options_df_cache, pd.DataFrame) and not options_df_cache.empty and "iv" in options_df_cache.columns:
-        iv_percentile = 35
     iv_regime, _ = get_iv_regime(iv_percentile)
     scenarios = get_weighted_scenarios(iv_regime)
-    horizon_days = max(1, min(int(st.session_state.get("tba_sim_days", 10)), 20))
+    horizon_days = max(1, min(int(horizon_days), 20))
 
     rows = []
     legs_by_trade: Dict[str, List[Dict[str, object]]] = {}
@@ -1151,10 +1149,7 @@ def aggregate_buckets(df_trades: pd.DataFrame, total_capital: float, allocations
 def _compute_portfolio_es99(positions: List[Dict[str, object]], account_size: float, lookback_days: int) -> Tuple[float, float]:
     if not positions:
         return 0.0, 0.0
-    options_df_cache = st.session_state.get("options_df_cache", pd.DataFrame())
     iv_percentile = 35
-    if isinstance(options_df_cache, pd.DataFrame) and not options_df_cache.empty and "iv" in options_df_cache.columns:
-        iv_percentile = 35
     iv_regime, _ = get_iv_regime(iv_percentile)
     scenarios = get_weighted_scenarios(iv_regime)
     trade_greeks = calculate_portfolio_greeks(positions)

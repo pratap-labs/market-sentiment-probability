@@ -1,6 +1,5 @@
 """Derivatives Data Management Tab - Fetch and cache NIFTY, Futures, and Options data."""
 
-import streamlit as st
 import pandas as pd
 import altair as alt
 from datetime import datetime, timedelta, date
@@ -16,6 +15,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from scripts.data import NSEDataFetcher
+from scripts.utils.optional_streamlit import st
 
 # Cache directory
 CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"

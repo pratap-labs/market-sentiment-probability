@@ -1,6 +1,5 @@
 """Risk Analysis Tab - Zone-based portfolio risk framework with normalized greeks."""
 
-import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -27,6 +26,7 @@ from scripts.utils.option_pricing import (
     price_option,
     pricing_model_available,
 )
+from scripts.utils.optional_streamlit import st
 
 from views.tabs.derivatives_data_tab import load_from_cache as _load_from_cache
 

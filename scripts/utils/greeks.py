@@ -4,10 +4,6 @@ import pandas as pd
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict
-try:
-    import streamlit as st
-except Exception:
-    st = None
 
 try:
     from py_vollib.black_scholes import black_scholes as bs
@@ -130,12 +126,6 @@ def enrich_position_with_greeks(
         Enhanced position dict with Greeks and parsed fields
     """
     symbol = position.get("tradingsymbol", "")
-    if st is not None:
-        spot_override = st.session_state.get("greeks_spot_override")
-        if spot_override is None:
-            spot_override = st.session_state.get("stress_spot_override")
-        if spot_override is not None:
-            current_spot = float(spot_override)
     parsed = parse_tradingsymbol(symbol)
     
     if not parsed:

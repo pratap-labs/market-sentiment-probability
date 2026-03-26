@@ -8,8 +8,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 import altair as alt
+
+from scripts.utils.optional_streamlit import st
 
 
 @dataclass

@@ -2,9 +2,9 @@
 
 import numpy as np
 import pandas as pd
-import streamlit as st
 from typing import List, Dict
 from .greeks import calculate_implied_volatility
+from .optional_streamlit import st
 
 
 def calculate_portfolio_greeks(enriched_positions: List[Dict]) -> Dict:

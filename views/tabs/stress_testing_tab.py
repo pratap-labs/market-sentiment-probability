@@ -6,7 +6,6 @@ from typing import Dict, List, Tuple, Optional
 
 import pandas as pd
 import plotly.express as px
-import streamlit as st
 import math
 
 from scripts.utils import (
@@ -22,6 +21,7 @@ from scripts.utils.option_pricing import (
     price_option,
     pricing_model_available,
 )
+from scripts.utils.optional_streamlit import st
 from views.tabs.risk_analysis_tab import (
     classify_zone,
     get_iv_regime,

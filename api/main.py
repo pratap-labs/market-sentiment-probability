@@ -70,8 +70,6 @@ from views.tabs.risk_buckets_tab import (
     _zone_rules_table,
     _build_bucket_history,
 )
-import streamlit as st
-
 try:
     from kiteconnect import KiteConnect
 except Exception:
@@ -90,16 +88,16 @@ MANUAL_BUCKET_FILE = ROOT / "database" / "manual_bucket_overrides.json"
 RISK_BUCKET_SETTINGS_FILE = ROOT / "database" / "risk_bucket_settings.json"
 FRONTEND_DIST = ROOT / "dist"
 KITE_TOKEN_TTL = timedelta(hours=12)
-DEFAULT_REDIRECT_URL = "http://localhost:8000/auth/callback"
-DEFAULT_FRONTEND_URL = "http://localhost:5173/login?auth=success"
+SERVER_PORT = os.getenv("SERVER_PORT", "8000")
+CLIENT_PORT = os.getenv("CLIENT_PORT", "5173")
+DEFAULT_REDIRECT_URL = os.getenv("REDIRECT_URL", f"http://localhost:{SERVER_PORT}/auth/callback")
+DEFAULT_FRONTEND_URL = os.getenv("FRONTEND_URL", f"http://localhost:{CLIENT_PORT}/login?auth=success")
 
 logger = logging.getLogger("gammashield.api")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-# FastAPI/bare mode does not run Streamlit's script context; silence noisy warnings.
-logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").setLevel(logging.ERROR)
 
 app = FastAPI(title="GammaShield API", version="0.1.0")
 app.add_middleware(
@@ -1154,21 +1152,8 @@ def _get_credentials(request: Request) -> KiteHeaders:
 
 
 def _prepare_rb_state(options_df: pd.DataFrame, nifty_df: pd.DataFrame) -> None:
-    st.session_state["options_df_cache"] = options_df
-    st.session_state["nifty_df_cache"] = nifty_df
-    st.session_state.setdefault("tba_sim_days", 10)
-    st.session_state.setdefault("tba_sim_paths", 2000)
-    st.session_state.setdefault("tba_iv_mode", "IV Flat")
-    st.session_state.setdefault("tba_iv_shock", 2.0)
-    st.session_state.setdefault("tba_alloc_low", 50.0)
-    st.session_state.setdefault("tba_alloc_med", 30.0)
-    st.session_state.setdefault("tba_alloc_high", 20.0)
-    st.session_state.setdefault("tba_bucket_es_limit_low", 2.0)
-    st.session_state.setdefault("tba_bucket_es_limit_med", 3.0)
-    st.session_state.setdefault("tba_bucket_es_limit_high", 5.0)
-    st.session_state.setdefault("tba_trade_low_max", 1.0)
-    st.session_state.setdefault("tba_trade_med_max", 2.0)
-    st.session_state.setdefault("tba_spot_input", 0.0)
+    _ = options_df
+    _ = nifty_df
 
 
 @app.middleware("http")

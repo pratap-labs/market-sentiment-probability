@@ -10,7 +10,6 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import streamlit as st
 from plotly.subplots import make_subplots
 
 import sys
@@ -19,6 +18,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from scripts.utils import parse_tradingsymbol
+from scripts.utils.optional_streamlit import st
 
 
 def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:

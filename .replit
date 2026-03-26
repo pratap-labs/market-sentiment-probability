@@ -6,7 +6,7 @@ packages = ["glibcLocales"]
 
 [deployment]
 deploymentTarget = "autoscale"
-run = ["streamlit", "run", "app.py", "--server.port", "5000"]
+run = ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "5000"]
 
 [workflows]
 runButton = "Project"
@@ -26,7 +26,7 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "streamlit run app.py --server.port 5000"
+args = "uvicorn api.main:app --host 0.0.0.0 --port 5000"
 waitForPort = 5000
 
 [workflows.workflow.metadata]
@@ -37,4 +37,4 @@ localPort = 5000
 externalPort = 80
 
 [agent]
-integrations = ["streamlit_database:1.0.0", "github:1.0.0"]
+integrations = ["github:1.0.0"]

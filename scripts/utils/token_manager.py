@@ -1,10 +1,11 @@
 """Token persistence helpers for Kite Connect authentication."""
 
 import json
-import streamlit as st
 from datetime import datetime
 from pathlib import Path as _Path
 from typing import Optional, Dict
+
+from .optional_streamlit import st
 
 
 def _token_file_path() -> _Path:

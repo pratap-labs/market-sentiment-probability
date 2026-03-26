@@ -3,7 +3,6 @@
 Provides one-glance decision signals on market conditions, portfolio health, and immediate actions.
 """
 
-import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
 from typing import Dict, List
@@ -18,6 +17,7 @@ if ROOT not in sys.path:
 from scripts.utils.portfolio_metrics import calculate_portfolio_greeks, calculate_market_regime
 from scripts.utils.risk_calculations import calculate_var
 from scripts.utils.formatters import format_inr
+from scripts.utils.optional_streamlit import st
 from pathlib import Path
 from datetime import datetime
 
