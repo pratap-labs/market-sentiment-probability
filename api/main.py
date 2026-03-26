@@ -90,8 +90,7 @@ FRONTEND_DIST = ROOT / "dist"
 KITE_TOKEN_TTL = timedelta(hours=12)
 SERVER_PORT = os.getenv("SERVER_PORT", "8000")
 CLIENT_PORT = os.getenv("CLIENT_PORT", "5173")
-DEFAULT_REDIRECT_URL = os.getenv("REDIRECT_URL", f"http://localhost:{SERVER_PORT}/auth/callback")
-DEFAULT_FRONTEND_URL = os.getenv("FRONTEND_URL", f"http://localhost:{CLIENT_PORT}/login?auth=success")
+APP_BASE_URL = (os.getenv("APP_BASE_URL") or "").rstrip("/")
 
 logger = logging.getLogger("gammashield.api")
 logging.basicConfig(
@@ -1186,7 +1185,9 @@ def auth_login():
     api_key = os.getenv("KITE_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="KITE_API_KEY missing")
-    redirect_uri = os.getenv("KITE_REDIRECT_URL", DEFAULT_REDIRECT_URL)
+    if not APP_BASE_URL:
+        raise HTTPException(status_code=500, detail="APP_BASE_URL missing")
+    redirect_uri = f"{APP_BASE_URL}/auth/callback"
     kite = KiteConnect(api_key=api_key)
     login_url = kite.login_url()
     if "redirect_uri=" not in login_url:
@@ -1215,7 +1216,9 @@ def auth_callback(request_token: str, status: Optional[str] = None):
     if not access_token:
         return HTMLResponse(content="Auth failed: no access_token returned", status_code=400)
     _save_kite_credentials_file(api_key, access_token)
-    frontend_url = os.getenv("FRONTEND_URL", DEFAULT_FRONTEND_URL)
+    if not APP_BASE_URL:
+        raise HTTPException(status_code=500, detail="APP_BASE_URL missing")
+    frontend_url = f"{APP_BASE_URL}/login?auth=success"
     return RedirectResponse(frontend_url)
 
 
