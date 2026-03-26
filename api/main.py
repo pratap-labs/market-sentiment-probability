@@ -98,14 +98,15 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-app = FastAPI(title="GammaShield API", version="0.1.0")
-app.add_middleware(
+api_app = FastAPI(title="GammaShield API", version="0.1.0")
+api_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app = api_app
 
 
 def _log_frontend_static_state(stage: str) -> None:
@@ -134,7 +135,7 @@ def _log_frontend_static_state(stage: str) -> None:
             logger.exception("[static:%s] failed to inspect client-assets: %s", stage, exc)
 
 
-@app.on_event("startup")
+@api_app.on_event("startup")
 async def startup_diagnostics() -> None:
     logger.info("[startup] GammaShield API starting")
     logger.info("[startup] python=%s", sys.version.replace("\n", " "))
@@ -1155,7 +1156,7 @@ def _prepare_rb_state(options_df: pd.DataFrame, nifty_df: pd.DataFrame) -> None:
     _ = nifty_df
 
 
-@app.middleware("http")
+@api_app.middleware("http")
 async def request_logger(request: Request, call_next):
     request_id = request.headers.get("x-request-id", str(uuid.uuid4()))
     start = time.time()
@@ -1187,7 +1188,7 @@ def auth_login():
         raise HTTPException(status_code=500, detail="KITE_API_KEY missing")
     if not APP_BASE_URL:
         raise HTTPException(status_code=500, detail="APP_BASE_URL missing")
-    redirect_uri = f"{APP_BASE_URL}/auth/callback"
+    redirect_uri = f"{APP_BASE_URL}/api/auth/callback"
     kite = KiteConnect(api_key=api_key)
     login_url = kite.login_url()
     if "redirect_uri=" not in login_url:
@@ -6146,8 +6147,40 @@ def data_source_refresh(
     }
 
 
+root_app = FastAPI(title="GammaShield", version="0.1.0")
+root_app.mount("/api", api_app)
+
 if FRONTEND_DIST.exists():
-    logger.info("[static:init] mounting StaticFiles at '/' from dist=%s", FRONTEND_DIST)
-    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="spa")
+    logger.info("[static:init] serving frontend dist from dist=%s", FRONTEND_DIST)
+
+    client_assets_dir = FRONTEND_DIST / "client-assets"
+    if client_assets_dir.exists():
+        root_app.mount("/client-assets", StaticFiles(directory=client_assets_dir), name="client-assets")
+
+    @root_app.get("/gammashield-logo.png")
+    def spa_logo():
+        path = FRONTEND_DIST / "gammashield-logo.png"
+        if not path.exists():
+            raise HTTPException(status_code=404, detail="Asset not found")
+        return FileResponse(path)
+
+    @root_app.get("/")
+    def spa_index():
+        index_path = FRONTEND_DIST / "index.html"
+        if not index_path.exists():
+            raise HTTPException(status_code=404, detail="Frontend index missing")
+        return FileResponse(index_path)
+
+    @root_app.get("/{full_path:path}")
+    def spa_fallback(full_path: str):
+        requested = FRONTEND_DIST / full_path
+        if requested.is_file():
+            return FileResponse(requested)
+        index_path = FRONTEND_DIST / "index.html"
+        if not index_path.exists():
+            raise HTTPException(status_code=404, detail="Frontend index missing")
+        return FileResponse(index_path)
 else:
     logger.warning("[static:init] dist folder missing at startup: %s", FRONTEND_DIST)
+
+app = root_app

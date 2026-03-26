@@ -1,7 +1,7 @@
 declare const __SERVER_PORT__: string;
 
 export const API_BASE_URL =
-  import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? `http://localhost:${__SERVER_PORT__}` : "");
+  import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? `http://localhost:${__SERVER_PORT__}/api` : "/api");
 
 type FetchOptions = {
   method?: string;
