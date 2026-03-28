@@ -12,7 +12,7 @@ export default defineConfig(({ mode }) => {
     define: {
       __SERVER_PORT__: JSON.stringify(serverPort)
     },
-    base: "./",
+    base: "/",
     build: {
       outDir: "../dist",
       emptyOutDir: true,
