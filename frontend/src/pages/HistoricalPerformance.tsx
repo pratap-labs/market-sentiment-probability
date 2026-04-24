@@ -28,6 +28,33 @@ type Historical = {
   daily_es99: Record<string, unknown>[];
 };
 
+type HistoricalRow = Record<string, unknown>;
+
+type DailyMarginRow = HistoricalRow & {
+  date: string;
+  dateIso: string;
+  gross_blocked?: number | string;
+};
+
+type DailyEs99Row = HistoricalRow & {
+  date: string;
+  dateIso: string;
+  es99_inr?: number | string;
+  blocked_margin?: number | string;
+};
+
+type PeriodMarginRow = HistoricalRow & {
+  periodStart: string;
+  periodLabel: string;
+  total_pnl?: number | string;
+  avg_margin_blocked?: number | string;
+};
+
+type PeriodRoiRow = PeriodMarginRow & {
+  roiPct: number;
+  stackTop: number;
+};
+
 const MIN_DISPLAY_DATE = "2025-06-01";
 
 export default function HistoricalPerformance() {
@@ -51,7 +78,7 @@ export default function HistoricalPerformance() {
   const weeklyMarginPnl = data?.weekly_margin_pnl || [];
   const monthlyMarginPnl = data?.monthly_margin_pnl || [];
   const dailyEs99 = data?.daily_es99 || [];
-  const dailyMarginSeries = useMemo(() => {
+  const dailyMarginSeries = useMemo<DailyMarginRow[]>(() => {
     return [...dailyMargin]
       .map((row) => {
         const date = String(row.date || "");
@@ -59,13 +86,13 @@ export default function HistoricalPerformance() {
           ...row,
           date,
           dateIso: date ? `${date}T00:00:00` : ""
-        };
+        } as DailyMarginRow;
       })
       .filter((row) => row.dateIso)
       .filter((row) => row.date >= MIN_DISPLAY_DATE)
       .sort((a, b) => a.dateIso.localeCompare(b.dateIso));
   }, [dailyMargin]);
-  const dailyEs99Series = useMemo(() => {
+  const dailyEs99Series = useMemo<DailyEs99Row[]>(() => {
     return [...dailyEs99]
       .map((row) => {
         const date = String(row.date || "");
@@ -73,36 +100,36 @@ export default function HistoricalPerformance() {
           ...row,
           date,
           dateIso: date ? `${date}T00:00:00` : ""
-        };
+        } as DailyEs99Row;
       })
       .filter((row) => row.dateIso)
       .filter((row) => row.date >= MIN_DISPLAY_DATE)
       .sort((a, b) => a.dateIso.localeCompare(b.dateIso));
   }, [dailyEs99]);
-  const weeklyMarginSeries = useMemo(() => {
+  const weeklyMarginSeries = useMemo<PeriodMarginRow[]>(() => {
     return [...weeklyMarginPnl]
       .map((row) => ({
         ...row,
         periodStart: String(row.period_start || ""),
         periodLabel: String(row.period_label || "")
-      }))
+      }) as PeriodMarginRow)
       .filter((row) => row.periodStart)
       .filter((row) => row.periodStart >= MIN_DISPLAY_DATE)
       .sort((a, b) => a.periodStart.localeCompare(b.periodStart));
   }, [weeklyMarginPnl]);
-  const monthlyMarginSeries = useMemo(() => {
+  const monthlyMarginSeries = useMemo<PeriodMarginRow[]>(() => {
     return [...monthlyMarginPnl]
       .map((row) => ({
         ...row,
         periodStart: String(row.period_start || ""),
         periodLabel: String(row.period_label || "")
-      }))
+      }) as PeriodMarginRow)
       .filter((row) => row.periodStart)
       .filter((row) => row.periodStart >= MIN_DISPLAY_DATE)
       .sort((a, b) => a.periodStart.localeCompare(b.periodStart));
   }, [monthlyMarginPnl]);
   const periodMarginSeries = marginView === "week" ? weeklyMarginSeries : monthlyMarginSeries;
-  const periodRoiSeries = useMemo(() => {
+  const periodRoiSeries = useMemo<PeriodRoiRow[]>(() => {
     return periodMarginSeries.map((row) => {
       const pnl = Number(row.total_pnl || 0);
       const avgMargin = Number(row.avg_margin_blocked || 0);
