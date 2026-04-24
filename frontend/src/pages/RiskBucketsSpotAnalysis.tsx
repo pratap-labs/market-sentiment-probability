@@ -3,6 +3,10 @@ import SectionCard from "../components/SectionCard";
 import LoadingState from "../components/LoadingState";
 import ErrorState from "../components/ErrorState";
 import Plot from "../components/Plot";
+import DataTable from "../components/DataTable";
+import MetricGrid from "../components/MetricGrid";
+import MetricCard from "../components/MetricCard";
+import { formatNumber, formatPct } from "../components/format";
 import { useCachedApi } from "../hooks/useCachedApi";
 import { useControls } from "../state/ControlsContext";
 
@@ -10,6 +14,30 @@ type History = { drift_counts: { drift: string; count: number }[]; ohlc: Record<
 type Ohlcv = { rows: Record<string, unknown>[]; summary: Record<string, unknown> };
 type Futures = { rows: Record<string, unknown>[] };
 type Options = { ce: Record<string, unknown>[]; pe: Record<string, unknown>[] };
+type DailyTrackerRow = {
+  date: string;
+  nifty_close: number | null;
+  price_change_pct: number | null;
+  price_direction: string;
+  futures_oi: number | null;
+  futures_oi_direction: string;
+  vix_value: number | null;
+  vix_direction: string;
+  vix_source: string;
+  breadth_signal: string;
+  breadth_pct: number | null;
+  weighted_constituent_volume: number | null;
+  usdinr_value: number | null;
+  usdinr_direction: string;
+  usdinr_source: string;
+  core_logic: string;
+  daily_classification: string;
+};
+type DailyTrackerResponse = {
+  rows: DailyTrackerRow[];
+  count: number;
+  latest: DailyTrackerRow | null;
+};
 
 const EXPIRY_PALETTE = [
   "#2D7DFF",
@@ -31,8 +59,15 @@ export default function RiskBucketsSpotAnalysis() {
   const ohlcv = useCachedApi<Ohlcv>("nifty_ohlcv", "/derivatives/nifty-ohlcv?limit=400", 60_000);
   const futures = useCachedApi<Futures>("nifty_futures", "/derivatives/futures?limit=600", 60_000);
   const options = useCachedApi<Options>("nifty_options", "/derivatives/options?limit=25000", 60_000);
+  const tracker = useCachedApi<DailyTrackerResponse>(
+    "spot_analysis_daily_tracker",
+    "/spot-analysis/daily-tracker?days=20",
+    60_000
+  );
   const { setControls } = useControls();
   const [selectedExpiry, setSelectedExpiry] = useState<string>("All");
+
+  const latestTracker = tracker.data?.latest || null;
 
   const ohlc = useMemo(() => {
     const rows = history.data?.ohlc || ohlcv.data?.rows || [];
@@ -220,9 +255,84 @@ export default function RiskBucketsSpotAnalysis() {
 
   return (
     <>
-      {history.error || ohlcv.error || futures.error || options.error ? (
-        <ErrorState message={String(history.error || ohlcv.error || futures.error || options.error)} />
+      {history.error || ohlcv.error || futures.error || options.error || tracker.error ? (
+        <ErrorState message={String(history.error || ohlcv.error || futures.error || options.error || tracker.error)} />
       ) : null}
+
+      <SectionCard title="Daily Market Tracker">
+        {tracker.loading || !tracker.data || !latestTracker ? (
+          <LoadingState />
+        ) : (
+          <>
+            <MetricGrid>
+              <MetricCard
+                label="NIFTY"
+                value={formatNumber(latestTracker.nifty_close, 0)}
+                delta={`${latestTracker.price_direction.toUpperCase()} ${formatPct(latestTracker.price_change_pct)}`}
+                tone={latestTracker.price_direction === "up" ? "positive" : latestTracker.price_direction === "down" ? "negative" : "neutral"}
+              />
+              <MetricCard
+                label="Futures OI"
+                value={latestTracker.futures_oi != null ? Number(latestTracker.futures_oi).toLocaleString("en-IN", { maximumFractionDigits: 0 }) : "—"}
+                delta={latestTracker.futures_oi_direction.toUpperCase()}
+                tone={latestTracker.futures_oi_direction === "up" ? "warning" : latestTracker.futures_oi_direction === "down" ? "info" : "neutral"}
+              />
+              <MetricCard
+                label="VIX"
+                value={formatNumber(latestTracker.vix_value, 1)}
+                delta={latestTracker.vix_direction.toUpperCase()}
+                tone={latestTracker.vix_direction === "up" ? "negative" : latestTracker.vix_direction === "down" ? "positive" : "neutral"}
+                tooltip="Current implementation uses a near-ATM IV proxy from NIFTY options cache."
+              />
+              <MetricCard
+                label="Breadth"
+                value={latestTracker.breadth_signal.toUpperCase()}
+                delta={formatPct(latestTracker.breadth_pct)}
+                tone={latestTracker.breadth_signal === "strong" ? "positive" : "warning"}
+              />
+              <MetricCard
+                label="USDINR"
+                value={latestTracker.usdinr_source === "missing" ? "Feed Missing" : formatNumber(latestTracker.usdinr_value, 2)}
+                delta={latestTracker.usdinr_direction.toUpperCase()}
+                tone="neutral"
+              />
+            </MetricGrid>
+
+            <div style={{ display: "flex", gap: 16, flexWrap: "wrap", marginTop: 12, color: "#b9c4d6" }}>
+              <span>Core Logic: <strong>{latestTracker.core_logic}</strong></span>
+              <span>Classification: <strong>{latestTracker.daily_classification}</strong></span>
+              <span>Weighted Volume: <strong>{latestTracker.weighted_constituent_volume != null ? Number(latestTracker.weighted_constituent_volume).toLocaleString("en-IN", { maximumFractionDigits: 0 }) : "—"}</strong></span>
+            </div>
+
+            <div style={{ marginTop: 14 }}>
+              <DataTable
+                columns={[
+                  { key: "date", label: "Date" },
+                  { key: "price_direction", label: "NIFTY" },
+                  { key: "futures_oi_direction", label: "Futures OI" },
+                  { key: "vix_direction", label: "VIX" },
+                  { key: "breadth_signal", label: "Breadth" },
+                  { key: "usdinr_direction", label: "USDINR" },
+                  { key: "core_logic", label: "Core Logic" },
+                  { key: "daily_classification", label: "Daily Classification" },
+                  {
+                    key: "weighted_constituent_volume",
+                    label: "Weighted Volume",
+                    format: (v) => {
+                      const n = Number(v);
+                      return Number.isFinite(n)
+                        ? n.toLocaleString("en-IN", { maximumFractionDigits: 0 })
+                        : "—";
+                    }
+                  },
+                ]}
+                rows={(tracker.data.rows || []).slice().reverse()}
+                maxHeight={360}
+              />
+            </div>
+          </>
+        )}
+      </SectionCard>
 
       <SectionCard title="NIFTY OHLCV">
         {history.loading || ohlcv.loading ? (

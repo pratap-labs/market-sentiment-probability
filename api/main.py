@@ -11,16 +11,40 @@ import json
 import io
 import re
 import zipfile
+from collections import defaultdict, deque
 import numpy as np
 from datetime import date
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+def load_env_file(env_path: Path) -> None:
+    """Load simple KEY=VALUE pairs into environment if not already set."""
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text().splitlines():
+            line = raw_line.strip()
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and (key not in os.environ or not os.environ.get(key)):
+                os.environ[key] = value
+    except Exception:
+        return
+
+
+load_env_file(ROOT / ".env")
 
 import requests
 import pandas as pd
@@ -43,6 +67,8 @@ from scripts.data import train_flow_probability_models as flow_train
 from scripts.utils.greeks import calculate_implied_volatility
 from scripts.utils.stress_testing import compute_var_es_metrics, get_weighted_scenarios, classify_bucket
 from scripts.utils.forward_risk import run_advanced_forward_risk
+from scripts.utils.parsers import parse_tradingsymbol
+from scripts.utils.option_pricing import price_option
 from views.tabs.overview_tab import (
     get_alignment_status,
     get_market_signal,
@@ -86,11 +112,14 @@ LONG_TERM_UNIVERSE_FILE = ROOT / "data" / "long_term_universe.json"
 NIFTY50_WEIGHTS_FILE = ROOT / "data" / "nifty50_weights.json"
 MANUAL_BUCKET_FILE = ROOT / "database" / "manual_bucket_overrides.json"
 RISK_BUCKET_SETTINGS_FILE = ROOT / "database" / "risk_bucket_settings.json"
+LEDGER_FILE = ROOT / "database" / "ledger.csv"
+TRADEBOOK_FO_FILE = ROOT / "database" / "tradebook_fo.csv"
 FRONTEND_DIST = ROOT / "dist"
 KITE_TOKEN_TTL = timedelta(hours=12)
 SERVER_PORT = os.getenv("SERVER_PORT", "8000")
 CLIENT_PORT = os.getenv("CLIENT_PORT", "5173")
-APP_BASE_URL = (os.getenv("APP_BASE_URL") or "").rstrip("/")
+BACKEND_BASE_URL = (os.getenv("BACKEND_BASE_URL") or "").rstrip("/")
+FRONTEND_BASE_URL = (os.getenv("FRONTEND_BASE_URL") or "").rstrip("/")
 
 logger = logging.getLogger("gammashield.api")
 logging.basicConfig(
@@ -296,6 +325,439 @@ def _append_csv_dedup(path: Path, new_df: pd.DataFrame, dedup_cols: List[str]) -
     sort_cols = [c for c in ["expiry_date", "expiry", "date", "timestamp_order"] if c in out.columns]
     if sort_cols:
         out = out.sort_values(sort_cols).reset_index(drop=True)
+    return out
+
+
+def _load_daily_margin_summary(ledger_path: Path) -> List[Dict[str, Any]]:
+    if not ledger_path.exists():
+        return []
+
+    df = _read_csv(ledger_path)
+    if df.empty or "particulars" not in df.columns or "posting_date" not in df.columns:
+        return []
+
+    df = df.copy()
+    df["posting_date"] = pd.to_datetime(df["posting_date"], errors="coerce")
+    df["particulars"] = df["particulars"].astype(str).str.strip().str.lower()
+    for col in ("debit", "credit"):
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0) if col in df.columns else 0.0
+
+    margin_labels = {
+        "span margin blocked for nse f&o": "span_blocked",
+        "exposure margin blocked for nse f&o": "exposure_blocked",
+        "span margin reversed for nse f&o": "span_reversed",
+        "exposure margin reversed for nse f&o": "exposure_reversed",
+    }
+    df["margin_kind"] = df["particulars"].map(margin_labels)
+    df = df[df["posting_date"].notna() & df["margin_kind"].notna()].copy()
+    if df.empty:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for posting_date, group in df.groupby(df["posting_date"].dt.strftime("%Y-%m-%d")):
+        span_blocked = float(group.loc[group["margin_kind"] == "span_blocked", "debit"].sum())
+        exposure_blocked = float(group.loc[group["margin_kind"] == "exposure_blocked", "debit"].sum())
+        span_reversed = float(group.loc[group["margin_kind"] == "span_reversed", "credit"].sum())
+        exposure_reversed = float(group.loc[group["margin_kind"] == "exposure_reversed", "credit"].sum())
+        gross_blocked = span_blocked + exposure_blocked
+        gross_reversed = span_reversed + exposure_reversed
+        rows.append(
+            {
+                "date": posting_date,
+                "span_blocked": span_blocked,
+                "exposure_blocked": exposure_blocked,
+                "gross_blocked": gross_blocked,
+                "span_reversed": span_reversed,
+                "exposure_reversed": exposure_reversed,
+                "gross_reversed": gross_reversed,
+                "net_margin_move": gross_blocked - gross_reversed,
+            }
+        )
+
+    return rows
+
+
+def _aggregate_period_margin_and_pnl(
+    pnl_source_df: pd.DataFrame,
+    pnl_date_col: str,
+    daily_margin_rows: List[Dict[str, Any]],
+    freq: str,
+) -> List[Dict[str, Any]]:
+    margin_df = pd.DataFrame(daily_margin_rows)
+    if not margin_df.empty:
+        margin_df["date"] = pd.to_datetime(margin_df["date"], errors="coerce")
+        margin_df = margin_df.dropna(subset=["date"]).copy()
+        margin_df["gross_blocked"] = pd.to_numeric(margin_df["gross_blocked"], errors="coerce").fillna(0.0)
+
+    pnl_df = pnl_source_df.dropna(subset=[pnl_date_col]).copy() if pnl_date_col in pnl_source_df.columns else pd.DataFrame()
+    if not pnl_df.empty:
+        pnl_df[pnl_date_col] = pd.to_datetime(pnl_df[pnl_date_col], errors="coerce")
+        pnl_df = pnl_df.dropna(subset=[pnl_date_col]).copy()
+        pnl_df["realized_pnl"] = pd.to_numeric(pnl_df["realized_pnl"], errors="coerce").fillna(0.0)
+
+    if freq == "W":
+        if not margin_df.empty:
+            margin_df["period_start"] = margin_df["date"].dt.to_period("W").dt.start_time
+        if not pnl_df.empty:
+            pnl_df["period_start"] = pnl_df[pnl_date_col].dt.to_period("W").dt.start_time
+        label_fmt = lambda s: f"{s.strftime('%Y-%m-%d')} wk"
+    else:
+        if not margin_df.empty:
+            margin_df["period_start"] = margin_df["date"].dt.to_period("M").dt.to_timestamp()
+        if not pnl_df.empty:
+            pnl_df["period_start"] = pnl_df[pnl_date_col].dt.to_period("M").dt.to_timestamp()
+        label_fmt = lambda s: s.strftime("%Y-%m")
+
+    margin_summary = pd.DataFrame(columns=["period_start", "avg_margin_blocked", "max_margin_blocked"])
+    if not margin_df.empty:
+        margin_summary = (
+            margin_df.groupby("period_start", as_index=False)["gross_blocked"]
+            .agg(avg_margin_blocked="mean", max_margin_blocked="max")
+        )
+
+    pnl_summary = pd.DataFrame(columns=["period_start", "total_pnl"])
+    if not pnl_df.empty:
+        pnl_summary = (
+            pnl_df.groupby("period_start", as_index=False)["realized_pnl"]
+            .sum()
+            .rename(columns={"realized_pnl": "total_pnl"})
+        )
+
+    merged = pd.merge(margin_summary, pnl_summary, on="period_start", how="outer").fillna(0.0)
+    if merged.empty:
+        return []
+
+    merged = merged.sort_values("period_start").reset_index(drop=True)
+    merged["period_start"] = pd.to_datetime(merged["period_start"], errors="coerce")
+    return [
+        {
+            "period_start": row.period_start.strftime("%Y-%m-%d"),
+            "period_label": label_fmt(row.period_start),
+            "avg_margin_blocked": float(row.avg_margin_blocked),
+            "max_margin_blocked": float(row.max_margin_blocked),
+            "total_pnl": float(row.total_pnl),
+        }
+        for row in merged.itertuples(index=False)
+        if pd.notna(row.period_start)
+    ]
+
+
+def _load_fo_booked_pnl(tradebook_fo_path: Path) -> pd.DataFrame:
+    df = _read_csv(tradebook_fo_path)
+    required = {"symbol", "trade_type", "quantity", "price"}
+    if df.empty or not required.issubset(set(df.columns)):
+        return pd.DataFrame(columns=["booking_date", "realized_pnl"])
+
+    working = df.copy()
+    if "order_execution_time" in working.columns:
+        working["booking_ts"] = pd.to_datetime(working["order_execution_time"], errors="coerce")
+    else:
+        working["booking_ts"] = pd.NaT
+    if "trade_date" in working.columns:
+        trade_date = pd.to_datetime(working["trade_date"], errors="coerce")
+        working["booking_ts"] = working["booking_ts"].fillna(trade_date)
+        working["booking_date"] = trade_date.dt.normalize()
+    else:
+        working["booking_date"] = working["booking_ts"].dt.normalize()
+
+    working["quantity"] = pd.to_numeric(working["quantity"], errors="coerce").fillna(0.0).abs()
+    working["price"] = pd.to_numeric(working["price"], errors="coerce").fillna(0.0)
+    working["trade_type"] = working["trade_type"].astype(str).str.strip().str.lower()
+    working["symbol"] = working["symbol"].astype(str).str.strip()
+    working = working[
+        working["booking_date"].notna()
+        & working["symbol"].ne("")
+        & working["quantity"].gt(0)
+        & working["price"].ge(0)
+        & working["trade_type"].isin(["buy", "sell"])
+    ].copy()
+    if working.empty:
+        return pd.DataFrame(columns=["booking_date", "realized_pnl"])
+
+    sort_cols = [c for c in ["booking_ts", "trade_date", "order_id", "trade_id"] if c in working.columns]
+    working = working.sort_values(sort_cols).reset_index(drop=True)
+
+    open_lots: Dict[str, deque] = defaultdict(deque)
+    realized_rows: List[Dict[str, Any]] = []
+
+    for row in working.itertuples(index=False):
+        symbol = str(row.symbol)
+        side = 1 if str(row.trade_type).lower() == "buy" else -1
+        remaining_qty = float(row.quantity)
+        fill_price = float(row.price)
+        booking_date = pd.Timestamp(row.booking_date).strftime("%Y-%m-%d")
+        lots = open_lots[symbol]
+
+        while remaining_qty > 0 and lots and int(lots[0]["side"]) != side:
+            open_lot = lots[0]
+            matched_qty = min(remaining_qty, float(open_lot["qty"]))
+            if side == 1:
+                realized_pnl = (float(open_lot["price"]) - fill_price) * matched_qty
+            else:
+                realized_pnl = (fill_price - float(open_lot["price"])) * matched_qty
+            realized_rows.append({"booking_date": booking_date, "realized_pnl": float(realized_pnl)})
+            open_lot["qty"] = float(open_lot["qty"]) - matched_qty
+            remaining_qty -= matched_qty
+            if open_lot["qty"] <= 1e-9:
+                lots.popleft()
+
+        if remaining_qty > 1e-9:
+            lots.append({"side": side, "qty": remaining_qty, "price": fill_price})
+
+    if not realized_rows:
+        return pd.DataFrame(columns=["booking_date", "realized_pnl"])
+
+    realized_df = pd.DataFrame(realized_rows)
+    realized_df["booking_date"] = pd.to_datetime(realized_df["booking_date"], errors="coerce")
+    realized_df = (
+        realized_df.dropna(subset=["booking_date"])
+        .groupby("booking_date", as_index=False)["realized_pnl"]
+        .sum()
+        .sort_values("booking_date")
+        .reset_index(drop=True)
+    )
+    return realized_df
+
+
+def _parse_nifty_contract_metadata(symbol: str) -> Optional[Dict[str, Any]]:
+    s = str(symbol or "").upper().strip()
+    if not s.startswith("NIFTY"):
+        return None
+    if s.endswith("FUT"):
+        match = re.match(r"^NIFTY(\d{2})([A-Z]{3})FUT$", s)
+        if not match:
+            return None
+        year_2, mon = match.groups()
+        year = 2000 + int(year_2)
+        month_map = {
+            "JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6,
+            "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12
+        }
+        month = month_map.get(mon)
+        if not month:
+            return None
+        expiry = hp_tab._last_tuesday(year, month)
+        return {"instrument_type": "FUT", "expiry_date": expiry.strftime("%Y-%m-%d"), "strike": None, "option_type": None}
+
+    parsed = parse_tradingsymbol(s)
+    if not parsed:
+        return None
+    return {
+        "instrument_type": "OPT",
+        "expiry_date": pd.Timestamp(parsed["expiry"]).strftime("%Y-%m-%d"),
+        "strike": float(parsed["strike"]),
+        "option_type": str(parsed["option_type"]),
+    }
+
+
+def _load_nifty_market_history() -> Dict[str, Any]:
+    spot_df = _read_csv(CACHE_DIR / "nifty_ohlcv.csv")
+    fut_df = _read_csv(CACHE_DIR / "nifty_futures.csv")
+    ce_df = _read_csv(CACHE_DIR / "nifty_options_ce.csv")
+    pe_df = _read_csv(CACHE_DIR / "nifty_options_pe.csv")
+    if spot_df.empty or fut_df.empty or (ce_df.empty and pe_df.empty):
+        return {}
+
+    spot_df = spot_df.copy()
+    spot_df["date"] = pd.to_datetime(spot_df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    spot_df["close"] = pd.to_numeric(spot_df["close"], errors="coerce")
+    spot_df = spot_df.dropna(subset=["date", "close"]).sort_values("date").drop_duplicates("date", keep="last")
+
+    fut_df = fut_df.copy()
+    fut_df["date"] = pd.to_datetime(fut_df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    fut_df["expiry_date"] = pd.to_datetime(fut_df["expiry_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    for col in ("close", "underlying_value"):
+        fut_df[col] = pd.to_numeric(fut_df[col], errors="coerce")
+    fut_df = fut_df.dropna(subset=["date", "expiry_date", "close"])
+
+    opt_df = pd.concat([ce_df, pe_df], ignore_index=True)
+    opt_df["date"] = pd.to_datetime(opt_df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    opt_df["expiry_date"] = pd.to_datetime(opt_df["expiry_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    opt_df["strike_price"] = pd.to_numeric(opt_df["strike_price"], errors="coerce")
+    for col in ("close", "underlying_value"):
+        opt_df[col] = pd.to_numeric(opt_df[col], errors="coerce")
+    opt_df["option_type"] = opt_df["option_type"].astype(str).str.upper()
+    opt_df = opt_df.dropna(subset=["date", "expiry_date", "strike_price", "close"])
+
+    fut_map: Dict[tuple, Dict[str, float]] = {}
+    for row in fut_df.itertuples(index=False):
+        fut_map[(str(row.date), str(row.expiry_date))] = {
+            "close": float(row.close),
+            "underlying_value": float(row.underlying_value) if pd.notna(row.underlying_value) else float(row.close),
+        }
+
+    opt_map: Dict[tuple, Dict[str, float]] = {}
+    for row in opt_df.itertuples(index=False):
+        opt_map[(str(row.date), str(row.expiry_date), float(row.strike_price), str(row.option_type))] = {
+            "close": float(row.close),
+            "underlying_value": float(row.underlying_value) if pd.notna(row.underlying_value) else None,
+        }
+
+    spot_dates = spot_df["date"].tolist()
+    spot_close_map = dict(zip(spot_df["date"], spot_df["close"]))
+    spot_return_map: Dict[str, List[float]] = {}
+    spot_work = spot_df.copy()
+    spot_work["ret"] = spot_work["close"].pct_change()
+    for idx, row in enumerate(spot_work.itertuples(index=False)):
+        if idx < 20:
+            continue
+        trailing = spot_work.iloc[max(1, idx - 252 + 1): idx + 1]["ret"].dropna()
+        if trailing.empty:
+            continue
+        spot_return_map[str(row.date)] = trailing.astype(float).tolist()
+
+    return {
+        "spot_dates": spot_dates,
+        "spot_close_map": {str(k): float(v) for k, v in spot_close_map.items()},
+        "spot_return_map": spot_return_map,
+        "fut_map": fut_map,
+        "opt_map": opt_map,
+    }
+
+
+def _build_nifty_daily_position_snapshots(tradebook_fo_path: Path, spot_dates: List[str]) -> List[Dict[str, Any]]:
+    df = _read_csv(tradebook_fo_path)
+    required = {"symbol", "trade_type", "quantity"}
+    if df.empty or not required.issubset(set(df.columns)):
+        return []
+
+    working = df.copy()
+    working["symbol"] = working["symbol"].astype(str).str.strip().str.upper()
+    working = working[working["symbol"].str.startswith("NIFTY")].copy()
+    if working.empty:
+        return []
+    working["booking_date"] = pd.to_datetime(working.get("trade_date"), errors="coerce").dt.strftime("%Y-%m-%d")
+    working["quantity"] = pd.to_numeric(working["quantity"], errors="coerce").fillna(0.0).abs()
+    working["trade_type"] = working["trade_type"].astype(str).str.strip().str.lower()
+    working = working[
+        working["booking_date"].notna()
+        & working["quantity"].gt(0)
+        & working["trade_type"].isin(["buy", "sell"])
+    ].copy()
+    if working.empty:
+        return []
+
+    daily_flows = (
+        working.assign(signed_qty=np.where(working["trade_type"].eq("buy"), working["quantity"], -working["quantity"]))
+        .groupby(["booking_date", "symbol"], as_index=False)["signed_qty"]
+        .sum()
+    )
+    flow_map: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in daily_flows.itertuples(index=False):
+        flow_map[str(row.booking_date)].append({"symbol": str(row.symbol), "signed_qty": float(row.signed_qty)})
+
+    open_positions: Dict[str, float] = {}
+    snapshots: List[Dict[str, Any]] = []
+    for day in sorted(spot_dates):
+        for flow in flow_map.get(day, []):
+            symbol = flow["symbol"]
+            open_positions[symbol] = float(open_positions.get(symbol, 0.0) + flow["signed_qty"])
+            if abs(open_positions[symbol]) < 1e-9:
+                open_positions.pop(symbol, None)
+        positions = []
+        for symbol, qty in sorted(open_positions.items()):
+            meta = _parse_nifty_contract_metadata(symbol)
+            if meta is None:
+                continue
+            positions.append({"symbol": symbol, "quantity": float(qty), **meta})
+        if positions:
+            snapshots.append({"date": day, "positions": positions})
+    return snapshots
+
+
+def _compute_daily_nifty_es99(
+    tradebook_fo_path: Path,
+    ledger_path: Path,
+) -> List[Dict[str, Any]]:
+    market = _load_nifty_market_history()
+    if not market:
+        return []
+
+    snapshots = _build_nifty_daily_position_snapshots(tradebook_fo_path, market["spot_dates"])
+    if not snapshots:
+        return []
+
+    margin_map = {str(row["date"]): float(row.get("gross_blocked", 0.0)) for row in _load_daily_margin_summary(ledger_path)}
+    out: List[Dict[str, Any]] = []
+
+    for snap in snapshots:
+        day = str(snap["date"])
+        trailing_returns = market["spot_return_map"].get(day) or []
+        spot_t = float(market["spot_close_map"].get(day) or 0.0)
+        if spot_t <= 0 or len(trailing_returns) < 20:
+            continue
+
+        scenario_losses: List[float] = []
+        for ret in trailing_returns:
+            shocked_spot = spot_t * (1.0 + float(ret))
+            portfolio_pnl = 0.0
+            priced_any = False
+            for pos in snap["positions"]:
+                qty = float(pos["quantity"])
+                expiry_date = str(pos["expiry_date"])
+                if pos["instrument_type"] == "FUT":
+                    fut_row = market["fut_map"].get((day, expiry_date))
+                    if not fut_row:
+                        continue
+                    current_price = float(fut_row["close"])
+                    shocked_price = current_price * (1.0 + float(ret))
+                    portfolio_pnl += qty * (shocked_price - current_price)
+                    priced_any = True
+                    continue
+
+                strike = float(pos["strike"] or 0.0)
+                option_type = str(pos["option_type"])
+                opt_row = market["opt_map"].get((day, expiry_date, strike, option_type))
+                if not opt_row:
+                    continue
+                current_price = float(opt_row["close"])
+                option_spot = float(opt_row["underlying_value"] or spot_t)
+                expiry_dt = pd.to_datetime(expiry_date, errors="coerce")
+                current_dt = pd.to_datetime(day, errors="coerce")
+                if pd.isna(expiry_dt) or pd.isna(current_dt):
+                    continue
+                tte = max((expiry_dt - current_dt).days / 365.0, 0.0)
+                shocked_tte = max((expiry_dt - (current_dt + pd.Timedelta(days=1))).days / 365.0, 0.0)
+                iv = calculate_implied_volatility(current_price, option_spot, strike, max(tte, 1e-6), option_type) or 0.20
+                flag = "c" if option_type == "CE" else "p"
+                shocked_price = price_option(
+                    flag=flag,
+                    spot=shocked_spot,
+                    strike=strike,
+                    time_to_expiry=shocked_tte,
+                    risk_free_rate=0.06,
+                    implied_vol=float(iv),
+                    model="black76",
+                    forward=shocked_spot,
+                )
+                if shocked_price is None:
+                    continue
+                portfolio_pnl += qty * (float(shocked_price) - current_price)
+                priced_any = True
+
+            if priced_any:
+                scenario_losses.append(max(-portfolio_pnl, 0.0))
+
+        if not scenario_losses:
+            continue
+
+        losses = np.asarray(sorted(scenario_losses), dtype=float)
+        tail_n = max(1, int(math.ceil(0.01 * losses.size)))
+        es99_inr = float(np.mean(losses[-tail_n:])) if losses.size else 0.0
+        var99_inr = float(losses[max(0, losses.size - tail_n)]) if losses.size else 0.0
+        blocked_margin = float(margin_map.get(day) or 0.0)
+        out.append(
+            {
+                "date": day,
+                "es99_inr": es99_inr,
+                "var99_inr": var99_inr,
+                "blocked_margin": blocked_margin,
+                "es99_pct_blocked": (es99_inr / blocked_margin * 100.0) if blocked_margin > 0 else None,
+                "positions_count": int(len(snap["positions"])),
+                "scenario_count": int(losses.size),
+            }
+        )
+
     return out
 
 
@@ -1108,18 +1570,21 @@ def _is_token_expired(saved_at: Optional[str]) -> bool:
     return datetime.now(timezone.utc) - saved_dt >= KITE_TOKEN_TTL
 
 
-def _save_kite_credentials_file(api_key: str, access_token: str) -> None:
+def _save_kite_credentials_file(api_key: str, access_token: str) -> bool:
     try:
         import json
 
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
         payload = {
             "api_key": api_key,
             "access_token": access_token,
             "saved_at": datetime.now(timezone.utc).isoformat(),
         }
         KITE_CREDS_FILE.write_text(json.dumps(payload))
+        return True
     except Exception as exc:
         logger.error("failed to save kite credentials: %s", exc)
+        return False
 
 
 def _get_kite_client(api_key: str, access_token: str):
@@ -1130,6 +1595,131 @@ def _get_kite_client(api_key: str, access_token: str):
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access_token)
     return kite
+
+
+def _kite_instruments_cached(kite: KiteConnect) -> List[Dict[str, Any]]:
+    try:
+        instruments = kite.instruments() or []
+        return [i for i in instruments if isinstance(i, dict)]
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch instruments: {exc}")
+
+
+def _resolve_india_vix_instrument(instruments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    exact_candidates: List[Dict[str, Any]] = []
+    fuzzy_candidates: List[Dict[str, Any]] = []
+    for inst in instruments:
+        tradingsymbol = str(inst.get("tradingsymbol") or "").upper().strip()
+        name = str(inst.get("name") or "").upper().strip()
+        exchange = str(inst.get("exchange") or "").upper().strip()
+        segment = str(inst.get("segment") or "").upper().strip()
+        if exchange != "NSE":
+            continue
+        if tradingsymbol == "INDIA VIX" or name == "INDIA VIX":
+            exact_candidates.append(inst)
+        elif "VIX" in tradingsymbol or "VIX" in name or "INDICES" in segment:
+            fuzzy_candidates.append(inst)
+    if exact_candidates:
+        return exact_candidates[0]
+    if fuzzy_candidates:
+        fuzzy_candidates = sorted(
+            fuzzy_candidates,
+            key=lambda x: (
+                str(x.get("tradingsymbol") or "") != "INDIA VIX",
+                str(x.get("name") or "") != "INDIA VIX",
+                str(x.get("segment") or ""),
+                str(x.get("tradingsymbol") or ""),
+            ),
+        )
+        return fuzzy_candidates[0]
+    return None
+
+
+def _resolve_usdinr_instrument(instruments: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    today = datetime.now().date()
+    candidates: List[Tuple[date, Dict[str, Any]]] = []
+    for inst in instruments:
+        exchange = str(inst.get("exchange") or "").upper().strip()
+        instrument_type = str(inst.get("instrument_type") or "").upper().strip()
+        tradingsymbol = str(inst.get("tradingsymbol") or "").upper().strip()
+        name = str(inst.get("name") or "").upper().strip()
+        if exchange != "CDS" or instrument_type != "FUTCUR":
+            continue
+        if not (tradingsymbol.startswith("USDINR") or name == "USDINR"):
+            continue
+        expiry_raw = inst.get("expiry")
+        expiry_dt = pd.to_datetime(expiry_raw, errors="coerce")
+        if pd.isna(expiry_dt):
+            continue
+        expiry_date = expiry_dt.date()
+        if expiry_date < today:
+            continue
+        candidates.append((expiry_date, inst))
+    if not candidates:
+        return None
+    candidates = sorted(candidates, key=lambda x: (x[0], str(x[1].get("tradingsymbol") or "")))
+    return candidates[0][1]
+
+
+def _fetch_kite_daily_history(
+    kite: KiteConnect,
+    instrument_token: int,
+    from_date: datetime,
+    to_date: datetime,
+) -> pd.DataFrame:
+    data = kite.historical_data(
+        instrument_token=instrument_token,
+        from_date=from_date,
+        to_date=to_date,
+        interval="day",
+    )
+    return pd.DataFrame(data or [])
+
+
+def _fetch_and_cache_single_kite_series(
+    *,
+    kite: KiteConnect,
+    cache_name: str,
+    instrument: Dict[str, Any],
+    lookback_days: int,
+    source_label: str,
+) -> Dict[str, Any]:
+    instrument_token = instrument.get("instrument_token")
+    if not instrument_token:
+        raise HTTPException(status_code=500, detail=f"{source_label} instrument token missing")
+    to_date = datetime.now()
+    from_date = to_date - timedelta(days=max(30, int(lookback_days)))
+    df = _fetch_kite_daily_history(
+        kite=kite,
+        instrument_token=int(instrument_token),
+        from_date=from_date,
+        to_date=to_date,
+    )
+    if df.empty:
+        raise HTTPException(status_code=500, detail=f"No {source_label} data returned from Kite")
+    df = df.copy()
+    df["source_symbol"] = str(instrument.get("tradingsymbol") or "")
+    df["source_exchange"] = str(instrument.get("exchange") or "")
+    df["source_segment"] = str(instrument.get("segment") or "")
+    df["source_name"] = str(instrument.get("name") or "")
+    if instrument.get("expiry") is not None:
+        df["source_expiry"] = str(pd.to_datetime(instrument.get("expiry"), errors="coerce").date())
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = CACHE_DIR / f"{cache_name}.csv"
+    df.to_csv(path, index=False)
+    return {
+        "status": "ok",
+        "rows": len(df),
+        "dataset": cache_name,
+        "instrument_token": int(instrument_token),
+        "tradingsymbol": str(instrument.get("tradingsymbol") or ""),
+        "exchange": str(instrument.get("exchange") or ""),
+        "segment": str(instrument.get("segment") or ""),
+        "name": str(instrument.get("name") or ""),
+        "expiry": str(pd.to_datetime(instrument.get("expiry"), errors="coerce").date()) if instrument.get("expiry") is not None else None,
+        "from_date": from_date.date().isoformat(),
+        "to_date": to_date.date().isoformat(),
+    }
 
 
 def _get_credentials(request: Request) -> KiteHeaders:
@@ -1186,9 +1776,9 @@ def auth_login():
     api_key = os.getenv("KITE_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="KITE_API_KEY missing")
-    if not APP_BASE_URL:
-        raise HTTPException(status_code=500, detail="APP_BASE_URL missing")
-    redirect_uri = f"{APP_BASE_URL}/api/auth/callback"
+    if not BACKEND_BASE_URL:
+        raise HTTPException(status_code=500, detail="BACKEND_BASE_URL missing")
+    redirect_uri = f"{BACKEND_BASE_URL}/api/auth/callback"
     kite = KiteConnect(api_key=api_key)
     login_url = kite.login_url()
     if "redirect_uri=" not in login_url:
@@ -1216,10 +1806,11 @@ def auth_callback(request_token: str, status: Optional[str] = None):
     access_token = data.get("access_token")
     if not access_token:
         return HTMLResponse(content="Auth failed: no access_token returned", status_code=400)
-    _save_kite_credentials_file(api_key, access_token)
-    if not APP_BASE_URL:
-        raise HTTPException(status_code=500, detail="APP_BASE_URL missing")
-    frontend_url = f"{APP_BASE_URL}/login?auth=success"
+    if not _save_kite_credentials_file(api_key, access_token):
+        return HTMLResponse(content="Auth failed: unable to persist Kite credentials", status_code=500)
+    if not FRONTEND_BASE_URL:
+        raise HTTPException(status_code=500, detail="FRONTEND_BASE_URL missing")
+    frontend_url = f"{FRONTEND_BASE_URL}/login?auth=success"
     return RedirectResponse(frontend_url)
 
 
@@ -1275,6 +1866,345 @@ def options_data(limit: int = 1000):
         "ce": df_ce.tail(limit).to_dict(orient="records") if not df_ce.empty else [],
         "pe": df_pe.tail(limit).to_dict(orient="records") if not df_pe.empty else [],
     }
+
+
+@app.get("/derivatives/india-vix")
+def india_vix_data(limit: int = 500):
+    df = _load_cache("india_vix")
+    if df.empty:
+        raise HTTPException(status_code=404, detail="India VIX cache missing")
+    sort_cols = [c for c in ["date"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+    return {"rows": _df_to_records(df, limit)}
+
+
+@app.get("/derivatives/usdinr")
+def usdinr_data(limit: int = 500):
+    df = _load_cache("usdinr")
+    if df.empty:
+        raise HTTPException(status_code=404, detail="USDINR cache missing")
+    sort_cols = [c for c in ["date"] if c in df.columns]
+    if sort_cols:
+        df = df.sort_values(sort_cols).reset_index(drop=True)
+    return {"rows": _df_to_records(df, limit)}
+
+
+def _load_equity_history_cache_fuzzy(symbol: str, max_age_hours: int = 24) -> pd.DataFrame:
+    candidates = [str(symbol).upper()]
+    if str(symbol).upper() == "MM":
+        candidates.append("M&M")
+    elif str(symbol).upper() == "M&M":
+        candidates.append("MM")
+    for candidate in candidates:
+        df = _load_equity_history_cache(candidate, max_age_hours=max_age_hours)
+        if not df.empty:
+            return df
+    return pd.DataFrame()
+
+
+def _safe_float_or_none(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+        return out if math.isfinite(out) else None
+    except Exception:
+        return None
+
+
+def _direction_label(curr: Any, prev: Any, tolerance: float = 1e-9) -> str:
+    curr_f = _safe_float_or_none(curr)
+    prev_f = _safe_float_or_none(prev)
+    if curr_f is None or prev_f is None:
+        return "n/a"
+    diff = curr_f - prev_f
+    if abs(diff) <= tolerance:
+        return "flat"
+    return "up" if diff > 0 else "down"
+
+
+def _build_constituent_breadth_by_date() -> Dict[str, Dict[str, float]]:
+    weights = _load_nifty50_weights()
+    if not weights:
+        return {}
+    total_weight = float(sum(float(item.get("weight", 0.0)) for item in weights))
+    out: Dict[str, Dict[str, float]] = {}
+    max_age_hours = 24 * 365 * 20
+
+    for item in weights:
+        sym = str(item.get("symbol") or "").upper()
+        weight = float(item.get("weight") or 0.0)
+        if not sym or weight <= 0:
+            continue
+        sdf = _load_equity_history_cache_fuzzy(sym, max_age_hours=max_age_hours)
+        if sdf.empty or "date" not in sdf.columns or "close" not in sdf.columns:
+            continue
+        sdf = sdf.copy()
+        sdf["date"] = pd.to_datetime(sdf["date"], errors="coerce")
+        sdf["close"] = pd.to_numeric(sdf["close"], errors="coerce")
+        sdf["volume"] = pd.to_numeric(sdf.get("volume"), errors="coerce")
+        sdf = sdf.dropna(subset=["date", "close"]).sort_values("date")
+        sdf["prev_close"] = sdf["close"].shift(1)
+        sdf["ret"] = np.where(
+            sdf["prev_close"] > 0,
+            (sdf["close"] / sdf["prev_close"]) - 1.0,
+            np.nan,
+        )
+        for _, row in sdf.iterrows():
+            ret = _safe_float_or_none(row.get("ret"))
+            if ret is None:
+                continue
+            dkey = pd.to_datetime(row["date"]).date().isoformat()
+            bucket = out.setdefault(
+                dkey,
+                {
+                    "up_weight": 0.0,
+                    "down_weight": 0.0,
+                    "up_count": 0.0,
+                    "down_count": 0.0,
+                    "weighted_volume": 0.0,
+                    "total_weight": total_weight,
+                },
+            )
+            if ret > 0:
+                bucket["up_weight"] += weight
+                bucket["up_count"] += 1.0
+            elif ret < 0:
+                bucket["down_weight"] += weight
+                bucket["down_count"] += 1.0
+            volume = _safe_float_or_none(row.get("volume"))
+            if volume is not None and volume > 0:
+                bucket["weighted_volume"] += volume * weight
+    return out
+
+
+def _build_vix_proxy_by_date(options_df: pd.DataFrame, max_days: int = 60) -> Dict[str, float]:
+    if options_df.empty or "date" not in options_df.columns:
+        return {}
+    df = options_df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["strike_price"] = pd.to_numeric(df.get("strike_price"), errors="coerce")
+    df["ltp"] = pd.to_numeric(df.get("ltp"), errors="coerce")
+    df["underlying_value"] = pd.to_numeric(df.get("underlying_value"), errors="coerce")
+    df = df.dropna(subset=["date", "strike_price", "ltp", "underlying_value"]).sort_values("date")
+    if df.empty:
+        return {}
+
+    out: Dict[str, float] = {}
+    unique_dates = sorted(df["date"].dropna().dt.date.unique())[-max_days:]
+    for d in unique_dates:
+        day_df = df[df["date"].dt.date == d].copy()
+        if day_df.empty:
+            continue
+        spot = _safe_float_or_none(day_df["underlying_value"].iloc[0])
+        if spot is None or spot <= 0:
+            continue
+        atm = round(spot / 50.0) * 50.0
+        day_df = day_df[
+            (day_df["strike_price"] >= atm - 100.0) &
+            (day_df["strike_price"] <= atm + 100.0)
+        ]
+        ivs: List[float] = []
+        for _, row in day_df.iterrows():
+            try:
+                iv = calculate_implied_volatility(
+                    row.get("ltp"),
+                    spot,
+                    row.get("strike_price"),
+                    0.027,
+                    str(row.get("option_type") or ""),
+                )
+                ivf = _safe_float_or_none(iv)
+                if ivf is not None and ivf > 0:
+                    ivs.append(ivf * 100.0)
+            except Exception:
+                continue
+        if ivs:
+            out[pd.Timestamp(d).date().isoformat()] = float(np.mean(ivs))
+    return out
+
+
+def _classify_market_tracker_row(row: Dict[str, Any]) -> str:
+    price_dir = str(row.get("price_direction") or "n/a")
+    oi_dir = str(row.get("futures_oi_direction") or "n/a")
+    vix_dir = str(row.get("vix_direction") or "n/a")
+    breadth_signal = str(row.get("breadth_signal") or "weak")
+    usdinr_dir = str(row.get("usdinr_direction") or "n/a")
+
+    if vix_dir == "up" and (breadth_signal == "weak" or price_dir == "n/a" or oi_dir == "n/a"):
+        return "Uncertain / Trap"
+    if price_dir == "up" and oi_dir == "up" and vix_dir == "down" and breadth_signal == "strong":
+        return "Strong Bullish"
+    if price_dir == "up" and oi_dir == "down" and vix_dir in {"up", "flat", "n/a"}:
+        return "Weak / Fake Bullish"
+    if price_dir == "down" and oi_dir == "up" and vix_dir == "up":
+        return "Strong Bearish"
+    if price_dir == "down" and oi_dir == "down":
+        return "Mild Bearish"
+    if usdinr_dir == "up" and breadth_signal == "weak":
+        return "Uncertain / Trap"
+    if price_dir == "up" and oi_dir == "up":
+        return "Bullish Bias"
+    if price_dir == "down" and oi_dir == "up":
+        return "Bearish Bias"
+    return "Mixed / Unclear"
+
+
+@app.get("/spot-analysis/daily-tracker")
+def spot_analysis_daily_tracker(days: int = 20):
+    days = max(5, min(int(days), 90))
+
+    nifty_df = _load_cache("nifty_ohlcv")
+    futures_df = _load_cache("nifty_futures")
+    df_ce = _load_cache("nifty_options_ce")
+    df_pe = _load_cache("nifty_options_pe")
+    options_df = pd.concat([df_ce, df_pe], ignore_index=True) if not df_ce.empty or not df_pe.empty else pd.DataFrame()
+    india_vix_df = _load_cache("india_vix")
+    usdinr_df = _load_cache("usdinr")
+
+    if nifty_df.empty or futures_df.empty:
+        raise HTTPException(status_code=404, detail="NIFTY spot or futures cache missing")
+
+    nifty_df = nifty_df.copy()
+    nifty_df["date"] = pd.to_datetime(nifty_df["date"], errors="coerce")
+    nifty_df["close"] = pd.to_numeric(nifty_df.get("close"), errors="coerce")
+    nifty_df = nifty_df.dropna(subset=["date", "close"]).sort_values("date")
+    nifty_df["date_key"] = nifty_df["date"].dt.date.astype(str)
+    nifty_df["prev_close"] = nifty_df["close"].shift(1)
+    nifty_df["price_direction"] = [
+        _direction_label(curr, prev) for curr, prev in zip(nifty_df["close"], nifty_df["prev_close"])
+    ]
+    nifty_df["price_change_pct"] = np.where(
+        nifty_df["prev_close"] > 0,
+        (nifty_df["close"] / nifty_df["prev_close"] - 1.0) * 100.0,
+        np.nan,
+    )
+    spot_rows = nifty_df[["date_key", "close", "prev_close", "price_direction", "price_change_pct"]].rename(
+        columns={"close": "nifty_close", "prev_close": "prev_nifty_close"}
+    )
+
+    futures_df = futures_df.copy()
+    futures_df["date"] = pd.to_datetime(futures_df["date"], errors="coerce")
+    if "expiry" in futures_df.columns:
+        futures_df["expiry"] = pd.to_datetime(futures_df["expiry"], errors="coerce")
+    if "expiry_date" in futures_df.columns:
+        futures_df["expiry_date"] = pd.to_datetime(futures_df["expiry_date"], errors="coerce")
+    futures_df["open_interest"] = pd.to_numeric(futures_df.get("open_interest"), errors="coerce")
+    futures_df["open_int"] = pd.to_numeric(futures_df.get("open_int"), errors="coerce")
+    futures_df["close"] = pd.to_numeric(futures_df.get("close"), errors="coerce")
+    futures_df["oi_value"] = futures_df["open_interest"].fillna(futures_df["open_int"])
+    sort_cols = [c for c in ["date", "expiry_date", "expiry", "timestamp_order"] if c in futures_df.columns]
+    futures_df = futures_df.dropna(subset=["date"]).sort_values(sort_cols)
+    front_fut = futures_df.groupby(futures_df["date"].dt.date, as_index=False).first()
+    front_fut["date_key"] = pd.to_datetime(front_fut["date"]).dt.date.astype(str)
+    front_fut["prev_oi"] = front_fut["oi_value"].shift(1)
+    front_fut["futures_oi_direction"] = [
+        _direction_label(curr, prev) for curr, prev in zip(front_fut["oi_value"], front_fut["prev_oi"])
+    ]
+    front_fut = front_fut[["date_key", "oi_value", "prev_oi", "close", "futures_oi_direction"]].rename(
+        columns={"oi_value": "futures_oi", "prev_oi": "prev_futures_oi", "close": "futures_close"}
+    )
+
+    merged = pd.merge(spot_rows, front_fut, on="date_key", how="inner").sort_values("date_key")
+    if merged.empty:
+        return {"rows": [], "count": 0, "latest": None}
+
+    breadth_by_date = _build_constituent_breadth_by_date()
+    vix_proxy_by_date = _build_vix_proxy_by_date(options_df)
+    india_vix_by_date: Dict[str, float] = {}
+    usdinr_by_date: Dict[str, float] = {}
+
+    if not india_vix_df.empty and "date" in india_vix_df.columns and "close" in india_vix_df.columns:
+        ivdf = india_vix_df.copy()
+        ivdf["date"] = pd.to_datetime(ivdf["date"], errors="coerce")
+        ivdf["close"] = pd.to_numeric(ivdf.get("close"), errors="coerce")
+        ivdf = ivdf.dropna(subset=["date", "close"]).sort_values("date")
+        india_vix_by_date = {
+            pd.to_datetime(r["date"]).date().isoformat(): float(r["close"])
+            for _, r in ivdf.iterrows()
+        }
+
+    if not usdinr_df.empty and "date" in usdinr_df.columns and "close" in usdinr_df.columns:
+        udf = usdinr_df.copy()
+        udf["date"] = pd.to_datetime(udf["date"], errors="coerce")
+        udf["close"] = pd.to_numeric(udf.get("close"), errors="coerce")
+        udf = udf.dropna(subset=["date", "close"]).sort_values("date")
+        usdinr_by_date = {
+            pd.to_datetime(r["date"]).date().isoformat(): float(r["close"])
+            for _, r in udf.iterrows()
+        }
+
+    merged["vix_value"] = merged["date_key"].map(india_vix_by_date)
+    merged["vix_source"] = np.where(merged["vix_value"].notna(), "india_vix_kite", "proxy_atm_iv")
+    merged["vix_value"] = merged["vix_value"].fillna(merged["date_key"].map(vix_proxy_by_date))
+    merged["prev_vix_value"] = merged["vix_value"].shift(1)
+    merged["vix_direction"] = [
+        _direction_label(curr, prev) for curr, prev in zip(merged["vix_value"], merged["prev_vix_value"])
+    ]
+    merged["usdinr_value"] = merged["date_key"].map(usdinr_by_date)
+    merged["prev_usdinr_value"] = merged["usdinr_value"].shift(1)
+    merged["usdinr_direction"] = [
+        _direction_label(curr, prev) for curr, prev in zip(merged["usdinr_value"], merged["prev_usdinr_value"])
+    ]
+    merged["usdinr_source"] = np.where(merged["usdinr_value"].notna(), "kite_front_month_futcur", "missing")
+
+    rows: List[Dict[str, Any]] = []
+    for _, row in merged.tail(days).iterrows():
+        dkey = str(row.get("date_key") or "")
+        breadth = breadth_by_date.get(dkey) or {}
+        up_weight = float(breadth.get("up_weight") or 0.0)
+        down_weight = float(breadth.get("down_weight") or 0.0)
+        total_weight = float(breadth.get("total_weight") or 1.0)
+        price_dir = str(row.get("price_direction") or "n/a")
+        if price_dir == "up":
+            aligned_weight = up_weight
+        elif price_dir == "down":
+            aligned_weight = down_weight
+        else:
+            aligned_weight = max(up_weight, down_weight)
+        breadth_pct = (aligned_weight / total_weight * 100.0) if total_weight > 0 else 0.0
+        breadth_signal = "strong" if breadth_pct >= 55.0 else "weak"
+
+        price_dir = str(row.get("price_direction") or "n/a")
+        oi_dir = str(row.get("futures_oi_direction") or "n/a")
+        if price_dir == "up" and oi_dir == "up":
+            core_logic = "Long build-up"
+        elif price_dir == "up" and oi_dir == "down":
+            core_logic = "Short covering"
+        elif price_dir == "down" and oi_dir == "up":
+            core_logic = "Short build-up"
+        elif price_dir == "down" and oi_dir == "down":
+            core_logic = "Long unwinding"
+        else:
+            core_logic = "Mixed"
+
+        out_row = {
+            "date": dkey,
+            "nifty_close": _json_safe(row.get("nifty_close")),
+            "prev_nifty_close": _json_safe(row.get("prev_nifty_close")),
+            "price_change_pct": _json_safe(row.get("price_change_pct")),
+            "price_direction": price_dir,
+            "futures_close": _json_safe(row.get("futures_close")),
+            "futures_oi": _json_safe(row.get("futures_oi")),
+            "prev_futures_oi": _json_safe(row.get("prev_futures_oi")),
+            "futures_oi_direction": oi_dir,
+            "vix_value": _json_safe(row.get("vix_value")),
+            "vix_direction": str(row.get("vix_direction") or "n/a"),
+            "vix_source": str(row.get("vix_source") or "proxy_atm_iv"),
+            "breadth_signal": breadth_signal,
+            "breadth_pct": _json_safe(breadth_pct),
+            "advancing_weight_pct": _json_safe((up_weight / total_weight * 100.0) if total_weight > 0 else None),
+            "declining_weight_pct": _json_safe((down_weight / total_weight * 100.0) if total_weight > 0 else None),
+            "weighted_constituent_volume": _json_safe(breadth.get("weighted_volume")),
+            "usdinr_value": _json_safe(row.get("usdinr_value")),
+            "usdinr_direction": str(row.get("usdinr_direction") or "n/a"),
+            "usdinr_source": str(row.get("usdinr_source") or "missing"),
+            "core_logic": core_logic,
+        }
+        out_row["daily_classification"] = _classify_market_tracker_row(out_row)
+        rows.append(out_row)
+
+    latest = rows[-1] if rows else None
+    return {"rows": rows, "count": len(rows), "latest": latest}
 
 
 @app.get("/derivatives/options-chain")
@@ -4526,6 +5456,11 @@ def historical_summary():
     losses = int((expiry_trades["realized_pnl"] <= 0).sum())
     top_contrib = expiry_trades.sort_values("realized_pnl", ascending=False).head(10)
     bottom_contrib = expiry_trades.sort_values("realized_pnl", ascending=True).head(10)
+    daily_margin = _load_daily_margin_summary(LEDGER_FILE)
+    booked_pnl = _load_fo_booked_pnl(TRADEBOOK_FO_FILE)
+    weekly_margin_pnl = _aggregate_period_margin_and_pnl(booked_pnl, "booking_date", daily_margin, "W")
+    monthly_margin_pnl = _aggregate_period_margin_and_pnl(booked_pnl, "booking_date", daily_margin, "M")
+    daily_es99 = _compute_daily_nifty_es99(TRADEBOOK_FO_FILE, LEDGER_FILE)
     return {
         "warnings": warnings,
         "trades": expiry_trades.to_dict(orient="records"),
@@ -4538,6 +5473,10 @@ def historical_summary():
         "win_loss": {"wins": wins, "losses": losses},
         "top_contributors": top_contrib.to_dict(orient="records"),
         "bottom_contributors": bottom_contrib.to_dict(orient="records"),
+        "daily_margin": daily_margin,
+        "weekly_margin_pnl": weekly_margin_pnl,
+        "monthly_margin_pnl": monthly_margin_pnl,
+        "daily_es99": daily_es99,
     }
 
 
@@ -4551,6 +5490,30 @@ async def upload_tradebook(file: UploadFile = File(...)):
     tradebook_path.parent.mkdir(parents=True, exist_ok=True)
     content = await file.read()
     tradebook_path.write_bytes(content)
+    return {"status": "ok", "filename": file.filename}
+
+
+@app.post("/historical/ledger")
+async def upload_ledger(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported")
+    LEDGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    content = await file.read()
+    LEDGER_FILE.write_bytes(content)
+    return {"status": "ok", "filename": file.filename}
+
+
+@app.post("/historical/tradebook-fo")
+async def upload_tradebook_fo(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only CSV files are supported")
+    TRADEBOOK_FO_FILE.parent.mkdir(parents=True, exist_ok=True)
+    content = await file.read()
+    TRADEBOOK_FO_FILE.write_bytes(content)
     return {"status": "ok", "filename": file.filename}
 
 
@@ -4634,6 +5597,8 @@ def data_source_cache_status():
         "nifty_futures": _status("nifty_futures"),
         "nifty_options_ce": _status("nifty_options_ce"),
         "nifty_options_pe": _status("nifty_options_pe"),
+        "india_vix": _status("india_vix"),
+        "usdinr": _status("usdinr"),
         "participants": _participant_cache_status(),
     }
 
@@ -4641,7 +5606,7 @@ def data_source_cache_status():
 @app.get("/data-source/preview/{name}")
 def data_source_preview(name: str, limit: int = 20):
     name = name.strip()
-    if name not in {"nifty_ohlcv", "nifty_futures", "nifty_options_ce", "nifty_options_pe"}:
+    if name not in {"nifty_ohlcv", "nifty_futures", "nifty_options_ce", "nifty_options_pe", "india_vix", "usdinr"}:
         raise HTTPException(status_code=400, detail="Unsupported dataset")
     df = _load_cache(name)
     if df.empty:
@@ -6002,7 +6967,7 @@ def data_source_refresh(
     lookback_days: int = 1825,
 ):
     name = name.strip()
-    if name not in {"nifty_ohlcv", "nifty_futures", "nifty_options_ce", "nifty_options_pe", "participants"}:
+    if name not in {"nifty_ohlcv", "nifty_futures", "nifty_options_ce", "nifty_options_pe", "participants", "india_vix", "usdinr"}:
         raise HTTPException(status_code=400, detail="Unsupported dataset")
 
     if name == "participants":
@@ -6057,6 +7022,33 @@ def data_source_refresh(
             "from_date": from_date.date().isoformat(),
             "to_date": to_date.date().isoformat(),
         }
+
+    if name in {"india_vix", "usdinr"}:
+        creds = _get_credentials(request)
+        kite = _get_kite_client(creds.api_key, creds.access_token)
+        instruments = _kite_instruments_cached(kite)
+        use_lookback_days = max(30, int(lookback_days))
+        if name == "india_vix":
+            instrument = _resolve_india_vix_instrument(instruments)
+            if instrument is None:
+                raise HTTPException(status_code=404, detail="India VIX instrument not found in Kite instruments")
+            return _fetch_and_cache_single_kite_series(
+                kite=kite,
+                cache_name="india_vix",
+                instrument=instrument,
+                lookback_days=use_lookback_days,
+                source_label="India VIX",
+            )
+        instrument = _resolve_usdinr_instrument(instruments)
+        if instrument is None:
+            raise HTTPException(status_code=404, detail="USDINR front-month futures instrument not found in Kite instruments")
+        return _fetch_and_cache_single_kite_series(
+            kite=kite,
+            cache_name="usdinr",
+            instrument=instrument,
+            lookback_days=use_lookback_days,
+            source_label="USDINR",
+        )
 
     fetcher = NSEDataFetcher()
     today = datetime.now().date()

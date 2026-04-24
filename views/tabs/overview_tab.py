@@ -3,9 +3,10 @@
 Provides one-glance decision signals on market conditions, portfolio health, and immediate actions.
 """
 
+import json
 import pandas as pd
 import plotly.graph_objects as go
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
 
 # Import utility functions
 import sys
@@ -18,12 +19,15 @@ from scripts.utils.portfolio_metrics import calculate_portfolio_greeks, calculat
 from scripts.utils.risk_calculations import calculate_var
 from scripts.utils.formatters import format_inr
 from scripts.utils.optional_streamlit import st
+from scripts.utils.greeks import calculate_implied_volatility
 from pathlib import Path
 from datetime import datetime
 
 
 # Cache directory
 CACHE_DIR = Path(ROOT) / "database" / "derivatives_cache"
+EQUITY_HISTORY_CACHE_DIR = CACHE_DIR / "equity_history_cache"
+NIFTY50_WEIGHTS_FILE = Path(ROOT) / "data" / "nifty50_weights.json"
 
 
 def load_from_cache(data_type: str) -> pd.DataFrame:
@@ -34,6 +38,327 @@ def load_from_cache(data_type: str) -> pd.DataFrame:
         return df
     else:
         return pd.DataFrame()
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    try:
+        out = float(value)
+        if pd.isna(out):
+            return None
+        return out
+    except Exception:
+        return None
+
+
+def _direction(curr: Any, prev: Any, tolerance: float = 1e-9) -> str:
+    curr_f = _safe_float(curr)
+    prev_f = _safe_float(prev)
+    if curr_f is None or prev_f is None:
+        return "n/a"
+    diff = curr_f - prev_f
+    if abs(diff) <= tolerance:
+        return "flat"
+    return "up" if diff > 0 else "down"
+
+
+def _direction_badge(direction: str) -> str:
+    mapping = {
+        "up": "↑ Up",
+        "down": "↓ Down",
+        "flat": "→ Flat",
+        "strong": "Strong",
+        "weak": "Weak",
+        "n/a": "N/A",
+    }
+    return mapping.get(direction, str(direction))
+
+
+def _load_nifty50_weights() -> List[Dict[str, Any]]:
+    if not NIFTY50_WEIGHTS_FILE.exists():
+        return []
+    try:
+        payload = json.loads(NIFTY50_WEIGHTS_FILE.read_text())
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or "").upper().strip()
+        weight_pct = _safe_float(row.get("weight_pct"))
+        if not symbol or weight_pct is None or weight_pct <= 0:
+            continue
+        rows.append({"symbol": symbol, "weight": weight_pct / 100.0})
+    return rows
+
+
+def _equity_history_path(symbol: str) -> Optional[Path]:
+    candidates = [symbol]
+    if symbol == "MM":
+        candidates.append("M&M")
+    elif symbol == "M&M":
+        candidates.append("MM")
+    for candidate in candidates:
+        path = EQUITY_HISTORY_CACHE_DIR / f"{candidate}.csv"
+        if path.exists():
+            return path
+    return None
+
+
+def _build_market_breadth_map() -> Dict[str, Dict[str, float]]:
+    weights = _load_nifty50_weights()
+    if not weights:
+        return {}
+
+    total_weight = sum(float(item["weight"]) for item in weights)
+    breadth_by_date: Dict[str, Dict[str, float]] = {}
+
+    for item in weights:
+        symbol = str(item["symbol"])
+        weight = float(item["weight"])
+        path = _equity_history_path(symbol)
+        if path is None:
+            continue
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        if df.empty or "date" not in df.columns or "close" not in df.columns:
+            continue
+        work = df.copy()
+        work["date"] = pd.to_datetime(work["date"], errors="coerce")
+        work["close"] = pd.to_numeric(work["close"], errors="coerce")
+        work["volume"] = pd.to_numeric(work.get("volume"), errors="coerce")
+        work = work.dropna(subset=["date", "close"]).sort_values("date")
+        work["ret"] = work["close"].pct_change()
+
+        for _, row in work.iterrows():
+            ret = _safe_float(row.get("ret"))
+            if ret is None:
+                continue
+            date_key = pd.to_datetime(row["date"]).date().isoformat()
+            bucket = breadth_by_date.setdefault(
+                date_key,
+                {
+                    "up_weight": 0.0,
+                    "down_weight": 0.0,
+                    "up_count": 0.0,
+                    "down_count": 0.0,
+                    "weighted_volume": 0.0,
+                    "total_weight": total_weight,
+                },
+            )
+            if ret > 0:
+                bucket["up_weight"] += weight
+                bucket["up_count"] += 1
+            elif ret < 0:
+                bucket["down_weight"] += weight
+                bucket["down_count"] += 1
+
+            volume = _safe_float(row.get("volume"))
+            if volume is not None and volume > 0:
+                bucket["weighted_volume"] += volume * weight
+
+    return breadth_by_date
+
+
+def _build_futures_snapshot(futures_df: pd.DataFrame) -> pd.DataFrame:
+    if futures_df.empty or "date" not in futures_df.columns:
+        return pd.DataFrame(columns=["date", "front_fut_close", "front_fut_oi"])
+
+    work = futures_df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work["expiry"] = pd.to_datetime(work.get("expiry"), errors="coerce")
+    work["open_interest"] = pd.to_numeric(work.get("open_interest"), errors="coerce")
+    work["open_int"] = pd.to_numeric(work.get("open_int"), errors="coerce")
+    work["close"] = pd.to_numeric(work.get("close"), errors="coerce")
+    work = work.dropna(subset=["date"]).sort_values(["date", "expiry"])
+    work["oi_value"] = work["open_interest"].fillna(work["open_int"])
+    front = work.groupby("date", as_index=False).first()
+    front["date"] = front["date"].dt.date.astype(str)
+    return front.rename(columns={"close": "front_fut_close", "oi_value": "front_fut_oi"})[
+        ["date", "front_fut_close", "front_fut_oi"]
+    ]
+
+
+def _build_vix_proxy_map(options_df: pd.DataFrame, max_days: int = 45) -> Dict[str, float]:
+    if options_df.empty or "date" not in options_df.columns:
+        return {}
+
+    work = options_df.copy()
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work["strike_price"] = pd.to_numeric(work.get("strike_price"), errors="coerce")
+    work["ltp"] = pd.to_numeric(work.get("ltp"), errors="coerce")
+    work["underlying_value"] = pd.to_numeric(work.get("underlying_value"), errors="coerce")
+    work = work.dropna(subset=["date", "strike_price", "ltp", "underlying_value"])
+    if work.empty:
+        return {}
+
+    out: Dict[str, float] = {}
+    unique_dates = sorted(work["date"].dropna().unique())[-max_days:]
+    for day in unique_dates:
+        day_options = work[work["date"] == day].copy()
+        if day_options.empty:
+            continue
+        spot = _safe_float(day_options["underlying_value"].iloc[0])
+        if spot is None or spot <= 0:
+            continue
+        atm = round(spot / 50.0) * 50.0
+        near_atm = day_options[
+            (day_options["strike_price"] >= atm - 100.0) &
+            (day_options["strike_price"] <= atm + 100.0)
+        ]
+        ivs: List[float] = []
+        for _, row in near_atm.iterrows():
+            try:
+                iv = calculate_implied_volatility(
+                    row["ltp"],
+                    spot,
+                    row["strike_price"],
+                    0.027,
+                    row["option_type"],
+                )
+                if iv and iv > 0:
+                    ivs.append(float(iv) * 100.0)
+            except Exception:
+                continue
+        if ivs:
+            out[pd.to_datetime(day).date().isoformat()] = float(sum(ivs) / len(ivs))
+    return out
+
+
+def _classify_daily_market_row(row: Dict[str, Any]) -> str:
+    price_dir = str(row.get("price_dir") or "n/a")
+    oi_dir = str(row.get("oi_dir") or "n/a")
+    vix_dir = str(row.get("vix_dir") or "n/a")
+    breadth_signal = str(row.get("breadth_signal") or "weak")
+    usdinr_dir = str(row.get("usdinr_dir") or "n/a")
+
+    if vix_dir == "up" and (price_dir == "n/a" or oi_dir == "n/a" or breadth_signal == "weak"):
+        return "🟣 Uncertain / Trap"
+    if price_dir == "up" and oi_dir == "up" and vix_dir == "down" and breadth_signal == "strong":
+        return "🟢 Strong Bullish"
+    if price_dir == "up" and oi_dir == "down" and vix_dir in {"up", "flat", "n/a"}:
+        return "🟡 Weak / Fake Bullish"
+    if price_dir == "down" and oi_dir == "up" and vix_dir == "up":
+        return "🔴 Strong Bearish"
+    if price_dir == "down" and oi_dir == "down":
+        return "⚪ Mild Bearish"
+    if usdinr_dir == "up" and price_dir == "up" and breadth_signal == "weak":
+        return "🟣 Uncertain / Trap"
+    if price_dir == "up" and oi_dir == "up":
+        return "🟢 Bullish Bias"
+    if price_dir == "down" and oi_dir == "up":
+        return "🔴 Bearish Bias"
+    return "🟣 Mixed / Unclear"
+
+
+def build_daily_market_tracker(
+    nifty_df: pd.DataFrame,
+    futures_df: pd.DataFrame,
+    options_df: pd.DataFrame,
+    history_days: int = 20,
+) -> pd.DataFrame:
+    if nifty_df.empty or futures_df.empty:
+        return pd.DataFrame()
+
+    spot = nifty_df.copy()
+    spot["date"] = pd.to_datetime(spot["date"], errors="coerce")
+    spot["close"] = pd.to_numeric(spot.get("close"), errors="coerce")
+    spot = spot.dropna(subset=["date", "close"]).sort_values("date")
+    spot["date"] = spot["date"].dt.date.astype(str)
+    spot = spot[["date", "close"]].rename(columns={"close": "nifty_close"})
+    spot["prev_nifty_close"] = spot["nifty_close"].shift(1)
+    spot["price_dir"] = [
+        _direction(curr, prev) for curr, prev in zip(spot["nifty_close"], spot["prev_nifty_close"])
+    ]
+
+    futures = _build_futures_snapshot(futures_df)
+    if futures.empty:
+        return pd.DataFrame()
+    futures = futures.sort_values("date")
+    futures["prev_front_fut_oi"] = futures["front_fut_oi"].shift(1)
+    futures["oi_dir"] = [
+        _direction(curr, prev) for curr, prev in zip(futures["front_fut_oi"], futures["prev_front_fut_oi"])
+    ]
+
+    merged = spot.merge(futures, on="date", how="inner").sort_values("date")
+    if merged.empty:
+        return merged
+
+    breadth_map = _build_market_breadth_map()
+    vix_map = _build_vix_proxy_map(options_df)
+
+    vix_series = []
+    for date_key in merged["date"]:
+        vix_series.append(vix_map.get(str(date_key)))
+    merged["vix_proxy"] = vix_series
+    merged["prev_vix_proxy"] = merged["vix_proxy"].shift(1)
+    merged["vix_dir"] = [
+        _direction(curr, prev) for curr, prev in zip(merged["vix_proxy"], merged["prev_vix_proxy"])
+    ]
+
+    breadth_signal = []
+    breadth_detail = []
+    weighted_volume = []
+    for _, row in merged.iterrows():
+        date_key = str(row["date"])
+        price_dir = str(row.get("price_dir") or "n/a")
+        stats = breadth_map.get(date_key) or {}
+        up_weight = float(stats.get("up_weight") or 0.0)
+        down_weight = float(stats.get("down_weight") or 0.0)
+        total_weight = float(stats.get("total_weight") or 1.0)
+        if price_dir == "up":
+            strength = up_weight / total_weight if total_weight > 0 else 0.0
+        elif price_dir == "down":
+            strength = down_weight / total_weight if total_weight > 0 else 0.0
+        else:
+            strength = max(up_weight, down_weight) / total_weight if total_weight > 0 else 0.0
+        breadth_signal.append("strong" if strength >= 0.55 else "weak")
+        breadth_detail.append(f"{strength * 100:.0f}%")
+        weighted_volume.append(float(stats.get("weighted_volume") or 0.0))
+
+    merged["breadth_signal"] = breadth_signal
+    merged["breadth_strength"] = breadth_detail
+    merged["weighted_constituent_volume"] = weighted_volume
+    merged["usdinr_dir"] = "n/a"
+
+    core_logic = []
+    for _, row in merged.iterrows():
+        price_dir = str(row.get("price_dir") or "n/a")
+        oi_dir = str(row.get("oi_dir") or "n/a")
+        if price_dir == "up" and oi_dir == "up":
+            core_logic.append("Long build-up")
+        elif price_dir == "up" and oi_dir == "down":
+            core_logic.append("Short covering")
+        elif price_dir == "down" and oi_dir == "up":
+            core_logic.append("Short build-up")
+        elif price_dir == "down" and oi_dir == "down":
+            core_logic.append("Long unwinding")
+        else:
+            core_logic.append("Mixed")
+    merged["core_logic"] = core_logic
+
+    merged["daily_classification"] = [
+        _classify_daily_market_row(row) for row in merged.to_dict(orient="records")
+    ]
+    merged["nifty_signal"] = merged["price_dir"].map(_direction_badge)
+    merged["futures_oi_signal"] = merged["oi_dir"].map(_direction_badge)
+    merged["vix_signal"] = merged["vix_dir"].map(_direction_badge)
+    merged["breadth_label"] = [
+        f"{_direction_badge(signal)} ({strength})"
+        for signal, strength in zip(merged["breadth_signal"], merged["breadth_strength"])
+    ]
+    merged["usdinr_signal"] = "N/A"
+    merged["weighted_constituent_volume_fmt"] = [
+        f"{float(val):,.0f}" if _safe_float(val) is not None else "—"
+        for val in merged["weighted_constituent_volume"]
+    ]
+
+    return merged.tail(history_days).reset_index(drop=True)
 
 
 
@@ -261,6 +586,72 @@ def get_alignment_status(market_iv_rank: float, portfolio_vega: float,
     return alignments
 
 
+def _render_daily_market_tracker(nifty_df: pd.DataFrame, options_df: pd.DataFrame) -> None:
+    futures_df = st.session_state.get("nifty_futures_df_cache")
+    if not isinstance(futures_df, pd.DataFrame) or futures_df.empty:
+        futures_df = load_from_cache("nifty_futures")
+
+    tracker_df = build_daily_market_tracker(nifty_df=nifty_df, futures_df=futures_df, options_df=options_df, history_days=20)
+
+    st.markdown("---")
+    st.subheader("🧭 Daily Market Tracker")
+    st.caption("Tracks NIFTY, front-month futures OI, VIX proxy, constituent breadth, and USDINR feed status.")
+
+    if tracker_df.empty:
+        st.warning("⚠️ Daily tracker unavailable. NIFTY and futures cache are required.")
+        return
+
+    latest = tracker_df.iloc[-1]
+    top_cols = st.columns(5)
+    top_cols[0].metric("NIFTY", f"₹{float(latest['nifty_close']):,.0f}", latest["nifty_signal"])
+    top_cols[1].metric("Futures OI", f"{float(latest['front_fut_oi']):,.0f}", latest["futures_oi_signal"])
+    top_cols[2].metric(
+        "VIX",
+        f"{float(latest['vix_proxy']):.1f}" if _safe_float(latest.get("vix_proxy")) is not None else "N/A",
+        latest["vix_signal"],
+    )
+    top_cols[3].metric("Breadth", latest["breadth_label"], latest["core_logic"])
+    top_cols[4].metric("USDINR", latest["usdinr_signal"], "Feed missing")
+
+    st.info(
+        f"**Latest classification:** {latest['daily_classification']} | "
+        f"Weighted constituent volume: {latest['weighted_constituent_volume_fmt']}"
+    )
+
+    display_df = tracker_df.copy()
+    display_df = display_df.rename(
+        columns={
+            "date": "Date",
+            "nifty_signal": "NIFTY",
+            "futures_oi_signal": "Futures OI",
+            "vix_signal": "VIX",
+            "breadth_label": "Breadth",
+            "usdinr_signal": "USDINR",
+            "core_logic": "Core Logic",
+            "daily_classification": "Daily Classification",
+            "weighted_constituent_volume_fmt": "Weighted Volume",
+        }
+    )
+    st.dataframe(
+        display_df[
+            [
+                "Date",
+                "NIFTY",
+                "Futures OI",
+                "VIX",
+                "Breadth",
+                "USDINR",
+                "Core Logic",
+                "Daily Classification",
+                "Weighted Volume",
+            ]
+        ].sort_values("Date", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption("`VIX` is derived from near-ATM options IV until a dedicated India VIX feed is added. `USDINR` is shown as unavailable because no local feed exists.")
+
+
 def render_overview_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame = None):
     """Render the Ultimate Overview Tab with key decision metrics."""
     
@@ -294,6 +685,13 @@ def render_overview_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame 
                 st.success(f"✅ Loaded {len(nifty_df)} NIFTY records")
             else:
                 st.warning("⚠️ No NIFTY data in cache")
+            
+            futures_df = load_from_cache("nifty_futures")
+            if not futures_df.empty:
+                st.session_state["nifty_futures_df_cache"] = futures_df
+                st.success(f"✅ Loaded {len(futures_df)} futures records")
+            else:
+                st.warning("⚠️ No NIFTY futures data in cache")
     if st.sidebar.button("🔄 Refresh", key="overview_refresh", help="Refresh overview with latest data"):
         st.rerun()
     
@@ -302,6 +700,10 @@ def render_overview_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame 
         options_df = st.session_state["options_df_cache"]
     if "nifty_df_cache" in st.session_state:
         nifty_df = st.session_state["nifty_df_cache"]
+    if "nifty_futures_df_cache" not in st.session_state:
+        futures_df = load_from_cache("nifty_futures")
+        if not futures_df.empty:
+            st.session_state["nifty_futures_df_cache"] = futures_df
     
     # Initialize empty dataframes if None
     if options_df is None:
@@ -507,6 +909,8 @@ def render_overview_tab(options_df: pd.DataFrame = None, nifty_df: pd.DataFrame 
     
     else:
         st.warning("⚠️ Insufficient market data for regime analysis")
+
+    _render_daily_market_tracker(nifty_df=nifty_df, options_df=options_df)
     
     # ========== 2️⃣ MIDDLE SECTION — PORTFOLIO HEALTH SNAPSHOT ==========
     st.markdown("---")
