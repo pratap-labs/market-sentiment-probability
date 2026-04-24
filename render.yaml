@@ -1,11 +1,30 @@
 services:
   - type: web
-    name: market-sentiment-probability
+    name: gammashield-api
     runtime: python
-    buildCommand: |
-      pip install -r requirements.txt
-      cd frontend && npm ci && npm run build
+    buildCommand: pip install -r requirements.txt
     startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.11
+      - key: BACKEND_BASE_URL
+        sync: false
+      - key: FRONTEND_BASE_URL
+        sync: false
+      - key: CORS_ALLOWED_ORIGINS
+        sync: false
+      - key: CORS_ALLOW_CREDENTIALS
+        value: "false"
+  - type: web
+    name: gammashield-client
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: frontend/dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

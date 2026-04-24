@@ -17,7 +17,7 @@ from scripts.utils import (
 )
 from scripts.utils.formatters import format_inr
 from scripts.utils.option_pricing import price_option
-from views.tabs.risk_analysis_tab import (
+from scripts.services.risk_analysis_tab import (
     DEFAULT_BUCKET_PROBS,
     classify_zone,
     compute_historical_bucket_probabilities,

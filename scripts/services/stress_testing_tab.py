@@ -22,7 +22,7 @@ from scripts.utils.option_pricing import (
     pricing_model_available,
 )
 from scripts.utils.optional_streamlit import st
-from views.tabs.risk_analysis_tab import (
+from scripts.services.risk_analysis_tab import (
     classify_zone,
     get_iv_regime,
     compute_historical_bucket_probabilities,

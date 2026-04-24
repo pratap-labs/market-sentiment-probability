@@ -49,10 +49,8 @@ load_env_file(ROOT / ".env")
 import requests
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File
-from fastapi.responses import FileResponse
-from fastapi.responses import RedirectResponse, HTMLResponse, FileResponse
+from fastapi.responses import RedirectResponse, HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from scripts.utils import (
@@ -69,17 +67,17 @@ from scripts.utils.stress_testing import compute_var_es_metrics, get_weighted_sc
 from scripts.utils.forward_risk import run_advanced_forward_risk
 from scripts.utils.parsers import parse_tradingsymbol
 from scripts.utils.option_pricing import price_option
-from views.tabs.overview_tab import (
+from scripts.services.overview_tab import (
     get_alignment_status,
     get_market_signal,
     get_portfolio_health_status,
 )
-from views.tabs import risk_analysis_tab as ra_tab
-from views.tabs import stress_testing_tab as st_tab
-from views.tabs import trade_selector_tab as ts_tab
+from scripts.services import risk_analysis_tab as ra_tab
+from scripts.services import stress_testing_tab as st_tab
+from scripts.services import trade_selector_tab as ts_tab
 
-from views.tabs import historical_performance_tab as hp_tab
-from views.tabs.risk_buckets_tab import (
+from scripts.services import historical_performance_tab as hp_tab
+from scripts.services.risk_buckets_tab import (
     SimulationConfig,
     assign_buckets,
     aggregate_buckets,
@@ -114,7 +112,6 @@ MANUAL_BUCKET_FILE = ROOT / "database" / "manual_bucket_overrides.json"
 RISK_BUCKET_SETTINGS_FILE = ROOT / "database" / "risk_bucket_settings.json"
 LEDGER_FILE = ROOT / "database" / "ledger.csv"
 TRADEBOOK_FO_FILE = ROOT / "database" / "tradebook_fo.csv"
-FRONTEND_DIST = ROOT / "dist"
 KITE_TOKEN_TTL = timedelta(hours=12)
 SERVER_PORT = os.getenv("SERVER_PORT", "8000")
 CLIENT_PORT = os.getenv("CLIENT_PORT", "5173")
@@ -127,41 +124,46 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_allowed_origins() -> List[str]:
+    configured = os.getenv("CORS_ALLOWED_ORIGINS", "")
+    origins = {
+        origin.rstrip("/")
+        for origin in (part.strip() for part in configured.split(","))
+        if origin.strip()
+    }
+    if FRONTEND_BASE_URL:
+        origins.add(FRONTEND_BASE_URL)
+    if not origins:
+        local_default = f"http://localhost:{CLIENT_PORT}"
+        origins.update(
+            {
+                local_default,
+                local_default.replace("localhost", "127.0.0.1"),
+            }
+        )
+    return sorted(origins)
+
+
+CORS_ALLOWED_ORIGINS = _build_allowed_origins()
+CORS_ALLOW_CREDENTIALS = _parse_bool_env("CORS_ALLOW_CREDENTIALS", False)
+
 api_app = FastAPI(title="GammaShield API", version="0.1.0")
 api_app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ALLOWED_ORIGINS,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 app = api_app
-
-
-def _log_frontend_static_state(stage: str) -> None:
-    index_file = FRONTEND_DIST / "index.html"
-    client_assets_dir = FRONTEND_DIST / "client-assets"
-    logger.info(
-        "[static:%s] cwd=%s root=%s dist=%s dist_exists=%s index_exists=%s client_assets_exists=%s",
-        stage,
-        Path.cwd(),
-        ROOT,
-        FRONTEND_DIST,
-        FRONTEND_DIST.exists(),
-        index_file.exists(),
-        client_assets_dir.exists(),
-    )
-    if client_assets_dir.exists():
-        try:
-            files = sorted(p.name for p in client_assets_dir.iterdir() if p.is_file())
-            logger.info(
-                "[static:%s] client-assets file_count=%s sample=%s",
-                stage,
-                len(files),
-                files[:8],
-            )
-        except Exception as exc:
-            logger.exception("[static:%s] failed to inspect client-assets: %s", stage, exc)
 
 
 @api_app.on_event("startup")
@@ -169,7 +171,13 @@ async def startup_diagnostics() -> None:
     logger.info("[startup] GammaShield API starting")
     logger.info("[startup] python=%s", sys.version.replace("\n", " "))
     logger.info("[startup] sys.path[0:5]=%s", sys.path[:5])
-    _log_frontend_static_state("startup")
+    logger.info(
+        "[startup] backend_base_url=%s frontend_base_url=%s cors_allowed_origins=%s cors_allow_credentials=%s",
+        BACKEND_BASE_URL or "<unset>",
+        FRONTEND_BASE_URL or "<unset>",
+        CORS_ALLOWED_ORIGINS,
+        CORS_ALLOW_CREDENTIALS,
+    )
 
 
 class KiteHeaders(BaseModel):
@@ -4998,7 +5006,7 @@ def risk_buckets_add_group(payload: TradeGroupPayload):
         raise HTTPException(status_code=400, detail="No legs provided")
     groups.append({"name": payload.name or "Manual Trade", "legs": legs})
     try:
-        from views.tabs.risk_buckets_tab import _save_saved_groups as _save_groups
+        from scripts.services.risk_buckets_tab import _save_saved_groups as _save_groups
         _save_groups(groups)
     except Exception:
         pass
@@ -5012,7 +5020,7 @@ def risk_buckets_remove_group(index: int):
         raise HTTPException(status_code=404, detail="Group not found")
     groups = [g for i, g in enumerate(groups) if i != index]
     try:
-        from views.tabs.risk_buckets_tab import _save_saved_groups as _save_groups
+        from scripts.services.risk_buckets_tab import _save_saved_groups as _save_groups
         _save_groups(groups)
     except Exception:
         pass
@@ -5022,7 +5030,7 @@ def risk_buckets_remove_group(index: int):
 @app.delete("/risk-buckets/settings/groups")
 def risk_buckets_clear_groups():
     try:
-        from views.tabs.risk_buckets_tab import _save_saved_groups as _save_groups
+        from scripts.services.risk_buckets_tab import _save_saved_groups as _save_groups
         _save_groups([])
     except Exception:
         pass
@@ -7142,37 +7150,20 @@ def data_source_refresh(
 root_app = FastAPI(title="GammaShield", version="0.1.0")
 root_app.mount("/api", api_app)
 
-if FRONTEND_DIST.exists():
-    logger.info("[static:init] serving frontend dist from dist=%s", FRONTEND_DIST)
+@root_app.get("/")
+def root_status():
+    return JSONResponse(
+        {
+            "service": "gammashield-backend",
+            "status": "ok",
+            "api_base_path": "/api",
+            "docs_url": "/api/docs",
+        }
+    )
 
-    client_assets_dir = FRONTEND_DIST / "client-assets"
-    if client_assets_dir.exists():
-        root_app.mount("/client-assets", StaticFiles(directory=client_assets_dir), name="client-assets")
 
-    @root_app.get("/gammashield-logo.png")
-    def spa_logo():
-        path = FRONTEND_DIST / "gammashield-logo.png"
-        if not path.exists():
-            raise HTTPException(status_code=404, detail="Asset not found")
-        return FileResponse(path)
-
-    @root_app.get("/")
-    def spa_index():
-        index_path = FRONTEND_DIST / "index.html"
-        if not index_path.exists():
-            raise HTTPException(status_code=404, detail="Frontend index missing")
-        return FileResponse(index_path)
-
-    @root_app.get("/{full_path:path}")
-    def spa_fallback(full_path: str):
-        requested = FRONTEND_DIST / full_path
-        if requested.is_file():
-            return FileResponse(requested)
-        index_path = FRONTEND_DIST / "index.html"
-        if not index_path.exists():
-            raise HTTPException(status_code=404, detail="Frontend index missing")
-        return FileResponse(index_path)
-else:
-    logger.warning("[static:init] dist folder missing at startup: %s", FRONTEND_DIST)
+@root_app.get("/health")
+def root_health():
+    return {"status": "ok", "service": "gammashield-backend"}
 
 app = root_app

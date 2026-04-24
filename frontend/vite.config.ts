@@ -5,21 +5,26 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, "..", "");
   const clientPort = Number(env.CLIENT_PORT || "5173");
   const serverPort = String(env.SERVER_PORT || "8000");
+  const backendProxyTarget = (env.VITE_DEV_PROXY_TARGET || env.BACKEND_BASE_URL || `http://localhost:${serverPort}`)
+    .replace(/\/$/, "");
 
   return {
     plugins: [react()],
     envDir: "..",
-    define: {
-      __SERVER_PORT__: JSON.stringify(serverPort)
-    },
     base: "/",
     build: {
-      outDir: "../dist",
+      outDir: "dist",
       emptyOutDir: true,
-      assetsDir: "client-assets"
+      assetsDir: "assets"
     },
     server: {
-      port: clientPort
+      port: clientPort,
+      proxy: {
+        "/api": {
+          target: backendProxyTarget,
+          changeOrigin: true
+        }
+      }
     }
   };
 });

@@ -24,14 +24,14 @@ from scripts.utils import (
 from scripts.utils.formatters import format_inr
 from scripts.utils.optional_streamlit import st
 from scripts.utils.option_pricing import price_option
-from views.tabs.portfolio_buckets_tab import (
+from scripts.services.portfolio_buckets_tab import (
     _classify_trade_zone,
     _compute_trade_es99,
     _derive_underlying,
     _extract_margin,
     _group_positions_by_trade,
 )
-from views.tabs.risk_analysis_tab import (
+from scripts.services.risk_analysis_tab import (
     DEFAULT_BUCKET_PROBS,
     DEFAULT_ES99_LIMIT,
     DEFAULT_THRESHOLD_NORMAL_SHARE,
@@ -43,7 +43,7 @@ from views.tabs.risk_analysis_tab import (
     _build_bucket_history,
     _load_cache_silent,
 )
-from views.tabs import risk_analysis_tab as ra_tab
+from scripts.services import risk_analysis_tab as ra_tab
 from scripts.utils.stress_testing import Scenario
 from scripts.utils import classify_history_bucket
 from collections import Counter, defaultdict

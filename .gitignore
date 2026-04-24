@@ -6,3 +6,5 @@ __pycache__/
 .pycache_local/
 node_modules/
 .risk-engine-env/
+dist/
+frontend/dist/

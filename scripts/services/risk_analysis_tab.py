@@ -28,7 +28,7 @@ from scripts.utils.option_pricing import (
 )
 from scripts.utils.optional_streamlit import st
 
-from views.tabs.derivatives_data_tab import load_from_cache as _load_from_cache
+from scripts.services.derivatives_data_tab import load_from_cache as _load_from_cache
 
 
 STRATEGY_MAX_DRAWDOWN = 12.0  # % NAV
